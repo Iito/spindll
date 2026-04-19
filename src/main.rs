@@ -45,6 +45,10 @@ enum Commands {
         /// GPU layers (omit to auto-detect)
         #[arg(long)]
         gpu_layers: Option<u32>,
+
+        /// Memory budget (e.g. "8G")
+        #[arg(long)]
+        budget: Option<String>,
     },
 
     /// One-shot inference (no server needed)
@@ -90,9 +94,21 @@ async fn main() -> anyhow::Result<()> {
             port,
             ctx_size,
             gpu_layers,
+            budget,
         } => {
             let store = spindll::model_store::ModelStore::new(None);
             let model_path = store.resolve_model_path(&model)?;
+
+            // Check memory budget before loading
+            let mem = spindll::scheduler::budget::MemoryBudget::detect(budget.as_deref());
+            let model_size = std::fs::metadata(&model_path)?.len();
+            if !mem.can_fit(model_size) {
+                anyhow::bail!(
+                    "model is {:.1} GB but memory budget is {:.1} GB",
+                    model_size as f64 / 1_073_741_824.0,
+                    mem.budget as f64 / 1_073_741_824.0
+                );
+            }
 
             let engine = spindll::engine::Engine::load(&model_path, gpu_layers, ctx_size)?;
             let engine = std::sync::Arc::new(engine);
