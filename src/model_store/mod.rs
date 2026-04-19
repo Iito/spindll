@@ -58,4 +58,44 @@ impl ModelStore {
 
         Ok(path)
     }
+
+    pub fn list(&self) -> anyhow::Result<()> {
+        let reg = registry::Registry::load(&self.registry_path());
+        if reg.models.is_empty() {
+            println!("no models downloaded");
+            return Ok(());
+        }
+
+        println!("{:<50} {:>10}", "MODEL", "SIZE");
+        println!("{}", "-".repeat(62));
+        for (key, entry) in &reg.models {
+            let size = format_size(entry.size_bytes);
+            println!("{:<50} {:>10}", key, size);
+        }
+        Ok(())
+    }
+
+    pub fn remove(&self, model: &str) -> anyhow::Result<()> {
+        let reg = registry::Registry::load(&self.registry_path());
+        let entry = reg.models.get(model)
+            .ok_or_else(|| anyhow::anyhow!("model '{}' not found", model))?;
+
+        if entry.path.exists() {
+            std::fs::remove_file(&entry.path)?;
+        }
+
+        // TODO: should probably clean up empty parent dirs too
+        println!("deleted {}", model);
+        Ok(())
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else {
+        format!("{} KB", bytes / 1024)
+    }
 }

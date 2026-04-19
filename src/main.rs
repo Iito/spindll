@@ -78,10 +78,12 @@ fn main() -> anyhow::Result<()> {
             println!("model ready: {}", path.display());
         }
         Commands::List => {
-            println!("list: showing local models");
+            let store = spindll::model_store::ModelStore::new(None);
+            store.list()?;
         }
         Commands::Rm { model } => {
-            println!("rm: deleting {model}");
+            let store = spindll::model_store::ModelStore::new(None);
+            store.remove(&model)?;
         }
         Commands::Serve { port, budget } => {
             println!("serve: port={port}, budget={budget:?}");
