@@ -17,6 +17,27 @@ impl SpindllService {
     }
 }
 
+fn format_chat_messages(messages: &[Message]) -> String {
+    let mut prompt = String::new();
+    for msg in messages {
+        match msg.role.as_str() {
+            "system" => {
+                prompt.push_str(&format!("<<SYS>>\n{}\n<</SYS>>\n\n", msg.content));
+            }
+            "user" => {
+                prompt.push_str(&format!("[INST] {} [/INST]\n", msg.content));
+            }
+            "assistant" => {
+                prompt.push_str(&format!("{}\n", msg.content));
+            }
+            _ => {
+                prompt.push_str(&format!("{}\n", msg.content));
+            }
+        }
+    }
+    prompt
+}
+
 fn proto_params_to_engine(p: Option<crate::proto::GenerateParams>) -> GenerateParams {
     match p {
         Some(p) => GenerateParams {
@@ -85,9 +106,51 @@ impl Spindll for SpindllService {
 
     async fn chat(
         &self,
-        _request: Request<ChatRequest>,
+        request: Request<ChatRequest>,
     ) -> Result<Response<Self::ChatStream>, Status> {
-        Err(Status::unimplemented("chat not yet implemented"))
+        let req = request.into_inner();
+        let engine = self.engine.clone();
+        let (tx, rx) = mpsc::channel(32);
+
+        tokio::task::spawn_blocking(move || {
+            // Format messages into a prompt string
+            let prompt = format_chat_messages(&req.messages);
+            let params = proto_params_to_engine(req.params);
+            let mut token_count = 0u32;
+            let start = std::time::Instant::now();
+
+            let result = engine.generate(&prompt, &params, |token| {
+                token_count += 1;
+                let resp = ChatResponse {
+                    token: token.to_string(),
+                    done: false,
+                    usage: None,
+                };
+                tx.blocking_send(Ok(resp)).is_ok()
+            });
+
+            if let Err(e) = result {
+                let _ = tx.blocking_send(Err(Status::internal(e.to_string())));
+                return;
+            }
+
+            let elapsed = start.elapsed().as_secs_f32();
+            let _ = tx.blocking_send(Ok(ChatResponse {
+                token: String::new(),
+                done: true,
+                usage: Some(UsageStats {
+                    prompt_tokens: 0,
+                    completion_tokens: token_count as i32,
+                    tokens_per_second: if elapsed > 0.0 {
+                        token_count as f32 / elapsed
+                    } else {
+                        0.0
+                    },
+                }),
+            }));
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn pull(
