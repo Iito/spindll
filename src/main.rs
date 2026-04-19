@@ -107,7 +107,19 @@ async fn main() -> anyhow::Result<()> {
             spindll::grpc::start_server(port, manager, store).await?;
         }
         Commands::Run { model, prompt } => {
-            println!("run: model={model}, prompt={prompt}");
+            let store = spindll::model_store::ModelStore::new(None);
+            let model_path = store.resolve_model_path(&model)?;
+
+            let engine = spindll::engine::Engine::load(&model_path, None, 2048)?;
+            let params = spindll::engine::GenerateParams::default();
+
+            engine.generate(&prompt, &params, |token| {
+                use std::io::Write;
+                print!("{token}");
+                std::io::stdout().flush().ok();
+                true
+            })?;
+            println!();
         }
         Commands::Import { from_ollama } => {
             if from_ollama {
