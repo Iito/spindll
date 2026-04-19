@@ -69,6 +69,27 @@ impl Engine {
             .map_err(|e| anyhow::anyhow!("failed to create context: {e}"))
     }
 
+    /// Apply the model's built-in chat template to a list of (role, content) messages.
+    pub fn apply_chat_template(
+        &self,
+        messages: &[(String, String)],
+    ) -> anyhow::Result<String> {
+        let tmpl = self.model.chat_template(None)
+            .map_err(|e| anyhow::anyhow!("model has no chat template: {e}"))?;
+
+        let chat_messages: Vec<llama_cpp_2::model::LlamaChatMessage> = messages
+            .iter()
+            .map(|(role, content)| {
+                llama_cpp_2::model::LlamaChatMessage::new(role.clone(), content.clone())
+                    .map_err(|e| anyhow::anyhow!("invalid chat message: {e}"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        self.model
+            .apply_chat_template(&tmpl, &chat_messages, true)
+            .map_err(|e| anyhow::anyhow!("failed to apply chat template: {e}"))
+    }
+
     pub fn generate(
         &self,
         prompt: &str,

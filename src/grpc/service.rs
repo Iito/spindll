@@ -19,27 +19,6 @@ impl SpindllService {
     }
 }
 
-fn format_chat_messages(messages: &[Message]) -> String {
-    let mut prompt = String::new();
-    for msg in messages {
-        match msg.role.as_str() {
-            "system" => {
-                prompt.push_str(&format!("<<SYS>>\n{}\n<</SYS>>\n\n", msg.content));
-            }
-            "user" => {
-                prompt.push_str(&format!("[INST] {} [/INST]\n", msg.content));
-            }
-            "assistant" => {
-                prompt.push_str(&format!("{}\n", msg.content));
-            }
-            _ => {
-                prompt.push_str(&format!("{}\n", msg.content));
-            }
-        }
-    }
-    prompt
-}
-
 fn proto_params_to_engine(p: Option<crate::proto::GenerateParams>) -> GenerateParams {
     match p {
         Some(p) => GenerateParams {
@@ -115,7 +94,18 @@ impl Spindll for SpindllService {
         let (tx, rx) = mpsc::channel(32);
 
         tokio::task::spawn_blocking(move || {
-            let prompt = format_chat_messages(&req.messages);
+            let messages: Vec<_> = req.messages.iter()
+                .map(|m| (m.role.clone(), m.content.clone()))
+                .collect();
+            let prompt = match engine.apply_chat_template(&messages) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(Status::internal(
+                        format!("chat template error: {e}")
+                    )));
+                    return;
+                }
+            };
             let params = proto_params_to_engine(req.params);
             let start = std::time::Instant::now();
 
