@@ -36,6 +36,26 @@ impl ModelStore {
     pub fn pull(&self, repo_id: &str, quant: Option<&str>) -> anyhow::Result<PathBuf> {
         self.ensure_dirs()?;
         let dest_dir = self.model_dir(repo_id);
-        download::download_gguf(repo_id, quant, &dest_dir)
+        let path = download::download_gguf(repo_id, quant, &dest_dir)?;
+
+        // Record in registry
+        let metadata = std::fs::symlink_metadata(&path)?;
+        let filename = path.file_name().unwrap().to_string_lossy().to_string();
+        let key = format!("{}/{}", repo_id, filename);
+
+        let mut reg = registry::Registry::load(&self.registry_path());
+        reg.add(key, registry::ModelEntry {
+            repo: repo_id.to_string(),
+            filename,
+            path: path.clone(),
+            size_bytes: metadata.len(),
+            downloaded_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        });
+        reg.save(&self.registry_path());
+
+        Ok(path)
     }
 }
