@@ -44,7 +44,7 @@ pub fn download_gguf(repo_id: &str, quant: Option<&str>, dest_dir: &Path) -> any
 }
 
 /// Check that a file starts with the GGUF magic bytes.
-fn validate_gguf(path: &Path) -> anyhow::Result<()> {
+pub fn validate_gguf(path: &Path) -> anyhow::Result<()> {
     let mut f = std::fs::File::open(path)?;
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;

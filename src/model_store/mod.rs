@@ -34,22 +34,39 @@ impl ModelStore {
         std::fs::create_dir_all(self.models_dir())
     }
 
-    pub fn pull(&self, repo_id: &str, quant: Option<&str>) -> anyhow::Result<PathBuf> {
+    /// Pull a model from Ollama's registry (default) or HuggingFace.
+    pub fn pull(&self, model: &str, quant: Option<&str>, from_hf: bool) -> anyhow::Result<PathBuf> {
         self.ensure_dirs()?;
-        let dest_dir = self.model_dir(repo_id);
-        let path = download::download_gguf(repo_id, quant, &dest_dir)?;
 
-        // Record in registry
-        let metadata = std::fs::symlink_metadata(&path)?;
+        let (path, size_bytes) = if from_hf {
+            let dest_dir = self.model_dir(model);
+            let path = download::download_gguf(model, quant, &dest_dir)?;
+            let size = std::fs::symlink_metadata(&path)?.len();
+            (path, size)
+        } else {
+            let (name, _tag) = ollama_pull::parse_model_ref(model);
+            let dest_dir = self.model_dir(&format!("ollama/{name}"));
+            ollama_pull::pull_from_registry(model, &dest_dir)?
+        };
+
+        // Validate GGUF
+        download::validate_gguf(&path)?;
+
+        // Register
         let filename = path.file_name().unwrap().to_string_lossy().to_string();
-        let key = format!("{}/{}", repo_id, filename);
+        let key = if from_hf {
+            format!("{}/{}", model, filename)
+        } else {
+            let (name, _tag) = ollama_pull::parse_model_ref(model);
+            format!("ollama/{name}/{filename}")
+        };
 
         let mut reg = registry::Registry::load(&self.registry_path())?;
         reg.add(key, registry::ModelEntry {
-            repo: repo_id.to_string(),
+            repo: model.to_string(),
             filename,
             path: path.clone(),
-            size_bytes: metadata.len(),
+            size_bytes,
             downloaded_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

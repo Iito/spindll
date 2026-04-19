@@ -10,14 +10,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Download a model from HuggingFace
+    /// Pull a model (from Ollama registry by default, or HuggingFace with --hf)
     Pull {
-        /// HuggingFace repo (e.g. "TheBloke/Llama-3-8B-GGUF")
-        repo: String,
+        /// Model name (e.g. "llama3.1:8b" or HF repo with --hf)
+        model: String,
 
-        /// Quantization filter (e.g. "Q4_K_M")
+        /// Quantization filter (HuggingFace only)
         #[arg(long)]
         quant: Option<String>,
+
+        /// Pull from HuggingFace instead of Ollama registry
+        #[arg(long)]
+        hf: bool,
     },
 
     /// List local models
@@ -76,9 +80,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Pull { repo, quant } => {
+        Commands::Pull { model, quant, hf } => {
             let store = spindll::model_store::ModelStore::new(None);
-            let path = store.pull(&repo, quant.as_deref())?;
+            let path = store.pull(&model, quant.as_deref(), hf)?;
             println!("model ready: {}", path.display());
         }
         Commands::List => {
