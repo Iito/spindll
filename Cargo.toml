@@ -8,6 +8,7 @@ license = "Apache-2.0"
 [dependencies]
 # Async runtime (like Python's asyncio event loop)
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
 
 # gRPC framework
 tonic = "0.13"
