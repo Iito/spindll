@@ -1,5 +1,7 @@
 pub mod streaming;
 
+pub use streaming::GenerateParams;
+
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
@@ -45,5 +47,15 @@ impl Engine {
         self.model
             .new_context(&self.backend, params)
             .map_err(|e| anyhow::anyhow!("failed to create context: {e}"))
+    }
+
+    pub fn generate(
+        &self,
+        prompt: &str,
+        params: &GenerateParams,
+        on_token: impl FnMut(&str) -> bool,
+    ) -> anyhow::Result<()> {
+        let mut ctx = self.create_context()?;
+        streaming::generate_streaming(&self.model, &mut ctx, prompt, params, on_token)
     }
 }
