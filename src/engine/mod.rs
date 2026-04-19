@@ -16,13 +16,33 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn load(path: &Path, n_gpu_layers: u32, n_ctx: u32) -> anyhow::Result<Self> {
+    /// Load a model, auto-detecting GPU. Pass n_gpu_layers=None to offload all layers.
+    pub fn load(path: &Path, n_gpu_layers: Option<u32>, n_ctx: u32) -> anyhow::Result<Self> {
         let backend = LlamaBackend::init()?;
 
+        let gpu_layers = n_gpu_layers.unwrap_or_else(|| {
+            if cfg!(target_os = "macos") {
+                // Metal: offload everything
+                999
+            } else {
+                // CPU fallback — user can override with explicit count
+                0
+            }
+        });
+
         let model_params = LlamaModelParams::default()
-            .with_n_gpu_layers(n_gpu_layers);
+            .with_n_gpu_layers(gpu_layers);
         let model = LlamaModel::load_from_file(&backend, path, &model_params)
             .map_err(|e| anyhow::anyhow!("failed to load model: {e}"))?;
+
+        let device = if gpu_layers > 0 && cfg!(target_os = "macos") {
+            "metal"
+        } else if gpu_layers > 0 {
+            "cuda"
+        } else {
+            "cpu"
+        };
+        println!("loaded {} layers on {device}", model.n_layer());
 
         Ok(Self {
             backend,
