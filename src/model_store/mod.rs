@@ -75,6 +75,21 @@ impl ModelStore {
         Ok(())
     }
 
+    /// Look up a model key in the registry and return the path to the GGUF file.
+    pub fn resolve_model_path(&self, model: &str) -> anyhow::Result<PathBuf> {
+        let reg = registry::Registry::load(&self.registry_path())?;
+        let entry = reg
+            .models
+            .get(model)
+            .ok_or_else(|| anyhow::anyhow!("model '{}' not found in registry", model))?;
+
+        let path = &entry.path;
+        // Resolve symlink to actual file
+        let real = std::fs::canonicalize(path)
+            .map_err(|_| anyhow::anyhow!("model file missing: {}", path.display()))?;
+        Ok(real)
+    }
+
     pub fn remove(&self, model: &str) -> anyhow::Result<()> {
         let mut reg = registry::Registry::load(&self.registry_path())?;
         let entry = reg.remove(model)
