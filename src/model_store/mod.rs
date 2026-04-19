@@ -90,6 +90,79 @@ impl ModelStore {
         Ok(real)
     }
 
+    /// Import all models from Ollama's local storage.
+    pub fn import_from_ollama(&self) -> anyhow::Result<u32> {
+        self.ensure_dirs()?;
+        let ollama = import::ollama_dir();
+        let models = import::discover_models(&ollama)?;
+
+        if models.is_empty() {
+            println!("no ollama models found");
+            return Ok(0);
+        }
+
+        let mut reg = registry::Registry::load(&self.registry_path())?;
+        let mut imported = 0u32;
+
+        for (name, tag, manifest_path) in &models {
+            let manifest = match import::parse_manifest(manifest_path) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("skipping {name}:{tag}: {e}");
+                    continue;
+                }
+            };
+
+            let layer = match manifest.model_layer() {
+                Some(l) => l,
+                None => {
+                    eprintln!("skipping {name}:{tag}: no model layer found");
+                    continue;
+                }
+            };
+
+            let blob_path = import::digest_to_blob_path(&ollama, &layer.digest);
+            if !blob_path.exists() {
+                eprintln!("skipping {name}:{tag}: blob missing at {}", blob_path.display());
+                continue;
+            }
+
+            // Symlink into spindll store
+            let dest_dir = self.model_dir(&format!("ollama/{name}"));
+            std::fs::create_dir_all(&dest_dir)?;
+            let filename = format!("{tag}.gguf");
+            let dest = dest_dir.join(&filename);
+
+            if !dest.exists() {
+                std::os::unix::fs::symlink(&blob_path, &dest)?;
+            }
+
+            let key = format!("ollama/{name}/{filename}");
+            if !reg.models.contains_key(&key) {
+                reg.add(
+                    key.clone(),
+                    registry::ModelEntry {
+                        repo: format!("ollama/{name}"),
+                        filename: filename.clone(),
+                        path: dest,
+                        size_bytes: layer.size,
+                        downloaded_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                    },
+                );
+                println!("imported {name}:{tag} ({:.1} GB)", layer.size as f64 / 1_073_741_824.0);
+                imported += 1;
+            } else {
+                println!("already imported {name}:{tag}");
+            }
+        }
+
+        reg.save(&self.registry_path())?;
+        Ok(imported)
+    }
+
     pub fn remove(&self, model: &str) -> anyhow::Result<()> {
         let mut reg = registry::Registry::load(&self.registry_path())?;
         let entry = reg.remove(model)
