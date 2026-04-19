@@ -1,4 +1,5 @@
 use hf_hub::api::sync::Api;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Download a GGUF model from HuggingFace and symlink it into the local store.
@@ -36,6 +37,24 @@ pub fn download_gguf(repo_id: &str, quant: Option<&str>, dest_dir: &Path) -> any
         std::os::unix::fs::symlink(&cached_path, &dest)?;
     }
 
+    validate_gguf(&cached_path)?;
+
     println!("done: {}", dest.display());
     Ok(dest)
+}
+
+/// Check that a file starts with the GGUF magic bytes.
+fn validate_gguf(path: &Path) -> anyhow::Result<()> {
+    let mut f = std::fs::File::open(path)?;
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic)?;
+
+    if &magic != b"GGUF" {
+        anyhow::bail!(
+            "not a valid GGUF file (magic: {:02x}{:02x}{:02x}{:02x}): {}",
+            magic[0], magic[1], magic[2], magic[3],
+            path.display()
+        );
+    }
+    Ok(())
 }
