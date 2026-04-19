@@ -209,6 +209,8 @@ impl Spindll for SpindllService {
         &self,
         _request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
+        let mem = crate::scheduler::budget::MemoryBudget::detect(None);
+
         let devices = if cfg!(target_os = "macos") {
             vec!["Metal".to_string(), "CPU".to_string()]
         } else {
@@ -217,7 +219,14 @@ impl Spindll for SpindllService {
 
         Ok(Response::new(StatusResponse {
             models: vec![],
-            memory: None,
+            memory: Some(MemoryInfo {
+                total_ram: mem.total_ram,
+                used_ram: mem.total_ram.saturating_sub(mem.available_ram),
+                available_ram: mem.available_ram,
+                total_vram: 0,
+                used_vram: 0,
+                available_vram: 0,
+            }),
             devices,
         }))
     }
