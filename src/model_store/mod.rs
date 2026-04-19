@@ -76,15 +76,15 @@ impl ModelStore {
     }
 
     pub fn remove(&self, model: &str) -> anyhow::Result<()> {
-        let reg = registry::Registry::load(&self.registry_path());
-        let entry = reg.models.get(model)
+        let mut reg = registry::Registry::load(&self.registry_path());
+        let entry = reg.remove(model)
             .ok_or_else(|| anyhow::anyhow!("model '{}' not found", model))?;
 
         if entry.path.exists() {
             std::fs::remove_file(&entry.path)?;
         }
 
-        // TODO: should probably clean up empty parent dirs too
+        reg.save(&self.registry_path());
         println!("deleted {}", model);
         Ok(())
     }
