@@ -4,16 +4,18 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use crate::engine::{Engine, GenerateParams};
+use crate::model_store::ModelStore;
 use crate::proto::spindll_server::Spindll;
 use crate::proto::*;
 
 pub struct SpindllService {
     engine: Arc<Engine>,
+    model_store: Arc<ModelStore>,
 }
 
 impl SpindllService {
-    pub fn new(engine: Arc<Engine>) -> Self {
-        Self { engine }
+    pub fn new(engine: Arc<Engine>, model_store: Arc<ModelStore>) -> Self {
+        Self { engine, model_store }
     }
 }
 
@@ -164,7 +166,23 @@ impl Spindll for SpindllService {
         &self,
         _request: Request<ListRequest>,
     ) -> Result<Response<ListResponse>, Status> {
-        Err(Status::unimplemented("list not yet implemented"))
+        let reg = crate::model_store::registry::Registry::load(&self.model_store.registry_path())
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let models = reg
+            .models
+            .iter()
+            .map(|(key, entry)| ModelInfo {
+                name: key.clone(),
+                repo: entry.repo.clone(),
+                file: entry.filename.clone(),
+                quantization: String::new(),
+                size_bytes: entry.size_bytes,
+                last_used: String::new(),
+            })
+            .collect();
+
+        Ok(Response::new(ListResponse { models }))
     }
 
     async fn load(
@@ -192,6 +210,16 @@ impl Spindll for SpindllService {
         &self,
         _request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        Err(Status::unimplemented("status not yet implemented"))
+        let devices = if cfg!(target_os = "macos") {
+            vec!["Metal".to_string(), "CPU".to_string()]
+        } else {
+            vec!["CPU".to_string()]
+        };
+
+        Ok(Response::new(StatusResponse {
+            models: vec![],
+            memory: None,
+            devices,
+        }))
     }
 }
