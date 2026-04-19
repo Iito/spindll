@@ -34,33 +34,33 @@ impl ModelStore {
         std::fs::create_dir_all(self.models_dir())
     }
 
-    /// Pull a model from Ollama's registry (default) or HuggingFace.
-    pub fn pull(&self, model: &str, quant: Option<&str>, from_hf: bool) -> anyhow::Result<PathBuf> {
+    /// Pull a model. Auto-detects source:
+    /// - Contains "/" → HuggingFace (e.g. "TheBloke/Llama-3-8B-GGUF")
+    /// - Otherwise → Ollama registry (e.g. "llama3.1:8b")
+    pub fn pull(&self, model: &str, quant: Option<&str>) -> anyhow::Result<PathBuf> {
         self.ensure_dirs()?;
 
-        let (path, size_bytes) = if from_hf {
+        let is_hf = model.contains('/');
+
+        let (path, size_bytes, key) = if is_hf {
             let dest_dir = self.model_dir(model);
             let path = download::download_gguf(model, quant, &dest_dir)?;
             let size = std::fs::symlink_metadata(&path)?.len();
-            (path, size)
+            let filename = path.file_name().unwrap().to_string_lossy();
+            let key = format!("{}/{}", model, filename);
+            (path, size, key)
         } else {
             let (name, _tag) = ollama_pull::parse_model_ref(model);
             let dest_dir = self.model_dir(&format!("ollama/{name}"));
-            ollama_pull::pull_from_registry(model, &dest_dir)?
+            let (path, size) = ollama_pull::pull_from_registry(model, &dest_dir)?;
+            let filename = path.file_name().unwrap().to_string_lossy();
+            let key = format!("ollama/{name}/{filename}");
+            (path, size, key)
         };
 
-        // Validate GGUF
         download::validate_gguf(&path)?;
 
-        // Register
         let filename = path.file_name().unwrap().to_string_lossy().to_string();
-        let key = if from_hf {
-            format!("{}/{}", model, filename)
-        } else {
-            let (name, _tag) = ollama_pull::parse_model_ref(model);
-            format!("ollama/{name}/{filename}")
-        };
-
         let mut reg = registry::Registry::load(&self.registry_path())?;
         reg.add(key, registry::ModelEntry {
             repo: model.to_string(),
