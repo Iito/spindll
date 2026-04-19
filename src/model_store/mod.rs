@@ -1,6 +1,7 @@
 pub mod download;
 pub mod registry;
 pub mod import;
+pub mod ollama_pull;
 
 use std::path::PathBuf;
 
