@@ -68,14 +68,14 @@ enum Commands {
     Status,
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // For now, just print which command was invoked.
-    // Each arm will call into the real implementation in Phase 1.
     match cli.command {
         Commands::Pull { repo, quant } => {
-            println!("pull: repo={repo}, quant={quant:?}");
+            let store = spindll::model_store::ModelStore::new(None);
+            let path = store.pull(&repo, quant.as_deref())?;
+            println!("model ready: {}", path.display());
         }
         Commands::List => {
             println!("list: showing local models");
@@ -96,4 +96,6 @@ fn main() {
             println!("status: querying server");
         }
     }
+
+    Ok(())
 }
