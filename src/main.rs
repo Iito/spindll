@@ -29,26 +29,19 @@ enum Commands {
         model: String,
     },
 
-    /// Start the gRPC server
+    /// Start the gRPC server (models loaded dynamically via Load RPC)
     Serve {
-        /// Model to load (registry key from `spindll list`)
-        model: String,
-
         /// Port to listen on
         #[arg(long, default_value = "50051")]
         port: u16,
 
-        /// Context size
+        /// Default context size for loaded models
         #[arg(long, default_value = "2048")]
         ctx_size: u32,
 
-        /// GPU layers (omit to auto-detect)
+        /// Default GPU layers (omit to auto-detect)
         #[arg(long)]
         gpu_layers: Option<u32>,
-
-        /// Memory budget (e.g. "8G")
-        #[arg(long)]
-        budget: Option<String>,
     },
 
     /// One-shot inference (no server needed)
@@ -90,31 +83,17 @@ async fn main() -> anyhow::Result<()> {
             store.remove(&model)?;
         }
         Commands::Serve {
-            model,
             port,
             ctx_size,
             gpu_layers,
-            budget,
         } => {
-            let store = spindll::model_store::ModelStore::new(None);
-            let model_path = store.resolve_model_path(&model)?;
+            let manager = spindll::engine::ModelManager::new(ctx_size, gpu_layers)?;
+            let manager = std::sync::Arc::new(manager);
+            let store = std::sync::Arc::new(
+                spindll::model_store::ModelStore::new(None),
+            );
 
-            // Check memory budget before loading
-            let mem = spindll::scheduler::budget::MemoryBudget::detect(budget.as_deref());
-            let model_size = std::fs::metadata(&model_path)?.len();
-            if !mem.can_fit(model_size) {
-                anyhow::bail!(
-                    "model is {:.1} GB but memory budget is {:.1} GB",
-                    model_size as f64 / 1_073_741_824.0,
-                    mem.budget as f64 / 1_073_741_824.0
-                );
-            }
-
-            let engine = spindll::engine::Engine::load(&model_path, gpu_layers, ctx_size)?;
-            let engine = std::sync::Arc::new(engine);
-            let store = std::sync::Arc::new(store);
-
-            spindll::grpc::start_server(port, engine, store).await?;
+            spindll::grpc::start_server(port, manager, store).await?;
         }
         Commands::Run { model, prompt } => {
             println!("run: model={model}, prompt={prompt}");

@@ -3,19 +3,19 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use crate::engine::{Engine, GenerateParams};
+use crate::engine::{GenerateParams, ModelManager};
 use crate::model_store::ModelStore;
 use crate::proto::spindll_server::Spindll;
 use crate::proto::*;
 
 pub struct SpindllService {
-    engine: Arc<Engine>,
+    manager: Arc<ModelManager>,
     model_store: Arc<ModelStore>,
 }
 
 impl SpindllService {
-    pub fn new(engine: Arc<Engine>, model_store: Arc<ModelStore>) -> Self {
-        Self { engine, model_store }
+    pub fn new(manager: Arc<ModelManager>, model_store: Arc<ModelStore>) -> Self {
+        Self { manager, model_store }
     }
 }
 
@@ -32,6 +32,21 @@ fn proto_params_to_engine(p: Option<crate::proto::GenerateParams>) -> GeneratePa
     }
 }
 
+fn send_usage(
+    stats: crate::engine::GenerateResult,
+    elapsed: f32,
+) -> UsageStats {
+    UsageStats {
+        prompt_tokens: stats.prompt_tokens as i32,
+        completion_tokens: stats.completion_tokens as i32,
+        tokens_per_second: if elapsed > 0.0 {
+            stats.completion_tokens as f32 / elapsed
+        } else {
+            0.0
+        },
+    }
+}
+
 #[tonic::async_trait]
 impl Spindll for SpindllService {
     type GenerateStream = ReceiverStream<Result<GenerateResponse, Status>>;
@@ -43,14 +58,14 @@ impl Spindll for SpindllService {
         request: Request<GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
         let req = request.into_inner();
-        let engine = self.engine.clone();
+        let mgr = self.manager.clone();
         let (tx, rx) = mpsc::channel(32);
 
         tokio::task::spawn_blocking(move || {
             let params = proto_params_to_engine(req.params);
             let start = std::time::Instant::now();
 
-            let result = engine.generate(&req.prompt, &params, |token| {
+            let result = mgr.generate(&req.model, &req.prompt, &params, |token| {
                 let resp = GenerateResponse {
                     token: token.to_string(),
                     done: false,
@@ -64,19 +79,10 @@ impl Spindll for SpindllService {
                     let _ = tx.blocking_send(Err(Status::internal(e.to_string())));
                 }
                 Ok(stats) => {
-                    let elapsed = start.elapsed().as_secs_f32();
                     let _ = tx.blocking_send(Ok(GenerateResponse {
                         token: String::new(),
                         done: true,
-                        usage: Some(UsageStats {
-                            prompt_tokens: stats.prompt_tokens as i32,
-                            completion_tokens: stats.completion_tokens as i32,
-                            tokens_per_second: if elapsed > 0.0 {
-                                stats.completion_tokens as f32 / elapsed
-                            } else {
-                                0.0
-                            },
-                        }),
+                        usage: Some(send_usage(stats, start.elapsed().as_secs_f32())),
                     }));
                 }
             }
@@ -90,14 +96,14 @@ impl Spindll for SpindllService {
         request: Request<ChatRequest>,
     ) -> Result<Response<Self::ChatStream>, Status> {
         let req = request.into_inner();
-        let engine = self.engine.clone();
+        let mgr = self.manager.clone();
         let (tx, rx) = mpsc::channel(32);
 
         tokio::task::spawn_blocking(move || {
             let messages: Vec<_> = req.messages.iter()
                 .map(|m| (m.role.clone(), m.content.clone()))
                 .collect();
-            let prompt = match engine.apply_chat_template(&messages) {
+            let prompt = match mgr.apply_chat_template(&req.model, &messages) {
                 Ok(p) => p,
                 Err(e) => {
                     let _ = tx.blocking_send(Err(Status::internal(
@@ -109,7 +115,7 @@ impl Spindll for SpindllService {
             let params = proto_params_to_engine(req.params);
             let start = std::time::Instant::now();
 
-            let result = engine.generate(&prompt, &params, |token| {
+            let result = mgr.generate(&req.model, &prompt, &params, |token| {
                 let resp = ChatResponse {
                     token: token.to_string(),
                     done: false,
@@ -123,19 +129,10 @@ impl Spindll for SpindllService {
                     let _ = tx.blocking_send(Err(Status::internal(e.to_string())));
                 }
                 Ok(stats) => {
-                    let elapsed = start.elapsed().as_secs_f32();
                     let _ = tx.blocking_send(Ok(ChatResponse {
                         token: String::new(),
                         done: true,
-                        usage: Some(UsageStats {
-                            prompt_tokens: stats.prompt_tokens as i32,
-                            completion_tokens: stats.completion_tokens as i32,
-                            tokens_per_second: if elapsed > 0.0 {
-                                stats.completion_tokens as f32 / elapsed
-                            } else {
-                                0.0
-                            },
-                        }),
+                        usage: Some(send_usage(stats, start.elapsed().as_secs_f32())),
                     }));
                 }
             }
@@ -176,16 +173,35 @@ impl Spindll for SpindllService {
 
     async fn load(
         &self,
-        _request: Request<LoadRequest>,
+        request: Request<LoadRequest>,
     ) -> Result<Response<LoadResponse>, Status> {
-        Err(Status::unimplemented("load not yet implemented"))
+        let req = request.into_inner();
+        let model_path = self.model_store
+            .resolve_model_path(&req.model)
+            .map_err(|e| Status::not_found(e.to_string()))?;
+
+        let gpu_layers = if req.gpu_layers < 0 { None } else { Some(req.gpu_layers as u32) };
+
+        self.manager
+            .load_model(&req.model, &model_path, gpu_layers)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(LoadResponse {
+            success: true,
+            message: format!("loaded {}", req.model),
+        }))
     }
 
     async fn unload(
         &self,
-        _request: Request<UnloadRequest>,
+        request: Request<UnloadRequest>,
     ) -> Result<Response<UnloadResponse>, Status> {
-        Err(Status::unimplemented("unload not yet implemented"))
+        let req = request.into_inner();
+        self.manager
+            .unload_model(&req.model)
+            .map_err(|e| Status::not_found(e.to_string()))?;
+
+        Ok(Response::new(UnloadResponse { success: true }))
     }
 
     async fn delete(
@@ -201,6 +217,14 @@ impl Spindll for SpindllService {
     ) -> Result<Response<StatusResponse>, Status> {
         let mem = crate::scheduler::budget::MemoryBudget::detect(None);
 
+        let models = self.manager.loaded_models().iter()
+            .map(|(name, size, layers)| LoadedModel {
+                name: name.clone(),
+                memory_used: *size,
+                gpu_layers: *layers as i32,
+            })
+            .collect();
+
         let devices = if cfg!(target_os = "macos") {
             vec!["Metal".to_string(), "CPU".to_string()]
         } else {
@@ -208,7 +232,7 @@ impl Spindll for SpindllService {
         };
 
         Ok(Response::new(StatusResponse {
-            models: vec![],
+            models,
             memory: Some(MemoryInfo {
                 total_ram: mem.total_ram,
                 used_ram: mem.total_ram.saturating_sub(mem.available_ram),

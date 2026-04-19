@@ -1,17 +1,17 @@
 pub mod service;
 
 use std::sync::Arc;
-use crate::engine::Engine;
+use crate::engine::ModelManager;
 use crate::model_store::ModelStore;
 use crate::proto::spindll_server::SpindllServer;
 
 pub async fn start_server(
     port: u16,
-    engine: Arc<Engine>,
+    manager: Arc<ModelManager>,
     model_store: Arc<ModelStore>,
 ) -> anyhow::Result<()> {
     let addr = format!("0.0.0.0:{port}").parse()?;
-    let svc = service::SpindllService::new(engine, model_store);
+    let svc = service::SpindllService::new(manager, model_store);
 
     println!("spindll serving on {addr}");
 
