@@ -120,7 +120,13 @@ async fn main() -> anyhow::Result<()> {
             println!("run: model={model}, prompt={prompt}");
         }
         Commands::Import { from_ollama } => {
-            println!("import: from_ollama={from_ollama}");
+            if from_ollama {
+                let store = spindll::model_store::ModelStore::new(None);
+                let count = store.import_from_ollama()?;
+                println!("imported {count} model(s) from ollama");
+            } else {
+                anyhow::bail!("specify --from-ollama");
+            }
         }
         Commands::Status => {
             println!("status: querying server");
