@@ -1,0 +1,156 @@
+syntax = "proto3";
+
+package spindll;
+
+// The main Spindll service — model management + inference.
+service Spindll {
+  // Streaming inference from a text prompt.
+  rpc Generate (GenerateRequest) returns (stream GenerateResponse);
+
+  // Streaming chat inference from a message history.
+  rpc Chat (ChatRequest) returns (stream ChatResponse);
+
+  // Download a model from HuggingFace. Streams progress updates.
+  rpc Pull (PullRequest) returns (stream PullProgress);
+
+  // List locally available models.
+  rpc List (ListRequest) returns (ListResponse);
+
+  // Load a model into memory.
+  rpc Load (LoadRequest) returns (LoadResponse);
+
+  // Unload a model from memory.
+  rpc Unload (UnloadRequest) returns (UnloadResponse);
+
+  // Delete a model from disk.
+  rpc Delete (DeleteRequest) returns (DeleteResponse);
+
+  // Server status: loaded models, memory, devices.
+  rpc Status (StatusRequest) returns (StatusResponse);
+}
+
+// --- Inference ---
+
+message GenerateRequest {
+  string model = 1;
+  string prompt = 2;
+  GenerateParams params = 3;
+}
+
+message GenerateResponse {
+  string token = 1;
+  bool done = 2;
+  UsageStats usage = 3;  // populated on final message
+}
+
+message ChatRequest {
+  string model = 1;
+  repeated Message messages = 2;
+  GenerateParams params = 3;
+}
+
+message ChatResponse {
+  string token = 1;
+  bool done = 2;
+  UsageStats usage = 3;  // populated on final message
+}
+
+message Message {
+  string role = 1;     // "system", "user", "assistant"
+  string content = 2;
+}
+
+message GenerateParams {
+  float temperature = 1;
+  float top_p = 2;
+  int32 top_k = 3;
+  int32 max_tokens = 4;
+  repeated string stop = 5;
+  uint64 seed = 6;
+}
+
+message UsageStats {
+  int32 prompt_tokens = 1;
+  int32 completion_tokens = 2;
+  float tokens_per_second = 3;
+}
+
+// --- Model Management ---
+
+message PullRequest {
+  string repo = 1;          // e.g. "TheBloke/Llama-3-8B-GGUF"
+  string quantization = 2;  // e.g. "Q4_K_M" (optional filter)
+}
+
+message PullProgress {
+  string file = 1;
+  uint64 downloaded = 2;
+  uint64 total = 3;
+  bool done = 4;
+}
+
+message ListRequest {}
+
+message ListResponse {
+  repeated ModelInfo models = 1;
+}
+
+message ModelInfo {
+  string name = 1;
+  string repo = 2;
+  string file = 3;
+  string quantization = 4;
+  uint64 size_bytes = 5;
+  string last_used = 6;
+}
+
+message LoadRequest {
+  string model = 1;
+  int32 gpu_layers = 2;  // -1 = auto
+}
+
+message LoadResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message UnloadRequest {
+  string model = 1;
+}
+
+message UnloadResponse {
+  bool success = 1;
+}
+
+message DeleteRequest {
+  string model = 1;
+}
+
+message DeleteResponse {
+  bool success = 1;
+}
+
+// --- Server Status ---
+
+message StatusRequest {}
+
+message StatusResponse {
+  repeated LoadedModel models = 1;
+  MemoryInfo memory = 2;
+  repeated string devices = 3;  // e.g. ["Metal", "CPU"]
+}
+
+message LoadedModel {
+  string name = 1;
+  uint64 memory_used = 2;
+  int32 gpu_layers = 3;
+}
+
+message MemoryInfo {
+  uint64 total_ram = 1;
+  uint64 used_ram = 2;
+  uint64 available_ram = 3;
+  uint64 total_vram = 4;
+  uint64 used_vram = 5;
+  uint64 available_vram = 6;
+}
