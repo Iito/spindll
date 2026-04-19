@@ -1,5 +1,7 @@
+pub mod manager;
 pub mod streaming;
 
+pub use manager::ModelManager;
 pub use streaming::{GenerateParams, GenerateResult};
 
 use llama_cpp_2::context::params::LlamaContextParams;
