@@ -24,6 +24,11 @@ impl Default for GenerateParams {
     }
 }
 
+pub struct GenerateResult {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+}
+
 /// Generate tokens from a prompt, calling `on_token` for each piece of text produced.
 pub fn generate_streaming(
     model: &LlamaModel,
@@ -31,7 +36,7 @@ pub fn generate_streaming(
     prompt: &str,
     params: &GenerateParams,
     mut on_token: impl FnMut(&str) -> bool, // return false to stop
-) -> anyhow::Result<()> {
+) -> anyhow::Result<GenerateResult> {
     let tokens = model.str_to_token(prompt, AddBos::Always)?;
     if tokens.is_empty() {
         anyhow::bail!("prompt produced no tokens");
@@ -52,8 +57,10 @@ pub fn generate_streaming(
         LlamaSampler::dist(params.seed),
     ]);
 
+    let prompt_token_count = tokens.len() as u32;
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut n_cur = batch.n_tokens();
+    let mut completion_tokens = 0u32;
 
     for _ in 0..params.max_tokens {
         let token = sampler.sample(ctx, batch.n_tokens() - 1);
@@ -63,6 +70,7 @@ pub fn generate_streaming(
             break;
         }
 
+        completion_tokens += 1;
         let piece = model
             .token_to_piece(token, &mut decoder, true, None)
             .map_err(|e| anyhow::anyhow!("token decode error: {e}"))?;
@@ -77,5 +85,8 @@ pub fn generate_streaming(
         n_cur += 1;
     }
 
-    Ok(())
+    Ok(GenerateResult {
+        prompt_tokens: prompt_token_count,
+        completion_tokens,
+    })
 }

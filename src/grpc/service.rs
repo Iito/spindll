@@ -69,11 +69,9 @@ impl Spindll for SpindllService {
 
         tokio::task::spawn_blocking(move || {
             let params = proto_params_to_engine(req.params);
-            let mut token_count = 0u32;
             let start = std::time::Instant::now();
 
             let result = engine.generate(&req.prompt, &params, |token| {
-                token_count += 1;
                 let resp = GenerateResponse {
                     token: token.to_string(),
                     done: false,
@@ -82,25 +80,27 @@ impl Spindll for SpindllService {
                 tx.blocking_send(Ok(resp)).is_ok()
             });
 
-            if let Err(e) = result {
-                let _ = tx.blocking_send(Err(Status::internal(e.to_string())));
-                return;
+            match result {
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(Status::internal(e.to_string())));
+                }
+                Ok(stats) => {
+                    let elapsed = start.elapsed().as_secs_f32();
+                    let _ = tx.blocking_send(Ok(GenerateResponse {
+                        token: String::new(),
+                        done: true,
+                        usage: Some(UsageStats {
+                            prompt_tokens: stats.prompt_tokens as i32,
+                            completion_tokens: stats.completion_tokens as i32,
+                            tokens_per_second: if elapsed > 0.0 {
+                                stats.completion_tokens as f32 / elapsed
+                            } else {
+                                0.0
+                            },
+                        }),
+                    }));
+                }
             }
-
-            let elapsed = start.elapsed().as_secs_f32();
-            let _ = tx.blocking_send(Ok(GenerateResponse {
-                token: String::new(),
-                done: true,
-                usage: Some(UsageStats {
-                    prompt_tokens: 0,
-                    completion_tokens: token_count as i32,
-                    tokens_per_second: if elapsed > 0.0 {
-                        token_count as f32 / elapsed
-                    } else {
-                        0.0
-                    },
-                }),
-            }));
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -115,14 +115,11 @@ impl Spindll for SpindllService {
         let (tx, rx) = mpsc::channel(32);
 
         tokio::task::spawn_blocking(move || {
-            // Format messages into a prompt string
             let prompt = format_chat_messages(&req.messages);
             let params = proto_params_to_engine(req.params);
-            let mut token_count = 0u32;
             let start = std::time::Instant::now();
 
             let result = engine.generate(&prompt, &params, |token| {
-                token_count += 1;
                 let resp = ChatResponse {
                     token: token.to_string(),
                     done: false,
@@ -131,25 +128,27 @@ impl Spindll for SpindllService {
                 tx.blocking_send(Ok(resp)).is_ok()
             });
 
-            if let Err(e) = result {
-                let _ = tx.blocking_send(Err(Status::internal(e.to_string())));
-                return;
+            match result {
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(Status::internal(e.to_string())));
+                }
+                Ok(stats) => {
+                    let elapsed = start.elapsed().as_secs_f32();
+                    let _ = tx.blocking_send(Ok(ChatResponse {
+                        token: String::new(),
+                        done: true,
+                        usage: Some(UsageStats {
+                            prompt_tokens: stats.prompt_tokens as i32,
+                            completion_tokens: stats.completion_tokens as i32,
+                            tokens_per_second: if elapsed > 0.0 {
+                                stats.completion_tokens as f32 / elapsed
+                            } else {
+                                0.0
+                            },
+                        }),
+                    }));
+                }
             }
-
-            let elapsed = start.elapsed().as_secs_f32();
-            let _ = tx.blocking_send(Ok(ChatResponse {
-                token: String::new(),
-                done: true,
-                usage: Some(UsageStats {
-                    prompt_tokens: 0,
-                    completion_tokens: token_count as i32,
-                    tokens_per_second: if elapsed > 0.0 {
-                        token_count as f32 / elapsed
-                    } else {
-                        0.0
-                    },
-                }),
-            }));
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
