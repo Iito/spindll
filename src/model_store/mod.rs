@@ -32,4 +32,10 @@ impl ModelStore {
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(self.models_dir())
     }
+
+    pub fn pull(&self, repo_id: &str, quant: Option<&str>) -> anyhow::Result<PathBuf> {
+        self.ensure_dirs()?;
+        let dest_dir = self.model_dir(repo_id);
+        download::download_gguf(repo_id, quant, &dest_dir)
+    }
 }

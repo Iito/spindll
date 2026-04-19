@@ -1,9 +1,8 @@
 use hf_hub::api::sync::Api;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-/// Download a GGUF model from HuggingFace.
-/// Returns the path to the downloaded file.
-pub fn download_gguf(repo_id: &str, quant: Option<&str>) -> anyhow::Result<PathBuf> {
+/// Download a GGUF model from HuggingFace and symlink it into the local store.
+pub fn download_gguf(repo_id: &str, quant: Option<&str>, dest_dir: &Path) -> anyhow::Result<PathBuf> {
     let api = Api::new()?;
     let repo = api.model(repo_id.to_string());
 
@@ -28,8 +27,15 @@ pub fn download_gguf(repo_id: &str, quant: Option<&str>) -> anyhow::Result<PathB
     };
 
     println!("downloading {}", target.rfilename);
-    let path = repo.get(&target.rfilename)?;
+    let cached_path = repo.get(&target.rfilename)?;
 
-    println!("done: {}", path.display());
-    Ok(path)
+    // Symlink from hf cache into our model store
+    std::fs::create_dir_all(dest_dir)?;
+    let dest = dest_dir.join(&target.rfilename);
+    if !dest.exists() {
+        std::os::unix::fs::symlink(&cached_path, &dest)?;
+    }
+
+    println!("done: {}", dest.display());
+    Ok(dest)
 }
