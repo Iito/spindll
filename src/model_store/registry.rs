@@ -17,18 +17,20 @@ pub struct Registry {
 }
 
 impl Registry {
-    pub fn load(path: &Path) -> Self {
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
         if path.exists() {
-            let data = std::fs::read_to_string(path).unwrap();
-            serde_json::from_str(&data).unwrap()
+            let data = std::fs::read_to_string(path)?;
+            let reg = serde_json::from_str(&data)?;
+            Ok(reg)
         } else {
-            Self::default()
+            Ok(Self::default())
         }
     }
 
-    pub fn save(&self, path: &Path) {
-        let data = serde_json::to_string_pretty(self).unwrap();
-        std::fs::write(path, data).unwrap();
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        let data = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, data)?;
+        Ok(())
     }
 
     pub fn add(&mut self, key: String, entry: ModelEntry) {

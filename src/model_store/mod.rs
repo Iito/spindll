@@ -43,7 +43,7 @@ impl ModelStore {
         let filename = path.file_name().unwrap().to_string_lossy().to_string();
         let key = format!("{}/{}", repo_id, filename);
 
-        let mut reg = registry::Registry::load(&self.registry_path());
+        let mut reg = registry::Registry::load(&self.registry_path())?;
         reg.add(key, registry::ModelEntry {
             repo: repo_id.to_string(),
             filename,
@@ -54,13 +54,13 @@ impl ModelStore {
                 .unwrap()
                 .as_secs(),
         });
-        reg.save(&self.registry_path());
+        reg.save(&self.registry_path())?;
 
         Ok(path)
     }
 
     pub fn list(&self) -> anyhow::Result<()> {
-        let reg = registry::Registry::load(&self.registry_path());
+        let reg = registry::Registry::load(&self.registry_path())?;
         if reg.models.is_empty() {
             println!("no models downloaded");
             return Ok(());
@@ -76,7 +76,7 @@ impl ModelStore {
     }
 
     pub fn remove(&self, model: &str) -> anyhow::Result<()> {
-        let mut reg = registry::Registry::load(&self.registry_path());
+        let mut reg = registry::Registry::load(&self.registry_path())?;
         let entry = reg.remove(model)
             .ok_or_else(|| anyhow::anyhow!("model '{}' not found", model))?;
 
@@ -84,7 +84,7 @@ impl ModelStore {
             std::fs::remove_file(&entry.path)?;
         }
 
-        reg.save(&self.registry_path());
+        reg.save(&self.registry_path())?;
         println!("deleted {}", model);
         Ok(())
     }
