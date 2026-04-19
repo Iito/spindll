@@ -24,10 +24,11 @@ pub struct ModelManager {
     models: RwLock<HashMap<String, LoadedModel>>,
     default_n_ctx: u32,
     default_gpu_layers: u32,
+    memory_budget: u64, // max bytes for loaded models, 0 = unlimited
 }
 
 impl ModelManager {
-    pub fn new(n_ctx: u32, gpu_layers: Option<u32>) -> anyhow::Result<Self> {
+    pub fn new(n_ctx: u32, gpu_layers: Option<u32>, memory_budget: u64) -> anyhow::Result<Self> {
         let backend = LlamaBackend::init()?;
 
         let default_gpu_layers = gpu_layers.unwrap_or_else(|| {
@@ -39,7 +40,51 @@ impl ModelManager {
             models: RwLock::new(HashMap::new()),
             default_n_ctx: n_ctx,
             default_gpu_layers,
+            memory_budget,
         })
+    }
+
+    fn total_loaded_bytes(&self) -> u64 {
+        self.models
+            .read()
+            .unwrap()
+            .values()
+            .map(|m| m.size_bytes)
+            .sum()
+    }
+
+    /// Evict least-recently-used models until `needed` bytes fit within budget.
+    fn evict_for(&self, needed: u64) -> anyhow::Result<()> {
+        if self.memory_budget == 0 {
+            return Ok(()); // unlimited
+        }
+
+        loop {
+            let used = self.total_loaded_bytes();
+            if used + needed <= self.memory_budget {
+                return Ok(());
+            }
+
+            // Find LRU model
+            let models = self.models.read().unwrap();
+            if models.is_empty() {
+                anyhow::bail!(
+                    "model needs {:.1} GB but budget is {:.1} GB",
+                    needed as f64 / 1_073_741_824.0,
+                    self.memory_budget as f64 / 1_073_741_824.0
+                );
+            }
+
+            let lru_name = models
+                .iter()
+                .min_by_key(|(_, m)| *m.last_used.read().unwrap())
+                .map(|(name, _)| name.clone())
+                .unwrap();
+            drop(models);
+
+            println!("evicting {lru_name} (lru) to make room");
+            self.models.write().unwrap().remove(&lru_name);
+        }
     }
 
     pub fn load_model(
@@ -48,6 +93,10 @@ impl ModelManager {
         path: &Path,
         gpu_layers: Option<u32>,
     ) -> anyhow::Result<()> {
+        // Estimate size from file for budget check before loading
+        let file_size = std::fs::metadata(path)?.len();
+        self.evict_for(file_size)?;
+
         let layers = gpu_layers.unwrap_or(self.default_gpu_layers);
 
         let model_params = LlamaModelParams::default()
