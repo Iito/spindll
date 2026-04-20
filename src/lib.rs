@@ -1,17 +1,14 @@
 //! Spindll — a Rust-native GGUF inference engine with model management.
 //!
-//! This is the library root. Other Rust projects can depend on spindll
-//! as a crate and use these modules directly, without running the server.
+//! The default library includes the gRPC server so embedders (e.g. parley)
+//! can start it in-process. The `cli` feature adds the standalone binary extras
+//! (argument parsing, pretty logging) and is not needed by library consumers.
 
-pub mod model_store;
 pub mod engine;
+pub mod model_store;
 pub mod scheduler;
-
-#[cfg(feature = "cli")]
 pub mod grpc;
 
-// Re-export the generated protobuf types so consumers can use them.
-#[cfg(feature = "cli")]
 pub mod proto {
     tonic::include_proto!("spindll");
 }
