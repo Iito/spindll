@@ -8,6 +8,11 @@ license = "Apache-2.0"
 # By default only the library is built — no protoc required.
 # Use `--features cli` (or depend on spindll with features = ["cli"])
 # to also compile the gRPC server and CLI binary.
+[[bin]]
+name = "spindll"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [features]
 cli = [
     "dep:tonic",
