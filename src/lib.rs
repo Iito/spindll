@@ -6,9 +6,12 @@
 pub mod model_store;
 pub mod engine;
 pub mod scheduler;
+
+#[cfg(feature = "cli")]
 pub mod grpc;
 
 // Re-export the generated protobuf types so consumers can use them.
+#[cfg(feature = "cli")]
 pub mod proto {
     tonic::include_proto!("spindll");
 }

@@ -5,45 +5,41 @@ edition = "2024"
 description = "A Rust-native GGUF inference engine with model management"
 license = "Apache-2.0"
 
+# By default only the library is built — no protoc required.
+# Use `--features cli` (or depend on spindll with features = ["cli"])
+# to also compile the gRPC server and CLI binary.
+[features]
+cli = [
+    "dep:tonic",
+    "dep:prost",
+    "dep:tokio-stream",
+    "dep:clap",
+    "dep:tracing-subscriber",
+    "dep:tonic-build",
+]
+
 [dependencies]
-# Async runtime (like Python's asyncio event loop)
+# Core — always compiled
 tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
-
-# gRPC framework
-tonic = "0.13"
-prost = "0.13"
-
-# CLI argument parsing (like Python's argparse)
-clap = { version = "4", features = ["derive"] }
-
-# HuggingFace model downloads
-hf-hub = "0.4"
-
-# llama.cpp inference
 llama-cpp-2 = "0.1"
 encoding_rs = "0.8"
-
-# HTTP client (for Ollama registry pulls)
+hf-hub = "0.4"
 reqwest = { version = "0.12", features = ["blocking"] }
 indicatif = "0.17"
-
-# Serialization (like Python's json/dataclasses)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-
-# Logging (like Python's logging module)
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# System info (RAM/VRAM detection)
-sysinfo = "0.35"
-
-# Error handling (like Python's custom exception classes, but better)
 thiserror = "2"
 anyhow = "1"
+tracing = "0.1"
+
+# CLI / gRPC server only
+tokio-stream  = { version = "0.1", optional = true }
+tonic         = { version = "0.13", optional = true }
+prost         = { version = "0.13", optional = true }
+clap          = { version = "4", features = ["derive"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+sysinfo       = { version = "0.35" }
 
 [build-dependencies]
-# Compiles .proto files to Rust code at build time
-tonic-build = "0.13"
+tonic-build = { version = "0.13", optional = true }
