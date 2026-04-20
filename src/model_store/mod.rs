@@ -93,19 +93,55 @@ impl ModelStore {
         Ok(())
     }
 
-    /// Look up a model key in the registry and return the path to the GGUF file.
-    pub fn resolve_model_path(&self, model: &str) -> anyhow::Result<PathBuf> {
+    /// Resolve any model name format to its canonical registry key.
+    ///
+    /// Accepted formats (tried in order):
+    ///   - Exact registry key:   `ollama/llama3.1/8b.gguf`
+    ///   - Ollama name+tag:      `llama3.1:8b`  → `ollama/llama3.1/8b.gguf`
+    ///   - Ollama name only:     `llama3.1`     → first matching `ollama/llama3.1/*.gguf`
+    ///   - HuggingFace repo:     `TheBloke/Llama-3-8B-GGUF` → first matching key
+    pub fn resolve_key(&self, model: &str) -> anyhow::Result<String> {
         let reg = registry::Registry::load(&self.registry_path())?;
-        let entry = reg
-            .models
-            .get(model)
-            .ok_or_else(|| anyhow::anyhow!("model '{}' not found in registry", model))?;
 
-        let path = &entry.path;
-        // Resolve symlink to actual file
-        let real = std::fs::canonicalize(path)
-            .map_err(|_| anyhow::anyhow!("model file missing: {}", path.display()))?;
-        Ok(real)
+        // 1. Exact match
+        if reg.models.contains_key(model) {
+            return Ok(model.to_string());
+        }
+
+        // 2. Ollama name:tag  →  ollama/name/tag.gguf
+        if let Some((name, tag)) = model.split_once(':') {
+            let key = format!("ollama/{name}/{tag}.gguf");
+            if reg.models.contains_key(&key) {
+                return Ok(key);
+            }
+        }
+
+        // 3. Bare name  →  first ollama/name/*.gguf entry
+        let prefix = format!("ollama/{model}/");
+        if let Some(key) = reg.models.keys().find(|k| k.starts_with(&prefix)) {
+            return Ok(key.clone());
+        }
+
+        // 4. HuggingFace repo prefix
+        let hf_prefix = format!("{model}/");
+        if let Some(key) = reg.models.keys().find(|k| k.starts_with(&hf_prefix)) {
+            return Ok(key.clone());
+        }
+
+        anyhow::bail!(
+            "model '{}' not found in registry — run: spindll pull {}",
+            model, model
+        )
+    }
+
+    /// Look up a model key in the registry and return the path to the GGUF file.
+    /// Accepts any format that `resolve_key` understands.
+    pub fn resolve_model_path(&self, model: &str) -> anyhow::Result<PathBuf> {
+        let key = self.resolve_key(model)?;
+        let reg = registry::Registry::load(&self.registry_path())?;
+        let path = &reg.models[&key].path;
+        std::fs::canonicalize(path)
+            .map_err(|_| anyhow::anyhow!("model file missing: {}", path.display()))
     }
 
     /// Import all models from Ollama's local storage.
