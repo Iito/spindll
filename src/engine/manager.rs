@@ -82,7 +82,7 @@ impl ModelManager {
                 .unwrap();
             drop(models);
 
-            println!("evicting {lru_name} (lru) to make room");
+            eprintln!("evicting {lru_name} (lru) to make room");
             self.models.write().unwrap().remove(&lru_name);
         }
     }
@@ -113,7 +113,7 @@ impl ModelManager {
         } else {
             "cpu"
         };
-        println!("loaded {name} ({} layers on {device})", model.n_layer());
+        eprintln!("loaded {name} ({} layers on {device})", model.n_layer());
 
         let loaded = LoadedModel {
             model,
@@ -133,7 +133,7 @@ impl ModelManager {
             .unwrap()
             .remove(name)
             .ok_or_else(|| anyhow::anyhow!("model '{name}' not loaded"))?;
-        println!("unloaded {name}");
+        eprintln!("unloaded {name}");
         Ok(())
     }
 
