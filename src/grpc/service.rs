@@ -163,9 +163,43 @@ impl Spindll for SpindllService {
 
     async fn pull(
         &self,
-        _request: Request<PullRequest>,
+        request: Request<PullRequest>,
     ) -> Result<Response<Self::PullStream>, Status> {
-        Err(Status::unimplemented("pull rpc not yet implemented"))
+        let req = request.into_inner();
+        let store = self.model_store.clone();
+        let (tx, rx) = mpsc::channel(4);
+
+        tokio::task::spawn_blocking(move || {
+            let quant = if req.quantization.is_empty() { None } else { Some(req.quantization.as_str()) };
+
+            // Signal that the pull has started.
+            let _ = tx.blocking_send(Ok(PullProgress {
+                file: req.repo.clone(),
+                downloaded: 0,
+                total: 0,
+                done: false,
+            }));
+
+            match store.pull(&req.repo, quant) {
+                Ok(path) => {
+                    let filename = path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    let _ = tx.blocking_send(Ok(PullProgress {
+                        file: filename,
+                        downloaded: size,
+                        total: size,
+                        done: true,
+                    }));
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(Status::internal(e.to_string())));
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn list(
