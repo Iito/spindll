@@ -1,4 +1,5 @@
 use hf_hub::api::sync::Api;
+use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -27,7 +28,7 @@ pub fn download_gguf(repo_id: &str, quant: Option<&str>, dest_dir: &Path) -> any
         &gguf_files[0]
     };
 
-    println!("downloading {}", target.rfilename);
+    tracing::info!(file = %target.rfilename, "downloading");
     let cached_path = repo.get(&target.rfilename)?;
 
     // Symlink from hf cache into our model store
@@ -39,8 +40,23 @@ pub fn download_gguf(repo_id: &str, quant: Option<&str>, dest_dir: &Path) -> any
 
     validate_gguf(&cached_path)?;
 
-    println!("done: {}", dest.display());
+    tracing::info!(path = %dest.display(), "download complete");
     Ok(dest)
+}
+
+/// Compute SHA-256 digest of a file, returned as `"sha256:<hex>"`.
+pub fn sha256_file(path: &Path) -> anyhow::Result<String> {
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 /// Check that a file starts with the GGUF magic bytes.

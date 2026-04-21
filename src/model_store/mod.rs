@@ -1,3 +1,9 @@
+//! Model store — download, import, and resolve GGUF model files.
+//!
+//! Supports pulling from HuggingFace repos and the Ollama registry, importing
+//! existing Ollama models via symlink, and resolving flexible model name formats
+//! to on-disk GGUF paths.
+
 pub mod download;
 pub mod registry;
 pub mod import;
@@ -5,11 +11,17 @@ pub mod ollama_pull;
 
 use std::path::PathBuf;
 
+/// Local model store backed by `~/.spindll` (or a custom directory).
+///
+/// Manages a registry of downloaded/imported GGUF models and provides
+/// name resolution so callers can refer to models by short names like
+/// `"llama3.1:8b"` instead of full paths.
 pub struct ModelStore {
     base_dir: PathBuf,
 }
 
 impl ModelStore {
+    /// Create a store rooted at the given directory, or `~/.spindll` if `None`.
     pub fn new(base_dir: Option<PathBuf>) -> Self {
         let base_dir = base_dir.unwrap_or_else(|| {
             let home = std::env::var("HOME").expect("HOME not set");
@@ -18,18 +30,22 @@ impl ModelStore {
         Self { base_dir }
     }
 
+    /// Path to the directory containing all downloaded model files.
     pub fn models_dir(&self) -> PathBuf {
         self.base_dir.join("models")
     }
 
+    /// Path to the subdirectory for a specific repo (e.g. `models/ollama/llama3.1`).
     pub fn model_dir(&self, repo: &str) -> PathBuf {
         self.models_dir().join(repo)
     }
 
+    /// Path to the `registry.json` file that tracks all known models.
     pub fn registry_path(&self) -> PathBuf {
         self.base_dir.join("registry.json")
     }
 
+    /// Create the models directory tree if it doesn't exist.
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(self.models_dir())
     }
@@ -42,20 +58,21 @@ impl ModelStore {
 
         let is_hf = model.contains('/');
 
-        let (path, size_bytes, key) = if is_hf {
+        let (path, size_bytes, key, digest) = if is_hf {
             let dest_dir = self.model_dir(model);
             let path = download::download_gguf(model, quant, &dest_dir)?;
             let size = std::fs::symlink_metadata(&path)?.len();
             let filename = path.file_name().unwrap().to_string_lossy();
             let key = format!("{}/{}", model, filename);
-            (path, size, key)
+            let digest = download::sha256_file(&path)?;
+            (path, size, key, digest)
         } else {
             let (name, _tag) = ollama_pull::parse_model_ref(model);
             let dest_dir = self.model_dir(&format!("ollama/{name}"));
-            let (path, size) = ollama_pull::pull_from_registry(model, &dest_dir)?;
+            let (path, size, digest) = ollama_pull::pull_from_registry(model, &dest_dir)?;
             let filename = path.file_name().unwrap().to_string_lossy();
             let key = format!("ollama/{name}/{filename}");
-            (path, size, key)
+            (path, size, key, digest)
         };
 
         download::validate_gguf(&path)?;
@@ -71,12 +88,14 @@ impl ModelStore {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+            digest,
         });
         reg.save(&self.registry_path())?;
 
         Ok(path)
     }
 
+    /// Print all registered models to stdout in a tabular format.
     pub fn list(&self) -> anyhow::Result<()> {
         let reg = registry::Registry::load(&self.registry_path())?;
         if reg.models.is_empty() {
@@ -84,11 +103,14 @@ impl ModelStore {
             return Ok(());
         }
 
-        println!("{:<50} {:>10}", "MODEL", "SIZE");
-        println!("{}", "-".repeat(62));
-        for (key, entry) in &reg.models {
+        println!("{:<45} {:>10}", "MODEL", "SIZE");
+        println!("{}", "-".repeat(57));
+        let mut entries: Vec<_> = reg.models.iter().collect();
+        entries.sort_by_key(|(k, _)| (*k).clone());
+        for (key, entry) in entries {
+            let display_name = format_model_name(key);
             let size = format_size(entry.size_bytes);
-            println!("{:<50} {:>10}", key, size);
+            println!("{:<45} {:>10}", display_name, size);
         }
         Ok(())
     }
@@ -144,6 +166,13 @@ impl ModelStore {
             .map_err(|_| anyhow::anyhow!("model file missing: {}", path.display()))
     }
 
+    /// Look up a model's digest from the registry.
+    pub fn resolve_model_digest(&self, model: &str) -> anyhow::Result<String> {
+        let key = self.resolve_key(model)?;
+        let reg = registry::Registry::load(&self.registry_path())?;
+        Ok(reg.models[&key].digest.clone())
+    }
+
     /// Import all models from Ollama's local storage.
     pub fn import_from_ollama(&self) -> anyhow::Result<u32> {
         self.ensure_dirs()?;
@@ -162,7 +191,7 @@ impl ModelStore {
             let manifest = match import::parse_manifest(manifest_path) {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("skipping {name}:{tag}: {e}");
+                    tracing::warn!(name, tag, error = %e, "skipping model: manifest parse error");
                     continue;
                 }
             };
@@ -170,14 +199,14 @@ impl ModelStore {
             let layer = match manifest.model_layer() {
                 Some(l) => l,
                 None => {
-                    eprintln!("skipping {name}:{tag}: no model layer found");
+                    tracing::warn!(name, tag, "skipping model: no model layer found");
                     continue;
                 }
             };
 
             let blob_path = import::digest_to_blob_path(&ollama, &layer.digest);
             if !blob_path.exists() {
-                eprintln!("skipping {name}:{tag}: blob missing at {}", blob_path.display());
+                tracing::warn!(name, tag, path = %blob_path.display(), "skipping model: blob missing");
                 continue;
             }
 
@@ -204,6 +233,7 @@ impl ModelStore {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
                             .as_secs(),
+                        digest: layer.digest.clone(),
                     },
                 );
                 println!("imported {name}:{tag} ({:.1} GB)", layer.size as f64 / 1_073_741_824.0);
@@ -217,6 +247,7 @@ impl ModelStore {
         Ok(imported)
     }
 
+    /// Remove a model from the registry and delete its file on disk.
     pub fn remove(&self, model: &str) -> anyhow::Result<()> {
         let mut reg = registry::Registry::load(&self.registry_path())?;
         let entry = reg.remove(model)
@@ -229,6 +260,25 @@ impl ModelStore {
         reg.save(&self.registry_path())?;
         println!("deleted {}", model);
         Ok(())
+    }
+}
+
+/// Convert a registry key to a friendly display name.
+///
+/// - `ollama/nemotron-3-nano/4b.gguf` → `nemotron-3-nano:4b`
+/// - `TheBloke/Llama-3-8B-GGUF/model.gguf` → `TheBloke/Llama-3-8B-GGUF:model`
+fn format_model_name(key: &str) -> String {
+    let parts: Vec<&str> = key.splitn(3, '/').collect();
+    match parts.as_slice() {
+        [provider, name, file] if *provider == "ollama" => {
+            let tag = file.strip_suffix(".gguf").unwrap_or(file);
+            format!("{name}:{tag}")
+        }
+        [org, repo, file] => {
+            let tag = file.strip_suffix(".gguf").unwrap_or(file);
+            format!("{org}/{repo}:{tag}")
+        }
+        _ => key.to_string(),
     }
 }
 

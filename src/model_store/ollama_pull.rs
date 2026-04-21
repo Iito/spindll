@@ -15,17 +15,17 @@ pub fn parse_model_ref(model: &str) -> (&str, &str) {
 }
 
 /// Pull a model from Ollama's registry.
-/// Returns the path to the downloaded GGUF file.
+/// Returns (path, size, digest).
 pub fn pull_from_registry(
     model: &str,
     dest_dir: &Path,
-) -> anyhow::Result<(PathBuf, u64)> {
+) -> anyhow::Result<(PathBuf, u64, String)> {
     let (name, tag) = parse_model_ref(model);
     let client = reqwest::blocking::Client::new();
 
     // Fetch manifest
     let manifest_url = format!("{REGISTRY_BASE}/v2/library/{name}/manifests/{tag}");
-    println!("pulling {name}:{tag}");
+    tracing::info!(name, tag, "pulling model from registry");
 
     let resp = client.get(&manifest_url).send()?;
     if !resp.status().is_success() {
@@ -41,10 +41,11 @@ pub fn pull_from_registry(
         .ok_or_else(|| anyhow::anyhow!("no model layer in manifest for {name}:{tag}"))?;
 
     // Download the blob
+    let digest = layer.digest.clone();
     let blob_url = format!("{REGISTRY_BASE}/v2/library/{name}/blobs/{}", layer.digest);
     let dest = download_blob(&client, &blob_url, layer, dest_dir, name, tag)?;
 
-    Ok((dest, layer.size))
+    Ok((dest, layer.size, digest))
 }
 
 fn download_blob(
@@ -62,7 +63,7 @@ fn download_blob(
     if dest.exists() {
         let meta = std::fs::metadata(&dest)?;
         if meta.len() == layer.size {
-            println!("already downloaded: {}", dest.display());
+            tracing::debug!(path = %dest.display(), "already downloaded");
             return Ok(dest);
         }
     }

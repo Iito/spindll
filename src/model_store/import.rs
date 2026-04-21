@@ -5,16 +5,22 @@ const OLLAMA_MODELS_DIR: &str = ".ollama/models";
 const MANIFESTS_DIR: &str = "manifests/registry.ollama.ai/library";
 const BLOBS_DIR: &str = "blobs";
 
+/// Parsed Ollama manifest describing a model's layers (blobs).
 #[derive(Debug, Deserialize)]
 pub struct OllamaManifest {
+    /// The layers that make up this model (model weights, template, license, etc.).
     pub layers: Vec<OllamaLayer>,
 }
 
+/// A single layer (blob) within an Ollama manifest.
 #[derive(Debug, Deserialize)]
 pub struct OllamaLayer {
+    /// MIME type identifying the layer's role (e.g. `"application/vnd.ollama.image.model"`).
     #[serde(rename = "mediaType")]
     pub media_type: String,
+    /// Content-addressable digest (e.g. `"sha256:abc123..."`).
     pub digest: String,
+    /// Layer size in bytes.
     pub size: u64,
 }
 
