@@ -97,9 +97,29 @@ impl Spindll for SpindllService {
     ) -> Result<Response<Self::ChatStream>, Status> {
         let req = request.into_inner();
         let mgr = self.manager.clone();
+        let store = self.model_store.clone();
         let (tx, rx) = mpsc::channel(32);
 
         tokio::task::spawn_blocking(move || {
+            // Auto-load the model if it isn't already in the manager.
+            if !mgr.is_loaded(&req.model) {
+                let path = match store.resolve_model_path(&req.model) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(Status::not_found(
+                            format!("model '{}' not found in store: {e}", req.model)
+                        )));
+                        return;
+                    }
+                };
+                if let Err(e) = mgr.load_model(&req.model, &path, None) {
+                    let _ = tx.blocking_send(Err(Status::internal(
+                        format!("failed to load model '{}': {e}", req.model)
+                    )));
+                    return;
+                }
+            }
+
             let messages: Vec<_> = req.messages.iter()
                 .map(|m| (m.role.clone(), m.content.clone()))
                 .collect();
