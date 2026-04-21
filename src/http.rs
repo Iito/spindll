@@ -8,7 +8,8 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::extract::Path;
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::ReceiverStream;
@@ -39,6 +40,8 @@ pub async fn start_http_server(
         .route("/health", get(health))
         .route("/models", get(models))
         .route("/chat", post(chat))
+        .route("/models/{id}", delete(model_delete))
+        .route("/models/{id}/unload", post(model_unload))
         .route("/load", post(load))
         .route("/pull", post(pull))
         .layer(CorsLayer::permissive())
@@ -65,6 +68,7 @@ struct ModelInfo {
     size_bytes: u64,
     quantization: String,
     digest: String,
+    loaded: bool,
 }
 
 async fn models(State(state): State<AppState>) -> impl IntoResponse {
@@ -79,6 +83,13 @@ async fn models(State(state): State<AppState>) -> impl IntoResponse {
         }
     };
 
+    let loaded: std::collections::HashSet<String> = state
+        .manager
+        .loaded_models()
+        .into_iter()
+        .map(|(name, _, _, _)| name)
+        .collect();
+
     let list: Vec<ModelInfo> = reg
         .models
         .iter()
@@ -87,10 +98,46 @@ async fn models(State(state): State<AppState>) -> impl IntoResponse {
             size_bytes: entry.size_bytes,
             quantization: String::new(),
             digest: entry.digest.clone(),
+            loaded: loaded.contains(key),
         })
         .collect();
 
     Json(list).into_response()
+}
+
+// -- DELETE /models/{id} — remove from disk -----------------------------------
+
+async fn model_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    // Unload from memory first if loaded.
+    let _ = state.manager.unload_model(&id);
+
+    match state.store.remove(&id) {
+        Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// -- POST /models/{id}/unload — remove from memory ----------------------------
+
+async fn model_unload(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.manager.unload_model(&id) {
+        Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 // -- /chat (SSE) --------------------------------------------------------------
