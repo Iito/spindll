@@ -25,6 +25,9 @@ service Spindll {
   // Delete a model from disk.
   rpc Delete (DeleteRequest) returns (DeleteResponse);
 
+  // Pre-encode a prompt into the KV cache without generating tokens.
+  rpc Prefill (PrefillRequest) returns (PrefillResponse);
+
   // Server status: loaded models, memory, devices.
   rpc Status (StatusRequest) returns (StatusResponse);
 }
@@ -47,6 +50,17 @@ message ChatRequest {
   string model = 1;
   repeated Message messages = 2;
   GenerateParams params = 3;
+  bytes encryption_key = 7;
+}
+
+message PrefillRequest {
+  string model = 1;
+  repeated Message messages = 2;
+  bytes encryption_key = 3;
+}
+
+message PrefillResponse {
+  uint32 tokens_cached = 1;
 }
 
 message ChatResponse {
@@ -102,6 +116,7 @@ message ModelInfo {
   string quantization = 4;
   uint64 size_bytes = 5;
   string last_used = 6;
+  string digest = 7;
 }
 
 message LoadRequest {
@@ -112,6 +127,7 @@ message LoadRequest {
 message LoadResponse {
   bool success = 1;
   string message = 2;
+  bool already_loaded = 3;  // true if model was already in memory
 }
 
 message UnloadRequest {
@@ -138,12 +154,25 @@ message StatusResponse {
   repeated LoadedModel models = 1;
   MemoryInfo memory = 2;
   repeated string devices = 3;  // e.g. ["Metal", "CPU"]
+  EngineMetrics metrics = 4;
+}
+
+message EngineMetrics {
+  uint64 cache_hits = 1;
+  uint64 cache_misses = 2;
+  float cache_hit_rate = 3;
+  uint64 total_prompt_tokens = 4;
+  uint64 total_completion_tokens = 5;
+  float avg_tokens_per_second = 6;
+  uint64 generate_requests = 7;
+  uint64 generate_errors = 8;
 }
 
 message LoadedModel {
   string name = 1;
   uint64 memory_used = 2;
   int32 gpu_layers = 3;
+  string digest = 4;
 }
 
 message MemoryInfo {
