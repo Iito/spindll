@@ -1,9 +1,13 @@
 use sysinfo::System;
 
+/// System memory information and the computed budget for model loading.
 pub struct MemoryBudget {
+    /// Total physical RAM in bytes.
     pub total_ram: u64,
+    /// Currently available RAM in bytes.
     pub available_ram: u64,
-    pub budget: u64, // user-configured max, or auto-detected
+    /// Maximum bytes allowed for loaded models (user-configured or 80% of available).
+    pub budget: u64,
 }
 
 impl MemoryBudget {
