@@ -46,6 +46,10 @@ enum Commands {
         /// Memory budget for loaded models (e.g. "8G", omit for 80% of available RAM)
         #[arg(long)]
         budget: Option<String>,
+
+        /// Enable KV cache for prompt prefixes (e.g. "2G", default 2G when enabled)
+        #[arg(long)]
+        kv_cache: Option<Option<String>>,
     },
 
     /// One-shot inference (no server needed)
@@ -55,6 +59,10 @@ enum Commands {
 
         /// Prompt text
         prompt: String,
+
+        /// Enable KV cache for prompt prefixes (e.g. "2G", default 2G when enabled)
+        #[arg(long)]
+        kv_cache: Option<Option<String>>,
     },
 
     /// Import models from Ollama
@@ -65,11 +73,46 @@ enum Commands {
     },
 
     /// Show server status
-    Status,
+    Status {
+        /// Port of the running server
+        #[arg(long, default_value = "50051")]
+        port: u16,
+    },
+}
+
+/// Parse a human-readable size like "2G", "512M" into bytes. Defaults to 2GB.
+fn parse_size_bytes(s: Option<&str>) -> u64 {
+    const DEFAULT: u64 = 2 * 1_073_741_824; // 2 GB
+    let s = match s {
+        Some(s) => s.trim(),
+        None => return DEFAULT,
+    };
+    if s.is_empty() {
+        return DEFAULT;
+    }
+
+    let (num, mult) = if s.ends_with('G') || s.ends_with('g') {
+        (&s[..s.len() - 1], 1_073_741_824u64)
+    } else if s.ends_with('M') || s.ends_with('m') {
+        (&s[..s.len() - 1], 1_048_576u64)
+    } else {
+        (s, 1u64) // raw bytes
+    };
+
+    num.parse::<f64>()
+        .map(|n| (n * mult as f64) as u64)
+        .unwrap_or(DEFAULT)
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "spindll=info".into()),
+        )
+        .init();
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -91,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
             ctx_size,
             gpu_layers,
             budget,
+            kv_cache,
         } => {
             let mem = spindll::scheduler::budget::MemoryBudget::detect(budget.as_deref());
             println!(
@@ -98,7 +142,14 @@ async fn main() -> anyhow::Result<()> {
                 mem.budget as f64 / 1_073_741_824.0,
                 mem.available_ram as f64 / 1_073_741_824.0
             );
-            let manager = spindll::engine::ModelManager::new(ctx_size, gpu_layers, mem.budget)?;
+            let mut manager = spindll::engine::ModelManager::new(ctx_size, gpu_layers, mem.budget)?;
+
+            if let Some(cache_size) = kv_cache {
+                let bytes = parse_size_bytes(cache_size.as_deref());
+                manager.enable_kv_cache(bytes);
+                println!("kv cache: {:.1} GB max", bytes as f64 / 1_073_741_824.0);
+            }
+
             let manager = std::sync::Arc::new(manager);
             let store = std::sync::Arc::new(
                 spindll::model_store::ModelStore::new(None),
@@ -106,11 +157,19 @@ async fn main() -> anyhow::Result<()> {
 
             spindll::grpc::start_server(port, manager, store).await?;
         }
-        Commands::Run { model, prompt } => {
+        Commands::Run { model, prompt, kv_cache } => {
             let store = spindll::model_store::ModelStore::new(None);
             let model_path = store.resolve_model_path(&model)?;
 
-            let engine = spindll::engine::Engine::load(&model_path, None, 2048)?;
+            let mut engine = spindll::engine::Engine::load(&model_path, None, 2048)?;
+
+            if let Some(cache_size) = kv_cache {
+                let bytes = parse_size_bytes(cache_size.as_deref());
+                let digest = store.resolve_model_digest(&model).unwrap_or_default();
+                engine.set_model_digest(digest);
+                engine.enable_kv_cache(bytes);
+            }
+
             let params = spindll::engine::GenerateParams::default();
 
             engine.generate(&prompt, &params, |token| {
@@ -130,8 +189,61 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("specify --from-ollama");
             }
         }
-        Commands::Status => {
-            println!("status: querying server");
+        Commands::Status { port } => {
+            let addr = format!("http://localhost:{port}");
+            let mut client = spindll::proto::spindll_client::SpindllClient::connect(addr).await
+                .map_err(|e| anyhow::anyhow!("cannot connect to server on port {port}: {e}"))?;
+
+            let resp = client.status(spindll::proto::StatusRequest {}).await?
+                .into_inner();
+
+            // Models
+            if resp.models.is_empty() {
+                println!("no models loaded");
+            } else {
+                println!("{:<35} {:>10} {:>6}  {}", "MODEL", "MEMORY", "GPU", "DIGEST");
+                println!("{}", "-".repeat(75));
+                for m in &resp.models {
+                    let size = if m.memory_used >= 1_073_741_824 {
+                        format!("{:.1} GB", m.memory_used as f64 / 1_073_741_824.0)
+                    } else {
+                        format!("{:.0} MB", m.memory_used as f64 / 1_048_576.0)
+                    };
+                    let digest_short = if m.digest.len() > 19 { &m.digest[..19] } else { &m.digest };
+                    println!("{:<35} {:>10} {:>4}L  {}", m.name, size, m.gpu_layers, digest_short);
+                }
+            }
+
+            // Memory
+            if let Some(mem) = &resp.memory {
+                println!();
+                println!(
+                    "memory: {:.1} GB used / {:.1} GB available / {:.1} GB total",
+                    (mem.total_ram - mem.available_ram) as f64 / 1_073_741_824.0,
+                    mem.available_ram as f64 / 1_073_741_824.0,
+                    mem.total_ram as f64 / 1_073_741_824.0,
+                );
+            }
+
+            // Metrics
+            if let Some(m) = &resp.metrics {
+                println!();
+                println!(
+                    "requests: {}  errors: {}  cache: {}/{} ({:.0}%)  avg: {:.1} tok/s",
+                    m.generate_requests,
+                    m.generate_errors,
+                    m.cache_hits,
+                    m.cache_hits + m.cache_misses,
+                    m.cache_hit_rate * 100.0,
+                    m.avg_tokens_per_second,
+                );
+            }
+
+            // Devices
+            if !resp.devices.is_empty() {
+                println!();
+                println!("devices: {}", resp.devices.join(", "));
+            }
         }
     }
 
