@@ -16,6 +16,8 @@ pub mod engine;
 pub mod model_store;
 pub mod scheduler;
 pub mod grpc;
+#[cfg(feature = "http")]
+pub mod http;
 
 /// Auto-generated protobuf types for the spindll gRPC protocol.
 pub mod proto {

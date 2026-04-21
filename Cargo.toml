@@ -17,6 +17,11 @@ cli = [
     "dep:clap",
     "dep:tracing-subscriber",
 ]
+# http adds an HTTP/SSE API alongside the gRPC server.
+http = [
+    "dep:axum",
+    "dep:tower-http",
+]
 
 [dependencies]
 # Core — always compiled
@@ -37,6 +42,10 @@ thiserror    = "2"
 anyhow       = "1"
 tracing      = "0.1"
 sysinfo      = "0.35"
+
+# http server (optional)
+axum       = { version = "0.8", features = ["macros"], optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
 
 # cli binary only
 clap               = { version = "4", features = ["derive"], optional = true }

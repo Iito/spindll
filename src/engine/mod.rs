@@ -1,10 +1,12 @@
 //! Inference engine — model loading, text generation, KV caching, and metrics.
 
+pub mod batch;
 pub mod kv_cache;
 pub mod manager;
 pub mod metrics;
 pub mod streaming;
 
+pub use batch::{BatchEvent, BatchRequest, BatchScheduler};
 pub use kv_cache::KvCache;
 pub use manager::ModelManager;
 pub use metrics::Metrics;
