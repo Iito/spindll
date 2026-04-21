@@ -50,6 +50,14 @@ enum Commands {
         /// Enable KV cache for prompt prefixes (e.g. "2G", default 2G when enabled)
         #[arg(long)]
         kv_cache: Option<Option<String>>,
+
+        /// Concurrent sequence slots per model for batch scheduling (0 = disabled)
+        #[arg(long, default_value = "0")]
+        batch_slots: usize,
+
+        /// HTTP/SSE server port (requires --features http, 0 = disabled)
+        #[arg(long, default_value = "8080")]
+        http_port: u16,
     },
 
     /// One-shot inference (no server needed)
@@ -135,6 +143,8 @@ async fn main() -> anyhow::Result<()> {
             gpu_layers,
             budget,
             kv_cache,
+            batch_slots,
+            http_port,
         } => {
             let mem = spindll::scheduler::budget::MemoryBudget::detect(budget.as_deref());
             println!(
@@ -150,10 +160,26 @@ async fn main() -> anyhow::Result<()> {
                 println!("kv cache: {:.1} GB max", bytes as f64 / 1_073_741_824.0);
             }
 
+            if batch_slots > 0 {
+                manager.set_batch_slots(batch_slots);
+                println!("batch scheduling: {batch_slots} concurrent slots per model");
+            }
+
             let manager = std::sync::Arc::new(manager);
             let store = std::sync::Arc::new(
                 spindll::model_store::ModelStore::new(None),
             );
+
+            #[cfg(feature = "http")]
+            if http_port > 0 {
+                let http_mgr = manager.clone();
+                let http_store = store.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = spindll::http::start_http_server(http_port, http_mgr, http_store).await {
+                        tracing::error!("HTTP server error: {e}");
+                    }
+                });
+            }
 
             spindll::grpc::start_server(port, manager, store).await?;
         }

@@ -9,6 +9,7 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
 use std::num::NonZeroU32;
 
+use super::batch::{BatchEvent, BatchRequest, BatchScheduler};
 use super::kv_cache::KvCache;
 use super::metrics::Metrics;
 use super::streaming::{GenerateParams, GenerateResult, generate_streaming, generate_streaming_cached};
@@ -27,6 +28,8 @@ pub struct LoadedModel {
     pub gpu_layers: u32,
     /// SHA-256 digest of the model file, used for KV cache keying.
     pub digest: String,
+    /// Channel to submit requests to this model's batch scheduler (if running).
+    pub batch_tx: Option<std::sync::mpsc::Sender<BatchRequest>>,
 }
 
 /// Multi-model manager with LRU eviction and memory budgeting.
@@ -41,6 +44,9 @@ pub struct ModelManager {
     memory_budget: u64, // max bytes for loaded models, 0 = unlimited
     kv_cache: Option<KvCache>,
     metrics: Arc<Metrics>,
+    /// Maximum concurrent sequences per model for batch scheduling.
+    /// 0 disables batching (each request gets its own context).
+    batch_slots: usize,
 }
 
 impl ModelManager {
@@ -61,7 +67,15 @@ impl ModelManager {
             memory_budget,
             kv_cache: None,
             metrics: Arc::new(Metrics::new()),
+            batch_slots: 0,
         })
+    }
+
+    /// Set the number of concurrent sequence slots for batch scheduling.
+    /// When > 0, each loaded model gets a dedicated batch scheduler thread
+    /// that multiplexes concurrent requests through a single context.
+    pub fn set_batch_slots(&mut self, slots: usize) {
+        self.batch_slots = slots;
     }
 
     fn total_loaded_bytes(&self) -> u64 {
@@ -151,6 +165,37 @@ impl ModelManager {
         };
         tracing::info!(name, layers = model.n_layer(), device, size_bytes, "model loaded");
 
+        // Optionally start a batch scheduler for this model.
+        let batch_tx = if self.batch_slots > 0 {
+            let (tx, rx) = std::sync::mpsc::channel::<BatchRequest>();
+            let n_ctx = self.default_n_ctx;
+            let max_seq = self.batch_slots;
+            let model_name = name.to_string();
+
+            // The batch scheduler needs its own context, which requires a
+            // reference to the model. Since LlamaModel isn't Send, we load
+            // a second handle for the scheduler thread.
+            let sched_params = LlamaModelParams::default().with_n_gpu_layers(layers);
+            let sched_model = LlamaModel::load_from_file(&self.backend, path, &sched_params)
+                .map_err(|e| anyhow::anyhow!("failed to load scheduler model: {e}"))?;
+            let sched_backend = LlamaBackend::init()?;
+
+            std::thread::Builder::new()
+                .name(format!("batch-{model_name}"))
+                .spawn(move || {
+                    if let Err(e) = BatchScheduler::run(
+                        &sched_model, &sched_backend, n_ctx, max_seq, rx,
+                    ) {
+                        tracing::error!(model = model_name, "batch scheduler exited: {e}");
+                    }
+                })?;
+
+            tracing::info!(name, slots = max_seq, "batch scheduler started");
+            Some(tx)
+        } else {
+            None
+        };
+
         let loaded = LoadedModel {
             model,
             n_ctx: self.default_n_ctx,
@@ -158,6 +203,7 @@ impl ModelManager {
             last_used: RwLock::new(Instant::now()),
             gpu_layers: layers,
             digest,
+            batch_tx,
         };
 
         self.models.write().unwrap().insert(name.to_string(), loaded);
@@ -227,8 +273,11 @@ impl ModelManager {
 
     /// Run inference on a loaded model, streaming tokens through `on_token`.
     ///
-    /// Automatically uses KV cache if enabled. Records prompt/completion metrics.
-    /// Pass `encryption_key` to encrypt cached KV state at rest.
+    /// When the model has a batch scheduler running, the request is submitted
+    /// to the shared decode loop. Otherwise falls back to a per-request context
+    /// (using the disk-backed KV cache if enabled).
+    ///
+    /// Pass `encryption_key` to encrypt cached KV state at rest (non-batched path only).
     #[tracing::instrument(skip(self, prompt, params, on_token, encryption_key), fields(model = model_name))]
     pub fn generate(
         &self,
@@ -236,23 +285,23 @@ impl ModelManager {
         prompt: &str,
         params: &GenerateParams,
         encryption_key: Option<&[u8; 32]>,
-        on_token: impl FnMut(&str) -> bool,
+        mut on_token: impl FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
-        let start = Instant::now();
-        let result = self.with_model(model_name, |model, backend, n_ctx, digest| {
-            let ctx_params = LlamaContextParams::default()
-                .with_n_ctx(NonZeroU32::new(n_ctx));
-            let mut ctx = model
-                .new_context(backend, ctx_params)
-                .map_err(|e| anyhow::anyhow!("failed to create context: {e}"))?;
+        // Check if this model has a batch scheduler.
+        let batch_tx = {
+            let models = self.models.read().unwrap();
+            models.get(model_name).and_then(|m| {
+                *m.last_used.write().unwrap() = Instant::now();
+                m.batch_tx.clone()
+            })
+        };
 
-            match &self.kv_cache {
-                Some(cache) => generate_streaming_cached(
-                    model, &mut ctx, prompt, params, model_name, digest, cache, encryption_key, on_token,
-                ),
-                None => generate_streaming(model, &mut ctx, prompt, params, on_token),
-            }
-        });
+        let start = Instant::now();
+        let result = if let Some(tx) = batch_tx {
+            Self::generate_via_batch(tx, prompt, params, &mut on_token)
+        } else {
+            self.generate_direct(model_name, prompt, params, encryption_key, on_token)
+        };
 
         let elapsed_us = start.elapsed().as_micros() as u64;
         match &result {
@@ -273,6 +322,90 @@ impl ModelManager {
             Err(_) => self.metrics.record_error(),
         }
         result
+    }
+
+    /// Submit a request to the model's batch scheduler and bridge events to the callback.
+    fn generate_via_batch(
+        tx: std::sync::mpsc::Sender<BatchRequest>,
+        prompt: &str,
+        params: &GenerateParams,
+        on_token: &mut dyn FnMut(&str) -> bool,
+    ) -> anyhow::Result<GenerateResult> {
+        let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<BatchEvent>(32);
+
+        let req = BatchRequest {
+            prompt: prompt.to_string(),
+            params: GenerateParams {
+                max_tokens: params.max_tokens,
+                temperature: params.temperature,
+                top_p: params.top_p,
+                top_k: params.top_k,
+                seed: params.seed,
+                prefill_only: params.prefill_only,
+            },
+            response_tx: resp_tx,
+        };
+
+        tx.send(req).map_err(|_| anyhow::anyhow!("batch scheduler is not running"))?;
+
+        // Drain events from the batch scheduler.
+        loop {
+            match resp_rx.blocking_recv() {
+                Some(BatchEvent::Token(piece)) => {
+                    if !on_token(&piece) {
+                        // Client abort — drop the receiver so the scheduler
+                        // detects the closed channel on its next send.
+                        break;
+                    }
+                }
+                Some(BatchEvent::Done { prompt_tokens, completion_tokens }) => {
+                    return Ok(GenerateResult {
+                        prompt_tokens,
+                        completion_tokens,
+                        cache_hit: false,
+                    });
+                }
+                Some(BatchEvent::Error(msg)) => {
+                    anyhow::bail!(msg);
+                }
+                None => {
+                    anyhow::bail!("batch scheduler dropped the response channel");
+                }
+            }
+        }
+
+        // If we broke out of the loop (client abort), wait for Done/Error.
+        // The scheduler will notice the closed channel and finish the sequence.
+        Ok(GenerateResult {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_hit: false,
+        })
+    }
+
+    /// Per-request context path (original behavior).
+    fn generate_direct(
+        &self,
+        model_name: &str,
+        prompt: &str,
+        params: &GenerateParams,
+        encryption_key: Option<&[u8; 32]>,
+        on_token: impl FnMut(&str) -> bool,
+    ) -> anyhow::Result<GenerateResult> {
+        self.with_model(model_name, |model, backend, n_ctx, digest| {
+            let ctx_params = LlamaContextParams::default()
+                .with_n_ctx(NonZeroU32::new(n_ctx));
+            let mut ctx = model
+                .new_context(backend, ctx_params)
+                .map_err(|e| anyhow::anyhow!("failed to create context: {e}"))?;
+
+            match &self.kv_cache {
+                Some(cache) => generate_streaming_cached(
+                    model, &mut ctx, prompt, params, model_name, digest, cache, encryption_key, on_token,
+                ),
+                None => generate_streaming(model, &mut ctx, prompt, params, on_token),
+            }
+        })
     }
 
     /// Apply the model's built-in chat template to a list of `(role, content)` messages.
