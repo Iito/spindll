@@ -409,6 +409,7 @@ impl ModelManager {
     }
 
     /// Apply the model's built-in chat template to a list of `(role, content)` messages.
+    /// Falls back to ChatML if the model has no embedded template.
     ///
     /// Returns the formatted prompt string ready for generation.
     pub fn apply_chat_template(
@@ -417,21 +418,7 @@ impl ModelManager {
         messages: &[(String, String)],
     ) -> anyhow::Result<String> {
         self.with_model(model_name, |model, _, _, _| {
-            let tmpl = model
-                .chat_template(None)
-                .map_err(|e| anyhow::anyhow!("model has no chat template: {e}"))?;
-
-            let chat_messages: Vec<llama_cpp_2::model::LlamaChatMessage> = messages
-                .iter()
-                .map(|(role, content)| {
-                    llama_cpp_2::model::LlamaChatMessage::new(role.clone(), content.clone())
-                        .map_err(|e| anyhow::anyhow!("invalid chat message: {e}"))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-
-            model
-                .apply_chat_template(&tmpl, &chat_messages, true)
-                .map_err(|e| anyhow::anyhow!("failed to apply chat template: {e}"))
+            super::apply_chat_template_with_fallback(model, messages)
         })
     }
 }
