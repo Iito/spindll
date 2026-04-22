@@ -233,7 +233,6 @@ async fn chat(
     });
 
     Sse::new(ReceiverStream::new(rx))
-        .keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 fn sse_data(data: &serde_json::Value) -> Event {
@@ -456,9 +455,7 @@ async fn oai_chat_completions(
             }
         });
 
-        Sse::new(ReceiverStream::new(rx))
-            .keep_alive(axum::response::sse::KeepAlive::default())
-            .into_response()
+        Sse::new(ReceiverStream::new(rx)).into_response()
     } else {
         // Non-streaming: collect all tokens then return a single JSON response.
         let result = tokio::task::spawn_blocking(move || {
