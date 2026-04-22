@@ -180,6 +180,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                 });
             }
+            #[cfg(not(feature = "http"))]
+            let _ = http_port;
 
             spindll::grpc::start_server(port, manager, store).await?;
         }
