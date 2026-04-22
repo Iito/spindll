@@ -26,7 +26,7 @@ Models are loaded automatically on first request, or explicitly via the `Load` R
 
 - **Pull from Ollama or HuggingFace** -- auto-detects source from model name format
 - **Streaming inference** -- token-by-token output over gRPC, HTTP/SSE, or OpenAI-compatible API
-- **OpenAI-compatible API** -- `POST /v1/chat/completions` works with AnythingLLM, Open WebUI, and any OpenAI client
+- **OpenAI-compatible API** -- `/v1/chat/completions`, `/v1/completions`, and tool/function calling for AnythingLLM, Open WebUI, and any OpenAI client
 - **Multi-model** -- multiple models loaded concurrently, LRU eviction when budget exceeded
 - **Continuous batching** -- concurrent requests to the same model share a single context via sequence IDs
 - **KV cache** -- disk-backed prefix caching with optional ChaCha20-Poly1305 encryption at rest
@@ -72,7 +72,7 @@ Quick summary of available interfaces:
 |-----------|------|-------------|----------|
 | gRPC | 50051 | none (always on) | Parley mesh, programmatic access |
 | HTTP/SSE | 8080 | `http` | Web frontends, custom integrations |
-| OpenAI `/v1` | 8080 | `http` | AnythingLLM, Open WebUI, any OpenAI client |
+| OpenAI `/v1` | 8080 | `http` | AnythingLLM, Open WebUI, any OpenAI client (chat, completions, tool calling) |
 
 ## Using as a Rust library
 
