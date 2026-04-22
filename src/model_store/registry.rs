@@ -27,6 +27,9 @@ pub struct ModelEntry {
     /// Model architecture from GGUF `general.architecture` metadata (e.g. `"llama"`).
     #[serde(default)]
     pub architecture: String,
+    /// Whether GGUF metadata has been read for this entry.
+    #[serde(default)]
+    pub metadata_read: bool,
 }
 
 /// Read GGUF metadata from a file without loading tensor weights.
@@ -92,11 +95,12 @@ impl Registry {
     pub fn backfill_metadata(&mut self) -> bool {
         let mut changed = false;
         for entry in self.models.values_mut() {
-            if entry.architecture.is_empty() && entry.path.exists() {
+            if !entry.metadata_read && entry.path.exists() {
                 let (name, desc, arch) = read_gguf_metadata(&entry.path);
                 entry.model_name = name;
                 entry.description = desc;
                 entry.architecture = arch;
+                entry.metadata_read = true;
                 changed = true;
             }
         }

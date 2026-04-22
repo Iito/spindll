@@ -93,6 +93,7 @@ impl ModelStore {
             model_name,
             description,
             architecture,
+            metadata_read: true,
         });
         reg.save(&self.registry_path())?;
 
@@ -251,6 +252,7 @@ impl ModelStore {
                         model_name: gguf_name,
                         description: gguf_desc,
                         architecture: gguf_arch,
+                        metadata_read: true,
                     },
                 );
                 println!("imported {name}:{tag} ({:.1} GB)", layer.size as f64 / 1_073_741_824.0);
