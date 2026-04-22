@@ -92,24 +92,12 @@ impl Engine {
     }
 
     /// Apply the model's built-in chat template to a list of (role, content) messages.
+    /// Falls back to ChatML if the model has no embedded template.
     pub fn apply_chat_template(
         &self,
         messages: &[(String, String)],
     ) -> anyhow::Result<String> {
-        let tmpl = self.model.chat_template(None)
-            .map_err(|e| anyhow::anyhow!("model has no chat template: {e}"))?;
-
-        let chat_messages: Vec<llama_cpp_2::model::LlamaChatMessage> = messages
-            .iter()
-            .map(|(role, content)| {
-                llama_cpp_2::model::LlamaChatMessage::new(role.clone(), content.clone())
-                    .map_err(|e| anyhow::anyhow!("invalid chat message: {e}"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-
-        self.model
-            .apply_chat_template(&tmpl, &chat_messages, true)
-            .map_err(|e| anyhow::anyhow!("failed to apply chat template: {e}"))
+        apply_chat_template_with_fallback(&self.model, messages)
     }
 
     /// Enable the disk-backed KV cache with the given maximum size in bytes.
@@ -141,4 +129,33 @@ impl Engine {
             None => streaming::generate_streaming(&self.model, &mut ctx, prompt, params, on_token),
         }
     }
+}
+
+/// Apply a model's chat template, falling back to ChatML if none is embedded.
+fn apply_chat_template_with_fallback(
+    model: &LlamaModel,
+    messages: &[(String, String)],
+) -> anyhow::Result<String> {
+    use llama_cpp_2::model::LlamaChatTemplate;
+
+    let tmpl = match model.chat_template(None) {
+        Ok(t) => t,
+        Err(_) => {
+            tracing::debug!("model has no chat template, using ChatML fallback");
+            LlamaChatTemplate::new("chatml")
+                .map_err(|e| anyhow::anyhow!("failed to create ChatML template: {e}"))?
+        }
+    };
+
+    let chat_messages: Vec<llama_cpp_2::model::LlamaChatMessage> = messages
+        .iter()
+        .map(|(role, content)| {
+            llama_cpp_2::model::LlamaChatMessage::new(role.clone(), content.clone())
+                .map_err(|e| anyhow::anyhow!("invalid chat message: {e}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    model
+        .apply_chat_template(&tmpl, &chat_messages, true)
+        .map_err(|e| anyhow::anyhow!("failed to apply chat template: {e}"))
 }
