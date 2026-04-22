@@ -422,9 +422,16 @@ async fn oai_chat_completions(
                 prefill_only: false,
             };
 
+            let completion_id = format!("chatcmpl-{:016x}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+            let created = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+
             let result = mgr.generate(&req.model, &prompt, &params, None, |token| {
                 let chunk = serde_json::json!({
+                    "id": &completion_id,
                     "object": "chat.completion.chunk",
+                    "created": created,
                     "model": &req.model,
                     "choices": [{
                         "index": 0,
@@ -438,7 +445,9 @@ async fn oai_chat_completions(
             match result {
                 Ok(_) => {
                     let done_chunk = serde_json::json!({
+                        "id": &completion_id,
                         "object": "chat.completion.chunk",
+                        "created": created,
                         "model": &req.model,
                         "choices": [{
                             "index": 0,
@@ -453,6 +462,7 @@ async fn oai_chat_completions(
                     let _ = tx.blocking_send(Ok(sse_data(&oai_error(&e.to_string()))));
                 }
             }
+            drop(tx);
         });
 
         Sse::new(ReceiverStream::new(rx)).into_response()
@@ -484,8 +494,15 @@ async fn oai_chat_completions(
         .await;
 
         match result {
-            Ok(Ok((content, stats))) => Json(serde_json::json!({
+            Ok(Ok((content, stats))) => {
+                let completion_id = format!("chatcmpl-{:016x}", std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+                let created = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                Json(serde_json::json!({
+                "id": completion_id,
                 "object": "chat.completion",
+                "created": created,
                 "model": model_id,
                 "choices": [{
                     "index": 0,
@@ -498,7 +515,8 @@ async fn oai_chat_completions(
                     "total_tokens": stats.prompt_tokens + stats.completion_tokens,
                 }
             }))
-            .into_response(),
+            .into_response()
+            }
             Ok(Err(e)) => (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(oai_error(&e.to_string())),
