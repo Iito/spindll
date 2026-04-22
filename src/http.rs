@@ -69,10 +69,13 @@ struct ModelInfo {
     quantization: String,
     digest: String,
     loaded: bool,
+    model_name: String,
+    description: String,
+    architecture: String,
 }
 
 async fn models(State(state): State<AppState>) -> impl IntoResponse {
-    let reg = match Registry::load(&state.store.registry_path()) {
+    let mut reg = match Registry::load(&state.store.registry_path()) {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -82,6 +85,9 @@ async fn models(State(state): State<AppState>) -> impl IntoResponse {
                 .into_response();
         }
     };
+    if reg.backfill_metadata() {
+        let _ = reg.save(&state.store.registry_path());
+    }
 
     let loaded: std::collections::HashSet<String> = state
         .manager
@@ -99,6 +105,9 @@ async fn models(State(state): State<AppState>) -> impl IntoResponse {
             quantization: String::new(),
             digest: entry.digest.clone(),
             loaded: loaded.contains(key),
+            model_name: entry.model_name.clone(),
+            description: entry.description.clone(),
+            architecture: entry.architecture.clone(),
         })
         .collect();
 

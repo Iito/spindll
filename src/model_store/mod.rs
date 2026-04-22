@@ -77,6 +77,7 @@ impl ModelStore {
 
         download::validate_gguf(&path)?;
 
+        let (model_name, description, architecture) = registry::read_gguf_metadata(&path);
         let filename = path.file_name().unwrap().to_string_lossy().to_string();
         let mut reg = registry::Registry::load(&self.registry_path())?;
         reg.add(key, registry::ModelEntry {
@@ -89,6 +90,9 @@ impl ModelStore {
                 .unwrap()
                 .as_secs(),
             digest,
+            model_name,
+            description,
+            architecture,
         });
         reg.save(&self.registry_path())?;
 
@@ -97,20 +101,29 @@ impl ModelStore {
 
     /// Print all registered models to stdout in a tabular format.
     pub fn list(&self) -> anyhow::Result<()> {
-        let reg = registry::Registry::load(&self.registry_path())?;
+        let mut reg = registry::Registry::load(&self.registry_path())?;
+        if reg.backfill_metadata() {
+            reg.save(&self.registry_path())?;
+        }
         if reg.models.is_empty() {
             println!("no models downloaded");
             return Ok(());
         }
 
-        println!("{:<45} {:>10}", "MODEL", "SIZE");
-        println!("{}", "-".repeat(57));
+        println!("{:<35} {:>10}  {:<10}  {}", "MODEL", "SIZE", "ARCH", "DESCRIPTION");
+        println!("{}", "-".repeat(85));
         let mut entries: Vec<_> = reg.models.iter().collect();
         entries.sort_by_key(|(k, _)| (*k).clone());
         for (key, entry) in entries {
             let display_name = format_model_name(key);
             let size = format_size(entry.size_bytes);
-            println!("{:<45} {:>10}", display_name, size);
+            let arch = if entry.architecture.is_empty() { "-" } else { &entry.architecture };
+            let desc = if entry.description.is_empty() {
+                entry.model_name.as_str()
+            } else {
+                &entry.description
+            };
+            println!("{:<35} {:>10}  {:<10}  {}", display_name, size, arch, desc);
         }
         Ok(())
     }
@@ -222,6 +235,7 @@ impl ModelStore {
 
             let key = format!("ollama/{name}/{filename}");
             if !reg.models.contains_key(&key) {
+                let (gguf_name, gguf_desc, gguf_arch) = registry::read_gguf_metadata(&dest);
                 reg.add(
                     key.clone(),
                     registry::ModelEntry {
@@ -234,6 +248,9 @@ impl ModelStore {
                             .unwrap()
                             .as_secs(),
                         digest: layer.digest.clone(),
+                        model_name: gguf_name,
+                        description: gguf_desc,
+                        architecture: gguf_arch,
                     },
                 );
                 println!("imported {name}:{tag} ({:.1} GB)", layer.size as f64 / 1_073_741_824.0);

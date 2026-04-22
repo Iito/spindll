@@ -18,6 +18,40 @@ pub struct ModelEntry {
     /// SHA-256 content digest (e.g. `"sha256:abcdef..."`).
     #[serde(default)]
     pub digest: String,
+    /// Human-readable model name from GGUF `general.name` metadata.
+    #[serde(default)]
+    pub model_name: String,
+    /// Description from GGUF `general.description` metadata.
+    #[serde(default)]
+    pub description: String,
+    /// Model architecture from GGUF `general.architecture` metadata (e.g. `"llama"`).
+    #[serde(default)]
+    pub architecture: String,
+}
+
+/// Read GGUF metadata from a file without loading tensor weights.
+///
+/// Returns `(general.name, general.description, general.architecture)`.
+pub fn read_gguf_metadata(path: &Path) -> (String, String, String) {
+    let ctx = match llama_cpp_2::gguf::GgufContext::from_file(path) {
+        Some(c) => c,
+        None => return (String::new(), String::new(), String::new()),
+    };
+
+    let read_str = |key: &str| -> String {
+        let idx = ctx.find_key(key);
+        if idx >= 0 {
+            ctx.val_str(idx).unwrap_or_default().to_string()
+        } else {
+            String::new()
+        }
+    };
+
+    (
+        read_str("general.name"),
+        read_str("general.description"),
+        read_str("general.architecture"),
+    )
 }
 
 /// JSON-backed registry mapping model keys to their metadata.
@@ -51,6 +85,22 @@ impl Registry {
     /// Insert or replace a model entry under the given key.
     pub fn add(&mut self, key: String, entry: ModelEntry) {
         self.models.insert(key, entry);
+    }
+
+    /// Backfill any entries missing GGUF metadata by reading the file header.
+    /// Returns `true` if any entries were updated.
+    pub fn backfill_metadata(&mut self) -> bool {
+        let mut changed = false;
+        for entry in self.models.values_mut() {
+            if entry.architecture.is_empty() && entry.path.exists() {
+                let (name, desc, arch) = read_gguf_metadata(&entry.path);
+                entry.model_name = name;
+                entry.description = desc;
+                entry.architecture = arch;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Remove a model entry by key, returning it if it existed.
