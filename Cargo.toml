@@ -1,9 +1,12 @@
 [package]
 name = "spindll"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 description = "A Rust-native GGUF inference engine with model management"
 license = "Apache-2.0"
+repository = "https://github.com/Iito/spindll"
+keywords = ["llm", "inference", "gguf", "llama", "gpu"]
+categories = ["science", "api-bindings"]
 
 [[bin]]
 name = "spindll"

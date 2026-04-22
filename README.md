@@ -2,12 +2,13 @@
 
 **Spindle + LL(ama).** A Rust-native GGUF inference engine with model management.
 
-A single binary that pulls models from Ollama's registry or HuggingFace, manages local storage, and serves streaming inference over gRPC. Multi-model, memory-aware, GPU-accelerated.
+A single binary that pulls models from Ollama's registry or HuggingFace, manages local storage, and serves streaming inference over gRPC and HTTP. Multi-model, memory-aware, GPU-accelerated, with an OpenAI-compatible API.
 
 ## Quick Start
 
 ```bash
-cargo build --release
+# Build with HTTP support
+cargo build --release --features cli,http
 
 # Pull a model
 spindll pull llama3.1:8b
@@ -15,66 +16,123 @@ spindll pull llama3.1:8b
 # Or import from an existing Ollama installation
 spindll import --from-ollama
 
-# Start the server
-spindll serve --port 50051 --budget 8G
+# Start the server (gRPC on 50051, HTTP on 8080)
+spindll serve
 ```
 
-Models are loaded and unloaded dynamically via the `Load` / `Unload` gRPC RPCs.
+Models are loaded automatically on first request, or explicitly via the `Load` RPC / `POST /load` endpoint.
 
 ## Features
 
-- **Pull from Ollama or HuggingFace** — auto-detects source from model name format
-- **Streaming inference** — token-by-token output over gRPC via llama.cpp
-- **Multi-model** — multiple models loaded concurrently, LRU eviction when budget exceeded
-- **Model-native chat templates** — reads the template from GGUF metadata, no hardcoded formats
-- **Memory-aware** — configurable budget, refuses to load models that won't fit
-- **GPU acceleration** — Metal (macOS) auto-detected, CUDA (Linux) supported
+- **Pull from Ollama or HuggingFace** -- auto-detects source from model name format
+- **Streaming inference** -- token-by-token output over gRPC, HTTP/SSE, or OpenAI-compatible API
+- **OpenAI-compatible API** -- `POST /v1/chat/completions` works with AnythingLLM, Open WebUI, and any OpenAI client
+- **Multi-model** -- multiple models loaded concurrently, LRU eviction when budget exceeded
+- **Continuous batching** -- concurrent requests to the same model share a single context via sequence IDs
+- **KV cache** -- disk-backed prefix caching with optional ChaCha20-Poly1305 encryption at rest
+- **Chat template fallback** -- reads template from GGUF metadata, falls back to ChatML for models without one
+- **GGUF metadata** -- extracts model name, description, and architecture from file headers
+- **Memory-aware** -- configurable budget, auto-detects available RAM/VRAM
+- **GPU acceleration** -- Metal (macOS) auto-detected, CUDA (Linux) supported
+- **Embeddable** -- use as a Rust crate in your own project, no subprocess needed
 
 ## CLI
 
 ```
 spindll pull <model>                  # pull from Ollama registry or HuggingFace
-spindll list                          # show local models
+spindll list                          # show local models with metadata
 spindll rm <model>                    # delete a local model
-spindll serve [--port] [--budget]     # start gRPC server
+spindll run <model> "prompt"          # one-shot inference (no server)
+spindll serve [options]               # start gRPC + HTTP server
 spindll import --from-ollama          # migrate existing Ollama models
+spindll status                        # query a running server
 ```
 
 Model names follow Ollama conventions (`llama3.1:8b`, `qwen2:0.5b`) or HuggingFace repos (`TheBloke/Llama-3-8B-GGUF`).
 
-## gRPC API
+### Serve options
 
-```protobuf
-service Spindll {
-  rpc Generate (GenerateRequest) returns (stream GenerateResponse);
-  rpc Chat (ChatRequest) returns (stream ChatResponse);
-  rpc Load (LoadRequest) returns (LoadResponse);
-  rpc Unload (UnloadRequest) returns (UnloadResponse);
-  rpc List (ListRequest) returns (ListResponse);
-  rpc Status (StatusRequest) returns (StatusResponse);
-}
 ```
+--port <PORT>              gRPC port [default: 50051]
+--http-port <PORT>         HTTP/SSE port [default: 8080]
+--ctx-size <N>             Context window size [default: 2048]
+--gpu-layers <N>           GPU layers (omit to auto-detect)
+--budget <SIZE>            Memory budget, e.g. "8G" (default: 80% of available RAM)
+--kv-cache [<SIZE>]        Enable KV cache for prompt prefixes [default: 2G]
+--batch-slots <N>          Concurrent sequence slots per model [default: 0 = disabled]
+```
+
+## API
+
+Full API reference covering HTTP, OpenAI-compatible `/v1`, gRPC, and Rust library usage: **[docs/API.md](docs/API.md)**
+
+Quick summary of available interfaces:
+
+| Interface | Port | Feature flag | Use case |
+|-----------|------|-------------|----------|
+| gRPC | 50051 | none (always on) | Parley mesh, programmatic access |
+| HTTP/SSE | 8080 | `http` | Web frontends, custom integrations |
+| OpenAI `/v1` | 8080 | `http` | AnythingLLM, Open WebUI, any OpenAI client |
+
+## Using as a Rust library
+
+```toml
+[dependencies]
+spindll = { git = "https://github.com/Iito/spindll.git" }
+```
+
+```rust
+use spindll::engine::{ModelManager, GenerateParams};
+use spindll::model_store::ModelStore;
+
+let store = ModelStore::new(None);
+let path = store.resolve_model_path("llama3.1:8b")?;
+let digest = store.resolve_model_digest("llama3.1:8b").unwrap_or_default();
+
+let manager = ModelManager::new(2048, None, 0)?;
+manager.load_model_with_digest("llama3.1:8b", &path, None, digest)?;
+
+manager.generate("llama3.1:8b", "Hello!", &GenerateParams::default(), None, |token| {
+    print!("{token}");
+    true
+})?;
+```
+
+See [docs/API.md](docs/API.md) for the full library API including batch scheduling, KV cache, and server startup.
 
 ## Architecture
 
 ```
-CLI / gRPC API
-      |
-  Model Manager (multi-model slots, LRU eviction, memory budget)
-      |
-  Inference Engine (llama.cpp via llama-cpp-2, streaming, GPU offload)
-      |
-  Model Store (Ollama registry, HuggingFace, local registry)
+CLI / gRPC / HTTP+SSE / OpenAI /v1
+              |
+    Model Manager (multi-model slots, LRU eviction, memory budget)
+         |                |
+  Batch Scheduler     Per-request context
+  (continuous batching,   (KV cache, encryption)
+   sequence pooling)
+         |                |
+    Inference Engine (llama.cpp via llama-cpp-2, streaming, GPU offload)
+              |
+    Model Store (Ollama registry, HuggingFace, GGUF metadata, local registry)
 ```
 
 ## Storage
 
-Models are stored in `~/.spindll/models/<repo>/<file>` — flat and inspectable. A JSON registry at `~/.spindll/registry.json` tracks downloaded models.
+Models are stored in `~/.spindll/models/<repo>/<file>`. A JSON registry at `~/.spindll/registry.json` tracks downloaded models with GGUF metadata. KV cache files are stored in `~/.spindll/cache/`.
+
+## Feature flags
+
+| Flag | Description |
+|------|-------------|
+| `cli` | Standalone binary (clap argument parsing, pretty logging) |
+| `http` | HTTP/SSE server with OpenAI-compatible `/v1` API (axum) |
+
+The gRPC server and core engine are always compiled -- no feature flag needed for library consumers or for Parley integration.
 
 ## Prerequisites
 
-- [Rust toolchain](https://rustup.rs/) (stable)
-- CMake
+- [Rust toolchain](https://rustup.rs/) (stable, edition 2024)
+- CMake (for llama.cpp compilation)
 
 ## License
 
