@@ -44,6 +44,9 @@ pub async fn start_http_server(
         .route("/models/{id}/unload", post(model_unload))
         .route("/load", post(load))
         .route("/pull", post(pull))
+        // OpenAI-compatible API
+        .route("/v1/models", get(oai_models))
+        .route("/v1/chat/completions", post(oai_chat_completions))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -188,20 +191,9 @@ async fn chat(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
 
     tokio::task::spawn_blocking(move || {
-        // Auto-load model if needed.
-        if !mgr.is_loaded(&req.model) {
-            let path = match store.resolve_model_path(&req.model) {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = tx.blocking_send(Ok(sse_data(&serde_json::json!({"type": "error", "error": format!("model '{}' not found: {e}", req.model)}))));
-                    return;
-                }
-            };
-            let digest = store.resolve_model_digest(&req.model).unwrap_or_default();
-            if let Err(e) = mgr.load_model_with_digest(&req.model, &path, None, digest) {
-                let _ = tx.blocking_send(Ok(sse_data(&serde_json::json!({"type": "error", "error": format!("failed to load model: {e}")}))));
-                return;
-            }
+        if let Err(e) = auto_load(&mgr, &store, &req.model) {
+            let _ = tx.blocking_send(Ok(sse_data(&serde_json::json!({"type": "error", "error": e.to_string()}))));
+            return;
         }
 
         let messages: Vec<_> = req.messages.iter().map(|m| (m.role.clone(), m.content.clone())).collect();
@@ -326,4 +318,224 @@ async fn pull(
         )
             .into_response(),
     }
+}
+
+// =============================================================================
+// OpenAI-compatible API (/v1)
+// =============================================================================
+
+// -- GET /v1/models -----------------------------------------------------------
+
+async fn oai_models(State(state): State<AppState>) -> impl IntoResponse {
+    let mut reg = match Registry::load(&state.store.registry_path()) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": {"message": e.to_string(), "type": "server_error"}})),
+            )
+                .into_response();
+        }
+    };
+    if reg.backfill_metadata() {
+        let _ = reg.save(&state.store.registry_path());
+    }
+
+    let data: Vec<serde_json::Value> = reg
+        .models
+        .keys()
+        .map(|key| {
+            serde_json::json!({
+                "id": key,
+                "object": "model",
+                "owned_by": "spindll",
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "object": "list",
+        "data": data,
+    }))
+    .into_response()
+}
+
+// -- POST /v1/chat/completions ------------------------------------------------
+
+#[derive(Deserialize)]
+struct OaiChatRequest {
+    model: String,
+    messages: Vec<OaiMessage>,
+    #[serde(default = "default_true")]
+    stream: bool,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    seed: Option<u32>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+struct OaiMessage {
+    role: String,
+    content: String,
+}
+
+async fn oai_chat_completions(
+    State(state): State<AppState>,
+    Json(req): Json<OaiChatRequest>,
+) -> impl IntoResponse {
+    let model_id = req.model.clone();
+    let mgr = state.manager.clone();
+    let store = state.store.clone();
+
+    if req.stream {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
+
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = auto_load(&mgr, &store, &req.model) {
+                let _ = tx.blocking_send(Ok(sse_data(&oai_error(&e.to_string()))));
+                return;
+            }
+
+            let messages: Vec<_> = req.messages.iter().map(|m| (m.role.clone(), m.content.clone())).collect();
+            let prompt = match mgr.apply_chat_template(&req.model, &messages) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = tx.blocking_send(Ok(sse_data(&oai_error(&e.to_string()))));
+                    return;
+                }
+            };
+
+            let params = GenerateParams {
+                max_tokens: req.max_tokens.unwrap_or(512),
+                temperature: req.temperature.unwrap_or(0.8),
+                top_p: req.top_p.unwrap_or(0.95),
+                top_k: 40,
+                seed: req.seed.unwrap_or(42),
+                prefill_only: false,
+            };
+
+            let result = mgr.generate(&req.model, &prompt, &params, None, |token| {
+                let chunk = serde_json::json!({
+                    "object": "chat.completion.chunk",
+                    "model": &req.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": token},
+                        "finish_reason": null,
+                    }]
+                });
+                tx.blocking_send(Ok(sse_data(&chunk))).is_ok()
+            });
+
+            match result {
+                Ok(_) => {
+                    let done_chunk = serde_json::json!({
+                        "object": "chat.completion.chunk",
+                        "model": &req.model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop",
+                        }]
+                    });
+                    let _ = tx.blocking_send(Ok(sse_data(&done_chunk)));
+                    let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Ok(sse_data(&oai_error(&e.to_string()))));
+                }
+            }
+        });
+
+        Sse::new(ReceiverStream::new(rx))
+            .keep_alive(axum::response::sse::KeepAlive::default())
+            .into_response()
+    } else {
+        // Non-streaming: collect all tokens then return a single JSON response.
+        let result = tokio::task::spawn_blocking(move || {
+            auto_load(&mgr, &store, &req.model)?;
+
+            let messages: Vec<_> = req.messages.iter().map(|m| (m.role.clone(), m.content.clone())).collect();
+            let prompt = mgr.apply_chat_template(&req.model, &messages)?;
+
+            let params = GenerateParams {
+                max_tokens: req.max_tokens.unwrap_or(512),
+                temperature: req.temperature.unwrap_or(0.8),
+                top_p: req.top_p.unwrap_or(0.95),
+                top_k: 40,
+                seed: req.seed.unwrap_or(42),
+                prefill_only: false,
+            };
+
+            let mut output = String::new();
+            let stats = mgr.generate(&req.model, &prompt, &params, None, |token| {
+                output.push_str(token);
+                true
+            })?;
+
+            Ok::<_, anyhow::Error>((output, stats))
+        })
+        .await;
+
+        match result {
+            Ok(Ok((content, stats))) => Json(serde_json::json!({
+                "object": "chat.completion",
+                "model": model_id,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": stats.prompt_tokens,
+                    "completion_tokens": stats.completion_tokens,
+                    "total_tokens": stats.prompt_tokens + stats.completion_tokens,
+                }
+            }))
+            .into_response(),
+            Ok(Err(e)) => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(oai_error(&e.to_string())),
+            )
+                .into_response(),
+            Err(e) => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(oai_error(&e.to_string())),
+            )
+                .into_response(),
+        }
+    }
+}
+
+fn oai_error(msg: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error": {
+            "message": msg,
+            "type": "server_error",
+        }
+    })
+}
+
+/// Auto-load a model if not already in memory.
+fn auto_load(
+    mgr: &ModelManager,
+    store: &ModelStore,
+    model: &str,
+) -> anyhow::Result<()> {
+    if mgr.is_loaded(model) {
+        return Ok(());
+    }
+    let path = store.resolve_model_path(model)?;
+    let digest = store.resolve_model_digest(model).unwrap_or_default();
+    mgr.load_model_with_digest(model, &path, None, digest)?;
+    Ok(())
 }
