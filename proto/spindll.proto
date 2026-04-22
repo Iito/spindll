@@ -117,6 +117,9 @@ message ModelInfo {
   uint64 size_bytes = 5;
   string last_used = 6;
   string digest = 7;
+  string model_name = 8;
+  string description = 9;
+  string architecture = 10;
 }
 
 message LoadRequest {

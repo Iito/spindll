@@ -224,8 +224,11 @@ impl Spindll for SpindllService {
         &self,
         _request: Request<ListRequest>,
     ) -> Result<Response<ListResponse>, Status> {
-        let reg = crate::model_store::registry::Registry::load(&self.model_store.registry_path())
+        let mut reg = crate::model_store::registry::Registry::load(&self.model_store.registry_path())
             .map_err(|e| Status::internal(e.to_string()))?;
+        if reg.backfill_metadata() {
+            let _ = reg.save(&self.model_store.registry_path());
+        }
 
         let models = reg
             .models
@@ -238,6 +241,9 @@ impl Spindll for SpindllService {
                 size_bytes: entry.size_bytes,
                 last_used: String::new(),
                 digest: entry.digest.clone(),
+                model_name: entry.model_name.clone(),
+                description: entry.description.clone(),
+                architecture: entry.architecture.clone(),
             })
             .collect();
 
