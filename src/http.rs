@@ -25,18 +25,12 @@ struct AppState {
     store: Arc<ModelStore>,
 }
 
-/// Start the HTTP/SSE server on the given port.
-///
-/// Runs alongside the gRPC server on a separate port, sharing the same
-/// `ModelManager` and `ModelStore`.
-pub async fn start_http_server(
-    port: u16,
-    manager: Arc<ModelManager>,
-    store: Arc<ModelStore>,
-) -> anyhow::Result<()> {
+/// Build the HTTP API router without binding to a port.
+/// Useful for embedding into a larger application server.
+pub fn router(manager: Arc<ModelManager>, store: Arc<ModelStore>) -> Router {
     let state = AppState { manager, store };
 
-    let app = Router::new()
+    Router::new()
         .route("/health", get(health))
         .route("/models", get(models))
         .route("/chat", post(chat))
@@ -49,8 +43,19 @@ pub async fn start_http_server(
         .route("/v1/chat/completions", post(oai_chat_completions))
         .route("/v1/completions", post(oai_completions))
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state)
+}
 
+/// Start the HTTP/SSE server on the given port.
+///
+/// Runs alongside the gRPC server on a separate port, sharing the same
+/// `ModelManager` and `ModelStore`.
+pub async fn start_http_server(
+    port: u16,
+    manager: Arc<ModelManager>,
+    store: Arc<ModelStore>,
+) -> anyhow::Result<()> {
+    let app = router(manager, store);
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(%addr, "HTTP server listening");
