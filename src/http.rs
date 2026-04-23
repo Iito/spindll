@@ -81,6 +81,7 @@ struct ModelInfo {
     model_name: String,
     description: String,
     architecture: String,
+    context_length: u32,
 }
 
 async fn models(State(state): State<AppState>) -> impl IntoResponse {
@@ -98,25 +99,32 @@ async fn models(State(state): State<AppState>) -> impl IntoResponse {
         let _ = reg.save(&state.store.registry_path());
     }
 
-    let loaded: std::collections::HashSet<String> = state
+    let loaded: std::collections::HashMap<String, (u32, u32)> = state
         .manager
         .loaded_models()
         .into_iter()
-        .map(|(name, _, _, _)| name)
+        .map(|(name, _, _, _, n_ctx, n_ctx_train)| (name, (n_ctx, n_ctx_train)))
         .collect();
 
     let list: Vec<ModelInfo> = reg
         .models
         .iter()
-        .map(|(key, entry)| ModelInfo {
-            name: key.clone(),
-            size_bytes: entry.size_bytes,
-            quantization: String::new(),
-            digest: entry.digest.clone(),
-            loaded: loaded.contains(key),
-            model_name: entry.model_name.clone(),
-            description: entry.description.clone(),
-            architecture: entry.architecture.clone(),
+        .map(|(key, entry)| {
+            // If loaded, use the effective context size; otherwise use registry metadata.
+            let context_length = loaded.get(key)
+                .map(|(n_ctx, _)| *n_ctx)
+                .unwrap_or(entry.context_length);
+            ModelInfo {
+                name: key.clone(),
+                size_bytes: entry.size_bytes,
+                quantization: String::new(),
+                digest: entry.digest.clone(),
+                loaded: loaded.contains_key(key),
+                model_name: entry.model_name.clone(),
+                description: entry.description.clone(),
+                architecture: entry.architecture.clone(),
+                context_length,
+            }
         })
         .collect();
 

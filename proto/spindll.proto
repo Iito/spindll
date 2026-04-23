@@ -120,6 +120,7 @@ message ModelInfo {
   string model_name = 8;
   string description = 9;
   string architecture = 10;
+  uint32 context_length = 11;
 }
 
 message LoadRequest {
@@ -176,6 +177,7 @@ message LoadedModel {
   uint64 memory_used = 2;
   int32 gpu_layers = 3;
   string digest = 4;
+  uint32 context_length = 5;
 }
 
 message MemoryInfo {

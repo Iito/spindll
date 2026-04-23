@@ -77,7 +77,7 @@ impl ModelStore {
 
         download::validate_gguf(&path)?;
 
-        let (model_name, description, architecture) = registry::read_gguf_metadata(&path);
+        let (model_name, description, architecture, context_length) = registry::read_gguf_metadata(&path);
         let filename = path.file_name().unwrap().to_string_lossy().to_string();
         let mut reg = registry::Registry::load(&self.registry_path())?;
         reg.add(key, registry::ModelEntry {
@@ -93,6 +93,7 @@ impl ModelStore {
             model_name,
             description,
             architecture,
+            context_length,
             metadata_read: true,
         });
         reg.save(&self.registry_path())?;
@@ -236,7 +237,7 @@ impl ModelStore {
 
             let key = format!("ollama/{name}/{filename}");
             if !reg.models.contains_key(&key) {
-                let (gguf_name, gguf_desc, gguf_arch) = registry::read_gguf_metadata(&dest);
+                let (gguf_name, gguf_desc, gguf_arch, gguf_ctx) = registry::read_gguf_metadata(&dest);
                 reg.add(
                     key.clone(),
                     registry::ModelEntry {
@@ -252,6 +253,7 @@ impl ModelStore {
                         model_name: gguf_name,
                         description: gguf_desc,
                         architecture: gguf_arch,
+                        context_length: gguf_ctx,
                         metadata_read: true,
                     },
                 );
