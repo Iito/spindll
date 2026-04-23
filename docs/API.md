@@ -36,7 +36,8 @@ curl http://localhost:8080/models
     "loaded": true,
     "model_name": "Llama 3.1 8B Instruct",
     "description": "",
-    "architecture": "llama"
+    "architecture": "llama",
+    "context_length": 8192
   }
 ]
 ```
@@ -46,6 +47,7 @@ curl http://localhost:8080/models
 | `model_name` | GGUF `general.name` metadata |
 | `description` | GGUF `general.description` metadata |
 | `architecture` | GGUF `general.architecture` metadata |
+| `context_length` | Trained context size from GGUF metadata (effective size capped by `--ctx-size` when loaded) |
 | `loaded` | Whether the model is currently in memory |
 
 ### POST /chat (SSE)
@@ -475,6 +477,27 @@ spindll::grpc::start_server(50051, manager.clone(), store.clone()).await?;
 // HTTP server (requires "http" feature)
 #[cfg(feature = "http")]
 spindll::http::start_http_server(8080, manager.clone(), store.clone()).await?;
+```
+
+### Embedding the HTTP router
+
+To mount spindll's API into your own axum server alongside other routes:
+
+```rust
+use std::sync::Arc;
+
+let manager = Arc::new(manager);
+let store = Arc::new(ModelStore::new(None));
+
+// Get the router without binding to a port
+let spindll_router = spindll::http::router(manager, store);
+
+// Nest it under a prefix, or merge with your own routes
+let app = axum::Router::new()
+    .nest("/spindll", spindll_router);
+
+let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+axum::serve(listener, app).await?;
 ```
 
 ### Engine (single-model)
