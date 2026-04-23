@@ -244,6 +244,7 @@ impl Spindll for SpindllService {
                 model_name: entry.model_name.clone(),
                 description: entry.description.clone(),
                 architecture: entry.architecture.clone(),
+                context_length: entry.context_length,
             })
             .collect();
 
@@ -367,11 +368,12 @@ impl Spindll for SpindllService {
         let mem = crate::scheduler::budget::MemoryBudget::detect(None);
 
         let models = self.manager.loaded_models().iter()
-            .map(|(name, size, layers, digest)| LoadedModel {
+            .map(|(name, size, layers, digest, n_ctx, _)| LoadedModel {
                 name: name.clone(),
                 memory_used: *size,
                 gpu_layers: *layers as i32,
                 digest: digest.clone(),
+                context_length: *n_ctx,
             })
             .collect();
 

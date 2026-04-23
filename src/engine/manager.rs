@@ -20,6 +20,8 @@ pub struct LoadedModel {
     pub model: LlamaModel,
     /// Context window size (number of tokens).
     pub n_ctx: u32,
+    /// Trained context length from GGUF metadata (0 if unknown).
+    pub n_ctx_train: u32,
     /// Approximate memory footprint in bytes.
     pub size_bytes: u64,
     /// Timestamp of the last inference request (used for LRU eviction).
@@ -156,6 +158,15 @@ impl ModelManager {
 
         let size_bytes = model.size();
 
+        // Read the trained context length from GGUF metadata and cap with
+        // the global default so we never exceed the user's VRAM budget.
+        let n_ctx_train = model.n_ctx_train();
+        let n_ctx = if n_ctx_train > 0 {
+            std::cmp::min(n_ctx_train, self.default_n_ctx)
+        } else {
+            self.default_n_ctx
+        };
+
         let device = if layers > 0 && cfg!(target_os = "macos") {
             "metal"
         } else if layers > 0 {
@@ -163,12 +174,12 @@ impl ModelManager {
         } else {
             "cpu"
         };
-        tracing::info!(name, layers = model.n_layer(), device, size_bytes, "model loaded");
+        tracing::info!(name, layers = model.n_layer(), device, size_bytes, n_ctx, n_ctx_train, "model loaded");
 
         // Optionally start a batch scheduler for this model.
         let batch_tx = if self.batch_slots > 0 {
             let (tx, rx) = std::sync::mpsc::channel::<BatchRequest>();
-            let n_ctx = self.default_n_ctx;
+            let n_ctx = n_ctx;
             let max_seq = self.batch_slots;
             let model_name = name.to_string();
 
@@ -198,7 +209,8 @@ impl ModelManager {
 
         let loaded = LoadedModel {
             model,
-            n_ctx: self.default_n_ctx,
+            n_ctx,
+            n_ctx_train,
             size_bytes,
             last_used: RwLock::new(Instant::now()),
             gpu_layers: layers,
@@ -226,13 +238,13 @@ impl ModelManager {
         self.models.read().unwrap().contains_key(name)
     }
 
-    /// List all loaded models as `(name, size_bytes, gpu_layers, digest)` tuples.
-    pub fn loaded_models(&self) -> Vec<(String, u64, u32, String)> {
+    /// List all loaded models as `(name, size_bytes, gpu_layers, digest, n_ctx, n_ctx_train)` tuples.
+    pub fn loaded_models(&self) -> Vec<(String, u64, u32, String, u32, u32)> {
         self.models
             .read()
             .unwrap()
             .iter()
-            .map(|(name, m)| (name.clone(), m.size_bytes, m.gpu_layers, m.digest.clone()))
+            .map(|(name, m)| (name.clone(), m.size_bytes, m.gpu_layers, m.digest.clone(), m.n_ctx, m.n_ctx_train))
             .collect()
     }
 

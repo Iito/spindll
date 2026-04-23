@@ -27,6 +27,9 @@ pub struct ModelEntry {
     /// Model architecture from GGUF `general.architecture` metadata (e.g. `"llama"`).
     #[serde(default)]
     pub architecture: String,
+    /// Trained context length from GGUF metadata (0 if unknown).
+    #[serde(default)]
+    pub context_length: u32,
     /// Whether GGUF metadata has been read for this entry.
     #[serde(default)]
     pub metadata_read: bool,
@@ -34,11 +37,11 @@ pub struct ModelEntry {
 
 /// Read GGUF metadata from a file without loading tensor weights.
 ///
-/// Returns `(general.name, general.description, general.architecture)`.
-pub fn read_gguf_metadata(path: &Path) -> (String, String, String) {
+/// Returns `(general.name, general.description, general.architecture, context_length)`.
+pub fn read_gguf_metadata(path: &Path) -> (String, String, String, u32) {
     let ctx = match llama_cpp_2::gguf::GgufContext::from_file(path) {
         Some(c) => c,
-        None => return (String::new(), String::new(), String::new()),
+        None => return (String::new(), String::new(), String::new(), 0),
     };
 
     let read_str = |key: &str| -> String {
@@ -50,10 +53,25 @@ pub fn read_gguf_metadata(path: &Path) -> (String, String, String) {
         }
     };
 
+    let arch = read_str("general.architecture");
+
+    // Try <arch>.context_length first, then fall back to llama.context_length.
+    let ctx_len = {
+        let key = format!("{arch}.context_length");
+        let idx = ctx.find_key(&key);
+        if idx >= 0 {
+            ctx.val_u32(idx)
+        } else {
+            let idx = ctx.find_key("llama.context_length");
+            if idx >= 0 { ctx.val_u32(idx) } else { 0 }
+        }
+    };
+
     (
         read_str("general.name"),
         read_str("general.description"),
-        read_str("general.architecture"),
+        arch,
+        ctx_len,
     )
 }
 
@@ -96,10 +114,11 @@ impl Registry {
         let mut changed = false;
         for entry in self.models.values_mut() {
             if !entry.metadata_read && entry.path.exists() {
-                let (name, desc, arch) = read_gguf_metadata(&entry.path);
+                let (name, desc, arch, ctx_len) = read_gguf_metadata(&entry.path);
                 entry.model_name = name;
                 entry.description = desc;
                 entry.architecture = arch;
+                entry.context_length = ctx_len;
                 entry.metadata_read = true;
                 changed = true;
             }
