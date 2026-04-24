@@ -60,7 +60,10 @@ Model names follow Ollama conventions (`llama3.1:8b`, `qwen2:0.5b`) or HuggingFa
 --budget <SIZE>            Memory budget, e.g. "8G" (default: 80% of available RAM)
 --kv-cache [<SIZE>]        Enable KV cache for prompt prefixes [default: 2G]
 --batch-slots <N>          Concurrent sequence slots per model [default: 0 = disabled]
+--ram-cache [<SIZE>]       Keep recently-evicted models warm in RAM [default: 4G; no-op on macOS]
 ```
+
+While `serve` is running it writes a JSON lockfile (`pid`, `grpc_port`, `http_port`) to the system temp dir. `spindll status` reads this file to auto-detect the port, so `--port` is optional when a local server is running. Stale lockfiles are cleaned automatically when the referenced PID is no longer alive.
 
 ## API
 
