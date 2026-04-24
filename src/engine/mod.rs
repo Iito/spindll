@@ -4,12 +4,14 @@ pub mod batch;
 pub mod kv_cache;
 pub mod manager;
 pub mod metrics;
+pub mod ram_cache;
 pub mod streaming;
 
 pub use batch::{BatchEvent, BatchRequest, BatchScheduler};
 pub use kv_cache::KvCache;
 pub use manager::ModelManager;
 pub use metrics::Metrics;
+pub use ram_cache::RamCache;
 pub use streaming::{GenerateParams, GenerateResult};
 
 use llama_cpp_2::context::params::LlamaContextParams;
