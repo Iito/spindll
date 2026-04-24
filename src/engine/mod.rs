@@ -40,11 +40,13 @@ impl Engine {
         let backend = LlamaBackend::init()?;
 
         let gpu_layers = n_gpu_layers.unwrap_or_else(|| {
-            if cfg!(target_os = "macos") {
-                // Metal: offload everything
+            if cfg!(target_os = "macos")
+                || cfg!(feature = "cuda")
+                || cfg!(feature = "metal")
+                || cfg!(feature = "vulkan")
+            {
                 999
             } else {
-                // CPU fallback — user can override with explicit count
                 0
             }
         });
@@ -54,10 +56,14 @@ impl Engine {
         let model = LlamaModel::load_from_file(&backend, path, &model_params)
             .map_err(|e| anyhow::anyhow!("failed to load model: {e}"))?;
 
-        let device = if gpu_layers > 0 && cfg!(target_os = "macos") {
+        let device = if gpu_layers == 0 {
+            "cpu"
+        } else if cfg!(target_os = "macos") || cfg!(feature = "metal") {
             "metal"
-        } else if gpu_layers > 0 {
+        } else if cfg!(feature = "cuda") {
             "cuda"
+        } else if cfg!(feature = "vulkan") {
+            "vulkan"
         } else {
             "cpu"
         };

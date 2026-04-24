@@ -62,7 +62,15 @@ impl ModelManager {
         let backend = LlamaBackend::init()?;
 
         let default_gpu_layers = gpu_layers.unwrap_or_else(|| {
-            if cfg!(target_os = "macos") { 999 } else { 0 }
+            if cfg!(target_os = "macos")
+                || cfg!(feature = "cuda")
+                || cfg!(feature = "metal")
+                || cfg!(feature = "vulkan")
+            {
+                999
+            } else {
+                0
+            }
         });
 
         Ok(Self {
@@ -187,10 +195,14 @@ impl ModelManager {
             self.default_n_ctx
         };
 
-        let device = if layers > 0 && cfg!(target_os = "macos") {
+        let device = if layers == 0 {
+            "cpu"
+        } else if cfg!(target_os = "macos") || cfg!(feature = "metal") {
             "metal"
-        } else if layers > 0 {
+        } else if cfg!(feature = "cuda") {
             "cuda"
+        } else if cfg!(feature = "vulkan") {
+            "vulkan"
         } else {
             "cpu"
         };
