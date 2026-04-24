@@ -47,6 +47,7 @@
 //! | `http` | HTTP/SSE server with OpenAI-compatible `/v1` API |
 
 pub mod engine;
+pub mod lockfile;
 pub mod model_store;
 pub mod scheduler;
 pub mod grpc;
