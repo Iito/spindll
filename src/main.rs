@@ -55,6 +55,10 @@ enum Commands {
         #[arg(long, default_value = "0")]
         batch_slots: usize,
 
+        /// RAM cache for recently-evicted models (e.g. "8G", default 4G when enabled)
+        #[arg(long)]
+        ram_cache: Option<Option<String>>,
+
         /// HTTP/SSE server port (requires --features http, 0 = disabled)
         #[arg(long, default_value = "8080")]
         http_port: u16,
@@ -144,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
             budget,
             kv_cache,
             batch_slots,
+            ram_cache,
             http_port,
         } => {
             let mem = spindll::scheduler::budget::MemoryBudget::detect(budget.as_deref());
@@ -158,6 +163,19 @@ async fn main() -> anyhow::Result<()> {
                 let bytes = parse_size_bytes(cache_size.as_deref());
                 manager.enable_kv_cache(bytes);
                 println!("kv cache: {:.1} GB max", bytes as f64 / 1_073_741_824.0);
+            }
+
+            if let Some(cache_size) = ram_cache {
+                let bytes = match cache_size.as_deref() {
+                    Some(s) => parse_size_bytes(Some(s)),
+                    None => 4 * 1_073_741_824, // 4 GB default
+                };
+                if !cfg!(target_os = "macos") {
+                    manager.enable_ram_cache(bytes);
+                    println!("ram cache: {:.1} GB max", bytes as f64 / 1_073_741_824.0);
+                } else {
+                    println!("ram cache: disabled (unified memory)");
+                }
             }
 
             if batch_slots > 0 {

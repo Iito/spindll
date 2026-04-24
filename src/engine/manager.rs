@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -12,12 +12,15 @@ use std::num::NonZeroU32;
 use super::batch::{BatchEvent, BatchRequest, BatchScheduler};
 use super::kv_cache::KvCache;
 use super::metrics::Metrics;
+use super::ram_cache::RamCache;
 use super::streaming::{GenerateParams, GenerateResult, generate_streaming, generate_streaming_cached};
 
 /// A model that has been loaded into memory and is ready for inference.
 pub struct LoadedModel {
     /// The underlying llama.cpp model handle.
     pub model: LlamaModel,
+    /// Path to the GGUF file on disk.
+    pub file_path: PathBuf,
     /// Context window size (number of tokens).
     pub n_ctx: u32,
     /// Trained context length from GGUF metadata (0 if unknown).
@@ -45,6 +48,7 @@ pub struct ModelManager {
     default_gpu_layers: u32,
     memory_budget: u64, // max bytes for loaded models, 0 = unlimited
     kv_cache: Option<KvCache>,
+    ram_cache: Option<RamCache>,
     metrics: Arc<Metrics>,
     /// Maximum concurrent sequences per model for batch scheduling.
     /// 0 disables batching (each request gets its own context).
@@ -68,6 +72,7 @@ impl ModelManager {
             default_gpu_layers,
             memory_budget,
             kv_cache: None,
+            ram_cache: None,
             metrics: Arc::new(Metrics::new()),
             batch_slots: 0,
         })
@@ -119,7 +124,10 @@ impl ModelManager {
             drop(models);
 
             tracing::warn!(model = %lru_name, "evicting LRU model");
-            self.models.write().unwrap().remove(&lru_name);
+            let evicted = self.models.write().unwrap().remove(&lru_name);
+            if let (Some(cache), Some(model)) = (&self.ram_cache, &evicted) {
+                cache.warm(&lru_name, &model.file_path);
+            }
         }
     }
 
@@ -145,6 +153,12 @@ impl ModelManager {
         gpu_layers: Option<u32>,
         digest: String,
     ) -> anyhow::Result<()> {
+        let from_ram_cache = self
+            .ram_cache
+            .as_ref()
+            .and_then(|c| c.get(name))
+            .is_some();
+
         // Estimate size from file for budget check before loading
         let file_size = std::fs::metadata(path)?.len();
         self.evict_for(file_size)?;
@@ -155,6 +169,12 @@ impl ModelManager {
             .with_n_gpu_layers(layers);
         let model = LlamaModel::load_from_file(&self.backend, path, &model_params)
             .map_err(|e| anyhow::anyhow!("failed to load model: {e}"))?;
+
+        if from_ram_cache {
+            if let Some(cache) = &self.ram_cache {
+                cache.remove(name);
+            }
+        }
 
         let size_bytes = model.size();
 
@@ -209,6 +229,7 @@ impl ModelManager {
 
         let loaded = LoadedModel {
             model,
+            file_path: path.to_path_buf(),
             n_ctx,
             n_ctx_train,
             size_bytes,
@@ -224,11 +245,15 @@ impl ModelManager {
 
     #[tracing::instrument(skip(self))]
     pub fn unload_model(&self, name: &str) -> anyhow::Result<()> {
-        self.models
+        let removed = self
+            .models
             .write()
             .unwrap()
             .remove(name)
             .ok_or_else(|| anyhow::anyhow!("model '{name}' not loaded"))?;
+        if let Some(cache) = &self.ram_cache {
+            cache.warm(name, &removed.file_path);
+        }
         tracing::info!(name, "model unloaded");
         Ok(())
     }
@@ -261,6 +286,16 @@ impl ModelManager {
 
         *loaded.last_used.write().unwrap() = Instant::now();
         f(&loaded.model, &self.backend, loaded.n_ctx, &loaded.digest)
+    }
+
+    /// Enable the RAM cache for recently-evicted models.
+    pub fn enable_ram_cache(&mut self, max_bytes: u64) {
+        self.ram_cache = Some(RamCache::new(max_bytes));
+    }
+
+    /// Returns a reference to the RAM cache, if enabled.
+    pub fn ram_cache(&self) -> Option<&RamCache> {
+        self.ram_cache.as_ref()
     }
 
     /// Enable the disk-backed KV cache with the given max size in bytes.
