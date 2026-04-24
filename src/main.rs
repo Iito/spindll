@@ -82,9 +82,9 @@ enum Commands {
 
     /// Show server status
     Status {
-        /// Port of the running server
-        #[arg(long, default_value = "50051")]
-        port: u16,
+        /// Port of the running server (auto-detected from lockfile if omitted)
+        #[arg(long)]
+        port: Option<u16>,
     },
 }
 
@@ -183,7 +183,11 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(not(feature = "http"))]
             let _ = http_port;
 
-            spindll::grpc::start_server(port, manager, store).await?;
+            let effective_http_port = if cfg!(feature = "http") { http_port } else { 0 };
+            spindll::lockfile::Lockfile::write(port, effective_http_port)?;
+            let result = spindll::grpc::start_server(port, manager, store).await;
+            spindll::lockfile::Lockfile::remove();
+            result?;
         }
         Commands::Run { model, prompt, kv_cache } => {
             let store = spindll::model_store::ModelStore::new(None);
@@ -218,6 +222,15 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Status { port } => {
+            let port = match port {
+                Some(p) => p,
+                None => {
+                    match spindll::lockfile::Lockfile::read() {
+                        Some(lf) => lf.grpc_port,
+                        None => anyhow::bail!("no running server found (no lockfile); specify --port"),
+                    }
+                }
+            };
             let addr = format!("http://localhost:{port}");
             let mut client = spindll::proto::spindll_client::SpindllClient::connect(addr).await
                 .map_err(|e| anyhow::anyhow!("cannot connect to server on port {port}: {e}"))?;
