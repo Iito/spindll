@@ -25,6 +25,10 @@ http = [
     "dep:axum",
     "dep:tower-http",
 ]
+# GPU backends — forward to llama-cpp-2 so it compiles llama.cpp with the right support.
+cuda   = ["llama-cpp-2/cuda"]
+metal  = ["llama-cpp-2/metal"]
+vulkan = ["llama-cpp-2/vulkan"]
 
 [dependencies]
 # Core — always compiled
