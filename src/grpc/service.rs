@@ -377,10 +377,18 @@ impl Spindll for SpindllService {
             })
             .collect();
 
-        let devices = if cfg!(target_os = "macos") {
-            vec!["Metal".to_string(), "CPU".to_string()]
-        } else {
-            vec!["CPU".to_string()]
+        let devices = {
+            let mut d = vec!["CPU".to_string()];
+            if cfg!(target_os = "macos") || cfg!(feature = "metal") {
+                d.insert(0, "Metal".to_string());
+            }
+            if cfg!(feature = "cuda") {
+                d.insert(0, "CUDA".to_string());
+            }
+            if cfg!(feature = "vulkan") {
+                d.insert(0, "Vulkan".to_string());
+            }
+            d
         };
 
         Ok(Response::new(StatusResponse {
