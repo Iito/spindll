@@ -232,7 +232,12 @@ impl ModelStore {
             let dest = dest_dir.join(&filename);
 
             if !dest.exists() {
+                #[cfg(unix)]
                 std::os::unix::fs::symlink(&blob_path, &dest)?;
+                #[cfg(windows)]
+                if std::fs::hard_link(&blob_path, &dest).is_err() {
+                    std::fs::copy(&blob_path, &dest)?;
+                }
             }
 
             let key = format!("ollama/{name}/{filename}");
