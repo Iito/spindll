@@ -31,11 +31,18 @@ pub fn download_gguf(repo_id: &str, quant: Option<&str>, dest_dir: &Path) -> any
     tracing::info!(file = %target.rfilename, "downloading");
     let cached_path = repo.get(&target.rfilename)?;
 
-    // Symlink from hf cache into our model store
+    // Link from hf cache into our model store.
+    // Unix: symlink. Windows: hard_link (no privilege required), falling back
+    // to copy if the cache and store are on different volumes.
     std::fs::create_dir_all(dest_dir)?;
     let dest = dest_dir.join(&target.rfilename);
     if !dest.exists() {
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&cached_path, &dest)?;
+        #[cfg(windows)]
+        if std::fs::hard_link(&cached_path, &dest).is_err() {
+            std::fs::copy(&cached_path, &dest)?;
+        }
     }
 
     validate_gguf(&cached_path)?;
