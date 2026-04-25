@@ -59,6 +59,8 @@ impl ModelManager {
     /// Create a new manager. Pass `gpu_layers = None` to auto-detect (all layers on macOS Metal,
     /// CPU-only elsewhere). Set `memory_budget` to 0 for unlimited.
     pub fn new(n_ctx: u32, gpu_layers: Option<u32>, memory_budget: u64) -> anyhow::Result<Self> {
+        super::suppress_llama_log();
+
         let backend = LlamaBackend::init()?;
 
         let default_gpu_layers = gpu_layers.unwrap_or_else(|| {
@@ -481,3 +483,4 @@ impl ModelManager {
         })
     }
 }
+
