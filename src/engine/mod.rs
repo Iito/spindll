@@ -94,7 +94,8 @@ impl Engine {
         &self,
     ) -> anyhow::Result<llama_cpp_2::context::LlamaContext<'_>> {
         let params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(self.n_ctx));
+            .with_n_ctx(NonZeroU32::new(self.n_ctx))
+            .with_n_batch(self.n_ctx);
         self.model
             .new_context(&self.backend, params)
             .map_err(|e| anyhow::anyhow!("failed to create context: {e}"))
@@ -177,8 +178,24 @@ pub(crate) fn suppress_llama_log() {
 }
 
 unsafe extern "C" fn noop_llama_log(
-    _level: llama_cpp_sys_2::ggml_log_level,
-    _text: *const std::ffi::c_char,
+    level: llama_cpp_sys_2::ggml_log_level,
+    text: *const std::ffi::c_char,
     _user_data: *mut std::ffi::c_void,
 ) {
+    // Forward only WARN (3) and ERROR (2) — drop INFO/DEBUG noise.
+    if level > 3 || text.is_null() {
+        return;
+    }
+    let msg = unsafe { std::ffi::CStr::from_ptr(text) }
+        .to_string_lossy()
+        .trim_end()
+        .to_string();
+    if msg.is_empty() {
+        return;
+    }
+    if level == 2 {
+        tracing::error!(target: "llama_cpp", "{msg}");
+    } else {
+        tracing::warn!(target: "llama_cpp", "{msg}");
+    }
 }
