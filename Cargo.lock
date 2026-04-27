@@ -2072,6 +2072,7 @@ dependencies = [
  "encoding_rs",
  "hf-hub",
  "indicatif",
+ "libc",
  "llama-cpp-2",
  "prost",
  "reqwest",
