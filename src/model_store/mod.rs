@@ -50,35 +50,53 @@ impl ModelStore {
         std::fs::create_dir_all(self.models_dir())
     }
 
-    /// Pull a model. Auto-detects source:
-    /// - Contains "/" → HuggingFace (e.g. "TheBloke/Llama-3-8B-GGUF")
-    /// - Otherwise → Ollama registry (e.g. "llama3.1:8b")
+    /// Pull a model. Auto-detects source and format:
+    /// - Contains "/" → HuggingFace; auto-detects GGUF vs MLX from repo contents.
+    /// - Otherwise    → Ollama registry (e.g. "llama3.1:8b"), always GGUF.
     pub fn pull(&self, model: &str, quant: Option<&str>) -> anyhow::Result<PathBuf> {
         self.ensure_dirs()?;
 
         let is_hf = model.contains('/');
 
-        let (path, size_bytes, key, digest) = if is_hf {
+        // --- Download & detect format ---
+        let (path, size_bytes, key, digest, format) = if is_hf {
             let dest_dir = self.model_dir(model);
-            let path = download::download_gguf(model, quant, &dest_dir)?;
-            let size = std::fs::symlink_metadata(&path)?.len();
-            let filename = path.file_name().unwrap().to_string_lossy();
-            let key = format!("{}/{}", model, filename);
-            let digest = download::sha256_file(&path)?;
-            (path, size, key, digest)
+            match download::download_hf_auto(model, quant, &dest_dir)? {
+                download::HfDownload::Gguf { path, filename, size, digest } => {
+                    download::validate_gguf(&path)?;
+                    let key = format!("{}/{}", model, filename);
+                    (path, size, key, digest, registry::ModelFormat::Gguf)
+                }
+                download::HfDownload::Mlx { dir, size, digest } => {
+                    // Registry key is just the repo ID — no filename suffix.
+                    let key = model.to_string();
+                    (dir, size, key, digest, registry::ModelFormat::Mlx)
+                }
+            }
         } else {
             let (name, _tag) = ollama_pull::parse_model_ref(model);
             let dest_dir = self.model_dir(&format!("ollama/{name}"));
             let (path, size, digest) = ollama_pull::pull_from_registry(model, &dest_dir)?;
+            download::validate_gguf(&path)?;
             let filename = path.file_name().unwrap().to_string_lossy();
             let key = format!("ollama/{name}/{filename}");
-            (path, size, key, digest)
+            (path, size, key, digest, registry::ModelFormat::Gguf)
         };
 
-        download::validate_gguf(&path)?;
+        // --- Read metadata ---
+        let (model_name, description, architecture, context_length) = match format {
+            registry::ModelFormat::Gguf => registry::read_gguf_metadata(&path),
+            registry::ModelFormat::Mlx  => {
+                let (arch, name) = download::read_mlx_metadata(&path);
+                (name, String::new(), arch, 0u32)
+            }
+        };
 
-        let (model_name, description, architecture, context_length) = registry::read_gguf_metadata(&path);
-        let filename = path.file_name().unwrap().to_string_lossy().to_string();
+        // --- Register ---
+        let filename = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
         let mut reg = registry::Registry::load(&self.registry_path())?;
         reg.add(key, registry::ModelEntry {
             repo: model.to_string(),
@@ -95,6 +113,7 @@ impl ModelStore {
             architecture,
             context_length,
             metadata_read: true,
+            format,
         });
         reg.save(&self.registry_path())?;
 
@@ -181,6 +200,13 @@ impl ModelStore {
             .map_err(|_| anyhow::anyhow!("model file missing: {}", path.display()))
     }
 
+    /// Look up a model's on-disk format (GGUF or MLX) from the registry.
+    pub fn resolve_model_format(&self, model: &str) -> anyhow::Result<registry::ModelFormat> {
+        let key = self.resolve_key(model)?;
+        let reg = registry::Registry::load(&self.registry_path())?;
+        Ok(reg.models[&key].format.clone())
+    }
+
     /// Look up a model's digest from the registry.
     pub fn resolve_model_digest(&self, model: &str) -> anyhow::Result<String> {
         let key = self.resolve_key(model)?;
@@ -260,6 +286,7 @@ impl ModelStore {
                         architecture: gguf_arch,
                         context_length: gguf_ctx,
                         metadata_read: true,
+                        format: registry::ModelFormat::Gguf,
                     },
                 );
                 println!("imported {name}:{tag} ({:.1} GB)", layer.size as f64 / 1_073_741_824.0);

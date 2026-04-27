@@ -2,7 +2,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Metadata for a single model file tracked in the registry.
+/// On-disk format of a model entry.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelFormat {
+    /// Single GGUF file (llama.cpp backend).
+    #[default]
+    Gguf,
+    /// Directory of safetensors + config.json (MLX Swift backend).
+    Mlx,
+}
+
+/// Metadata for a single model tracked in the registry.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ModelEntry {
     /// Source repo identifier (e.g. `"ollama/llama3.1"` or `"TheBloke/Llama-3-8B-GGUF"`).
@@ -30,9 +41,22 @@ pub struct ModelEntry {
     /// Trained context length from GGUF metadata (0 if unknown).
     #[serde(default)]
     pub context_length: u32,
-    /// Whether GGUF metadata has been read for this entry.
+    /// Whether metadata has been read for this entry.
     #[serde(default)]
     pub metadata_read: bool,
+    /// Model format. Defaults to `Gguf` so existing registry entries are unaffected.
+    #[serde(default)]
+    pub format: ModelFormat,
+}
+
+/// Sum the sizes of all files in a directory (non-recursive, follows symlinks).
+fn dir_size(dir: &std::path::Path) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        total += std::fs::metadata(entry.path())?.len();
+    }
+    Ok(total)
 }
 
 /// Read GGUF metadata from a file without loading tensor weights.
@@ -113,7 +137,7 @@ impl Registry {
     pub fn backfill_metadata(&mut self) -> bool {
         let mut changed = false;
         for entry in self.models.values_mut() {
-            if !entry.metadata_read && entry.path.exists() {
+            if !entry.metadata_read && entry.path.exists() && entry.format == ModelFormat::Gguf {
                 let (name, desc, arch, ctx_len) = read_gguf_metadata(&entry.path);
                 entry.model_name = name;
                 entry.description = desc;
@@ -121,6 +145,15 @@ impl Registry {
                 entry.context_length = ctx_len;
                 entry.metadata_read = true;
                 changed = true;
+            }
+
+            // Backfill missing size for MLX directory entries (size was stored as 0 due to
+            // symlink_metadata not following HF hub symlinks).
+            if entry.size_bytes == 0 && entry.format == ModelFormat::Mlx && entry.path.is_dir() {
+                if let Ok(size) = dir_size(&entry.path) {
+                    entry.size_bytes = size;
+                    changed = true;
+                }
             }
         }
         changed
