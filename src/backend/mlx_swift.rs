@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::mpsc;
 
 use crate::engine::streaming::{GenerateParams, GenerateResult};
+use super::traits::{BackendLoadParams, BackendModel, InferenceBackend};
 
 // ---------------------------------------------------------------------------
 // Raw C declarations (matches mlx_bridge.h)
@@ -52,6 +53,32 @@ unsafe extern "C" fn token_callback(token: *const c_char, ctx: *mut c_void) -> c
 }
 
 // ---------------------------------------------------------------------------
+// InferenceBackend — factory for loading MLX models
+// ---------------------------------------------------------------------------
+
+pub struct MlxBackend;
+
+impl InferenceBackend for MlxBackend {
+    fn load_model(
+        &self,
+        path: &Path,
+        _params: BackendLoadParams,
+    ) -> anyhow::Result<Box<dyn BackendModel>> {
+        let engine = MlxSwiftEngine::load(path)?;
+        tracing::info!(
+            n_ctx = engine.model_n_ctx,
+            size_bytes = engine.model_size_bytes,
+            "MLX model loaded"
+        );
+        Ok(Box::new(engine))
+    }
+
+    fn name(&self) -> &str {
+        "mlx"
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Safe wrapper
 // ---------------------------------------------------------------------------
 
@@ -62,6 +89,8 @@ unsafe extern "C" fn token_callback(token: *const c_char, ctx: *mut c_void) -> c
 /// HuggingFace MLX Community format (safetensors + `config.json`).
 pub struct MlxSwiftEngine {
     handle: *mut MlxModelHandle,
+    pub model_n_ctx: u32,
+    pub model_size_bytes: u64,
 }
 
 // The handle is an opaque pointer managed by Swift ARC; it is never aliased.
@@ -80,7 +109,34 @@ impl MlxSwiftEngine {
         if handle.is_null() {
             anyhow::bail!("mlx_model_load returned NULL for {:?}", model_path);
         }
-        Ok(Self { handle })
+
+        let model_n_ctx = std::fs::read_to_string(model_path.join("config.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("max_position_embeddings")?.as_u64())
+            .unwrap_or(4096) as u32;
+
+        let model_size_bytes: u64 = std::fs::read_dir(model_path)
+            .ok()
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.path()
+                            .extension()
+                            .is_some_and(|ext| ext == "safetensors")
+                    })
+                    .filter_map(|e| std::fs::metadata(e.path()).ok())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0);
+
+        Ok(Self {
+            handle,
+            model_n_ctx,
+            model_size_bytes,
+        })
     }
 
     /// Generate tokens from `prompt`, calling `on_token` for each text chunk.
@@ -92,6 +148,15 @@ impl MlxSwiftEngine {
         prompt: &str,
         params: &GenerateParams,
         mut on_token: impl FnMut(&str) -> bool,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_dyn(prompt, params, &mut on_token)
+    }
+
+    fn generate_dyn(
+        &self,
+        prompt: &str,
+        params: &GenerateParams,
+        on_token: &mut dyn FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
         let c_prompt = CString::new(prompt)?;
 
@@ -153,10 +218,40 @@ impl MlxSwiftEngine {
         }
 
         Ok(GenerateResult {
-            prompt_tokens:     0, // wire up via mlx_bridge once PoC is validated
+            prompt_tokens:     0,
             completion_tokens,
             cache_hit:         false,
         })
+    }
+}
+
+impl BackendModel for MlxSwiftEngine {
+    fn generate(
+        &self,
+        prompt: &str,
+        params: &GenerateParams,
+        on_token: &mut dyn FnMut(&str) -> bool,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_dyn(prompt, params, on_token)
+    }
+
+    fn apply_chat_template(
+        &self,
+        _messages: &[(String, String)],
+    ) -> anyhow::Result<String> {
+        anyhow::bail!("chat templates are not yet supported for MLX models")
+    }
+
+    fn n_ctx(&self) -> u32 {
+        self.model_n_ctx
+    }
+
+    fn size_bytes(&self) -> u64 {
+        self.model_size_bytes
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
