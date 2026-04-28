@@ -26,7 +26,6 @@ use std::path::Path;
 /// For multi-model use cases (the common Parley path), prefer [`ModelManager`] instead.
 /// `Engine` is useful when you need a lightweight wrapper around exactly one model.
 pub struct Engine {
-    backend: LlamaBackend,
     model: LlamaModel,
     n_ctx: u32,
     model_digest: String,
@@ -37,7 +36,7 @@ impl Engine {
     /// Load a model, auto-detecting GPU. Pass n_gpu_layers=None to offload all layers.
     #[tracing::instrument(skip(path), fields(n_ctx, gpu_layers))]
     pub fn load(path: &Path, n_gpu_layers: Option<u32>, n_ctx: u32) -> anyhow::Result<Self> {
-        let backend = LlamaBackend::init()?;
+        let backend = crate::backend::llamacpp::shared_backend();
 
         let gpu_layers = n_gpu_layers.unwrap_or_else(|| {
             if cfg!(target_os = "macos")
@@ -70,7 +69,6 @@ impl Engine {
         tracing::info!(layers = model.n_layer(), device, "model loaded");
 
         Ok(Self {
-            backend,
             model,
             n_ctx,
             model_digest: String::new(),
@@ -85,7 +83,7 @@ impl Engine {
 
     /// Returns a reference to the llama.cpp backend instance.
     pub fn backend(&self) -> &LlamaBackend {
-        &self.backend
+        crate::backend::llamacpp::shared_backend()
     }
 
     /// Create a new inference context with the configured `n_ctx` window size.
@@ -95,7 +93,7 @@ impl Engine {
         let params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(self.n_ctx));
         self.model
-            .new_context(&self.backend, params)
+            .new_context(self.backend(), params)
             .map_err(|e| anyhow::anyhow!("failed to create context: {e}"))
     }
 

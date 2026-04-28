@@ -4,7 +4,6 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use llama_cpp_2::context::params::LlamaContextParams;
-use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
 use std::num::NonZeroU32;
@@ -235,16 +234,16 @@ impl ModelManager {
             let max_seq = self.batch_slots;
             let model_name = name.to_string();
 
-            let sched_backend = LlamaBackend::init()?;
+            let sched_backend = crate::backend::llamacpp::shared_backend();
             let sched_params = LlamaModelParams::default().with_n_gpu_layers(layers);
-            let sched_model = LlamaModel::load_from_file(&sched_backend, path, &sched_params)
+            let sched_model = LlamaModel::load_from_file(sched_backend, path, &sched_params)
                 .map_err(|e| anyhow::anyhow!("failed to load scheduler model: {e}"))?;
 
             std::thread::Builder::new()
                 .name(format!("batch-{model_name}"))
                 .spawn(move || {
                     if let Err(e) =
-                        BatchScheduler::run(&sched_model, &sched_backend, n_ctx, max_seq, rx)
+                        BatchScheduler::run(&sched_model, sched_backend, n_ctx, max_seq, rx)
                     {
                         tracing::error!(model = model_name, "batch scheduler exited: {e}");
                     }
