@@ -4,26 +4,29 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use llama_cpp_2::context::params::LlamaContextParams;
-use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
 use std::num::NonZeroU32;
+
+use crate::backend::llamacpp::LlamaCppModel;
+use crate::backend::{BackendLoadParams, BackendModel, InferenceBackend};
+use crate::model_store::registry::ModelFormat;
 
 use super::batch::{BatchEvent, BatchRequest, BatchScheduler};
 use super::kv_cache::KvCache;
 use super::metrics::Metrics;
 use super::ram_cache::RamCache;
-use super::streaming::{GenerateParams, GenerateResult, generate_streaming, generate_streaming_cached};
+use super::streaming::{GenerateParams, GenerateResult, generate_streaming_cached};
 
 /// A model that has been loaded into memory and is ready for inference.
 pub struct LoadedModel {
-    /// The underlying llama.cpp model handle.
-    pub model: LlamaModel,
-    /// Path to the GGUF file on disk.
+    /// The backend model, dispatching to GGUF or MLX as appropriate.
+    pub model: Box<dyn BackendModel>,
+    /// Path to the model file or directory on disk.
     pub file_path: PathBuf,
     /// Context window size (number of tokens).
     pub n_ctx: u32,
-    /// Trained context length from GGUF metadata (0 if unknown).
+    /// Trained context length from metadata (0 if unknown).
     pub n_ctx_train: u32,
     /// Approximate memory footprint in bytes.
     pub size_bytes: u64,
@@ -33,6 +36,8 @@ pub struct LoadedModel {
     pub gpu_layers: u32,
     /// SHA-256 digest of the model file, used for KV cache keying.
     pub digest: String,
+    /// On-disk format of this model.
+    pub format: ModelFormat,
     /// Channel to submit requests to this model's batch scheduler (if running).
     pub batch_tx: Option<std::sync::mpsc::Sender<BatchRequest>>,
 }
@@ -42,24 +47,29 @@ pub struct LoadedModel {
 /// This is the primary entry point for Parley: load models by name, run inference,
 /// and let the manager handle eviction when memory is tight.
 pub struct ModelManager {
-    backend: LlamaBackend,
+    backends: Vec<Box<dyn InferenceBackend>>,
     models: RwLock<HashMap<String, LoadedModel>>,
     default_n_ctx: u32,
     default_gpu_layers: u32,
-    memory_budget: u64, // max bytes for loaded models, 0 = unlimited
+    memory_budget: u64,
     kv_cache: Option<KvCache>,
     ram_cache: Option<RamCache>,
     metrics: Arc<Metrics>,
-    /// Maximum concurrent sequences per model for batch scheduling.
-    /// 0 disables batching (each request gets its own context).
     batch_slots: usize,
 }
 
 impl ModelManager {
     /// Create a new manager. Pass `gpu_layers = None` to auto-detect (all layers on macOS Metal,
-    /// CPU-only elsewhere). Set `memory_budget` to 0 for unlimited.
+    /// CPU-only elsewhere). Pass `memory_budget = 0` to use total physical RAM as the cap
+    /// (recommended on Apple Silicon's unified memory).
     pub fn new(n_ctx: u32, gpu_layers: Option<u32>, memory_budget: u64) -> anyhow::Result<Self> {
-        let backend = LlamaBackend::init()?;
+        #[allow(unused_mut)]
+        let mut backends: Vec<Box<dyn InferenceBackend>> = vec![
+            Box::new(crate::backend::llamacpp::LlamaCppBackend::new()?),
+        ];
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+        backends.push(Box::new(crate::backend::mlx_swift::MlxBackend));
 
         let default_gpu_layers = gpu_layers.unwrap_or_else(|| {
             if cfg!(target_os = "macos")
@@ -73,8 +83,14 @@ impl ModelManager {
             }
         });
 
+        let memory_budget = if memory_budget == 0 {
+            sysinfo::System::new_all().total_memory()
+        } else {
+            memory_budget
+        };
+
         Ok(Self {
-            backend,
+            backends,
             models: RwLock::new(HashMap::new()),
             default_n_ctx: n_ctx,
             default_gpu_layers,
@@ -98,29 +114,49 @@ impl ModelManager {
             .read()
             .unwrap()
             .values()
-            .map(|m| m.size_bytes)
+            .map(|m| {
+                let kv = m.model.as_any()
+                    .downcast_ref::<LlamaCppModel>()
+                    .map(|lm| kv_bytes_for(lm.llama_model(), m.n_ctx))
+                    .unwrap_or(0);
+                m.size_bytes + kv
+            })
             .sum()
+    }
+
+    /// Effective budget for the next load: the configured cap, lowered to
+    /// what the system can actually provide right now. We use `available_ram`
+    /// (free + inactive + purgeable on macOS) — KV/n_ctx headroom is handled
+    /// per-backend (`LlamaCppBackend::resolve_n_ctx` reads it from
+    /// `BackendLoadParams.memory_budget`), and the `--budget 0` (total RAM)
+    /// opt-in must not be silently downgraded.
+    fn effective_budget(&self) -> u64 {
+        if self.memory_budget == 0 {
+            return 0; // unlimited
+        }
+        let live = crate::scheduler::budget::MemoryBudget::detect(None).available_ram;
+        std::cmp::min(self.memory_budget, live)
     }
 
     /// Evict least-recently-used models until `needed` bytes fit within budget.
     fn evict_for(&self, needed: u64) -> anyhow::Result<()> {
-        if self.memory_budget == 0 {
+        let budget = self.effective_budget();
+        if budget == 0 {
             return Ok(()); // unlimited
         }
 
         loop {
             let used = self.total_loaded_bytes();
-            if used + needed <= self.memory_budget {
+            if used + needed <= budget {
                 return Ok(());
             }
 
-            // Find LRU model
             let models = self.models.read().unwrap();
             if models.is_empty() {
                 anyhow::bail!(
                     "model needs {:.1} GB but budget is {:.1} GB",
                     needed as f64 / 1_073_741_824.0,
-                    self.memory_budget as f64 / 1_073_741_824.0
+                    budget as f64 / 1_073_741_824.0
                 );
             }
 
@@ -136,6 +172,26 @@ impl ModelManager {
             if let (Some(cache), Some(model)) = (&self.ram_cache, &evicted) {
                 cache.warm(&lru_name, &model.file_path);
             }
+        }
+    }
+
+    fn backend_for_format(&self, format: &ModelFormat) -> anyhow::Result<&dyn InferenceBackend> {
+        let target = match format {
+            ModelFormat::Gguf => "llamacpp",
+            ModelFormat::Mlx => "mlx",
+        };
+        self.backends
+            .iter()
+            .find(|b| b.name() == target)
+            .map(|b| b.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("no backend available for {target} format"))
+    }
+
+    fn infer_format(path: &Path) -> ModelFormat {
+        if path.is_dir() {
+            ModelFormat::Mlx
+        } else {
+            ModelFormat::Gguf
         }
     }
 
@@ -161,22 +217,47 @@ impl ModelManager {
         gpu_layers: Option<u32>,
         digest: String,
     ) -> anyhow::Result<()> {
+        let format = Self::infer_format(path);
+        let backend = self.backend_for_format(&format)?;
+
         let from_ram_cache = self
             .ram_cache
             .as_ref()
             .and_then(|c| c.get(name))
             .is_some();
 
-        // Estimate size from file for budget check before loading
-        let file_size = std::fs::metadata(path)?.len();
+        let file_size = if path.is_dir() {
+            std::fs::read_dir(path)?
+                .filter_map(|e| e.ok())
+                .filter_map(|e| std::fs::metadata(e.path()).ok())
+                .map(|m| m.len())
+                .sum()
+        } else {
+            std::fs::metadata(path)?.len()
+        };
         self.evict_for(file_size)?;
+
+        // Snapshot live availability BEFORE the load so the backend can
+        // budget-resolve n_ctx against memory not yet consumed by weights.
+        // Once weights are mmap'd / uploaded to Metal, available memory drops,
+        // so the snapshot has to happen here, not inside the backend.
+        let available_before =
+            crate::scheduler::budget::MemoryBudget::detect(None).available_ram;
+        let load_budget = if self.memory_budget > 0 {
+            std::cmp::min(self.memory_budget, available_before)
+        } else {
+            available_before
+        };
 
         let layers = gpu_layers.unwrap_or(self.default_gpu_layers);
 
-        let model_params = LlamaModelParams::default()
-            .with_n_gpu_layers(layers);
-        let model = LlamaModel::load_from_file(&self.backend, path, &model_params)
-            .map_err(|e| anyhow::anyhow!("failed to load model: {e}"))?;
+        let load_params = BackendLoadParams {
+            n_ctx: self.default_n_ctx,
+            n_gpu_layers: Some(layers),
+            memory_budget: load_budget,
+        };
+
+        let model = backend.load_model(path, load_params)?;
 
         if from_ram_cache {
             if let Some(cache) = &self.ram_cache {
@@ -184,51 +265,29 @@ impl ModelManager {
             }
         }
 
-        let size_bytes = model.size();
-
-        // Read the trained context length from GGUF metadata and cap with
-        // the global default so we never exceed the user's VRAM budget.
+        let n_ctx = model.n_ctx();
         let n_ctx_train = model.n_ctx_train();
-        let n_ctx = if n_ctx_train > 0 {
-            std::cmp::min(n_ctx_train, self.default_n_ctx)
-        } else {
-            self.default_n_ctx
-        };
+        let size_bytes = model.size_bytes();
 
-        let device = if layers == 0 {
-            "cpu"
-        } else if cfg!(target_os = "macos") || cfg!(feature = "metal") {
-            "metal"
-        } else if cfg!(feature = "cuda") {
-            "cuda"
-        } else if cfg!(feature = "vulkan") {
-            "vulkan"
-        } else {
-            "cpu"
-        };
-        tracing::info!(name, layers = model.n_layer(), device, size_bytes, n_ctx, n_ctx_train, "model loaded");
-
-        // Optionally start a batch scheduler for this model.
-        let batch_tx = if self.batch_slots > 0 {
+        // Batch scheduling: GGUF-only, gated on supports_batching().
+        // n_ctx, device, and size are logged from inside `LlamaCppBackend::load_model`
+        // (which has direct access to `LlamaModel::n_layer` and the GPU detection).
+        let batch_tx = if self.batch_slots > 0 && model.supports_batching() {
             let (tx, rx) = std::sync::mpsc::channel::<BatchRequest>();
-            let n_ctx = n_ctx;
             let max_seq = self.batch_slots;
             let model_name = name.to_string();
 
-            // The batch scheduler needs its own context, which requires a
-            // reference to the model. Since LlamaModel isn't Send, we load
-            // a second handle for the scheduler thread.
+            let sched_backend = crate::backend::llamacpp::shared_backend();
             let sched_params = LlamaModelParams::default().with_n_gpu_layers(layers);
-            let sched_model = LlamaModel::load_from_file(&self.backend, path, &sched_params)
+            let sched_model = LlamaModel::load_from_file(sched_backend, path, &sched_params)
                 .map_err(|e| anyhow::anyhow!("failed to load scheduler model: {e}"))?;
-            let sched_backend = LlamaBackend::init()?;
 
             std::thread::Builder::new()
                 .name(format!("batch-{model_name}"))
                 .spawn(move || {
-                    if let Err(e) = BatchScheduler::run(
-                        &sched_model, &sched_backend, n_ctx, max_seq, rx,
-                    ) {
+                    if let Err(e) =
+                        BatchScheduler::run(&sched_model, sched_backend, n_ctx, max_seq, rx)
+                    {
                         tracing::error!(model = model_name, "batch scheduler exited: {e}");
                     }
                 })?;
@@ -248,6 +307,7 @@ impl ModelManager {
             last_used: RwLock::new(Instant::now()),
             gpu_layers: layers,
             digest,
+            format,
             batch_tx,
         };
 
@@ -281,23 +341,17 @@ impl ModelManager {
             .read()
             .unwrap()
             .iter()
-            .map(|(name, m)| (name.clone(), m.size_bytes, m.gpu_layers, m.digest.clone(), m.n_ctx, m.n_ctx_train))
+            .map(|(name, m)| {
+                (
+                    name.clone(),
+                    m.size_bytes,
+                    m.gpu_layers,
+                    m.digest.clone(),
+                    m.n_ctx,
+                    m.n_ctx_train,
+                )
+            })
             .collect()
-    }
-
-    /// Run a closure with a reference to a loaded model.
-    /// Updates last_used timestamp.
-    pub fn with_model<F, R>(&self, name: &str, f: F) -> anyhow::Result<R>
-    where
-        F: FnOnce(&LlamaModel, &LlamaBackend, u32, &str) -> anyhow::Result<R>,
-    {
-        let models = self.models.read().unwrap();
-        let loaded = models
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("model '{name}' not loaded"))?;
-
-        *loaded.last_used.write().unwrap() = Instant::now();
-        f(&loaded.model, &self.backend, loaded.n_ctx, &loaded.digest)
     }
 
     /// Enable the RAM cache for recently-evicted models.
@@ -334,10 +388,13 @@ impl ModelManager {
     ///
     /// When the model has a batch scheduler running, the request is submitted
     /// to the shared decode loop. Otherwise falls back to a per-request context
-    /// (using the disk-backed KV cache if enabled).
+    /// (using the disk-backed KV cache if enabled for GGUF models).
     ///
-    /// Pass `encryption_key` to encrypt cached KV state at rest (non-batched path only).
-    #[tracing::instrument(skip(self, prompt, params, on_token, encryption_key), fields(model = model_name))]
+    /// Pass `encryption_key` to encrypt cached KV state at rest (non-batched GGUF path only).
+    #[tracing::instrument(
+        skip(self, prompt, params, on_token, encryption_key),
+        fields(model = model_name)
+    )]
     pub fn generate(
         &self,
         model_name: &str,
@@ -346,7 +403,13 @@ impl ModelManager {
         encryption_key: Option<&[u8; 32]>,
         mut on_token: impl FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
-        // Check if this model has a batch scheduler.
+        tracing::info!(
+            model = model_name,
+            prompt_chars = prompt.len(),
+            max_tokens = params.max_tokens,
+            "generate request received"
+        );
+
         let batch_tx = {
             let models = self.models.read().unwrap();
             models.get(model_name).and_then(|m| {
@@ -359,16 +422,21 @@ impl ModelManager {
         let result = if let Some(tx) = batch_tx {
             Self::generate_via_batch(tx, prompt, params, &mut on_token)
         } else {
-            self.generate_direct(model_name, prompt, params, encryption_key, on_token)
+            self.generate_direct(model_name, prompt, params, encryption_key, &mut on_token)
         };
 
         let elapsed_us = start.elapsed().as_micros() as u64;
         match &result {
             Ok(stats) => {
+                tracing::info!(
+                    prompt_tokens = stats.prompt_tokens,
+                    completion_tokens = stats.completion_tokens,
+                    elapsed_ms = elapsed_us / 1000,
+                    "generation complete"
+                );
                 if params.prefill_only {
-                    self.metrics.record_prefill(
-                        stats.prompt_tokens as u64, elapsed_us, stats.cache_hit,
-                    );
+                    self.metrics
+                        .record_prefill(stats.prompt_tokens as u64, elapsed_us, stats.cache_hit);
                 } else {
                     self.metrics.record_generate(
                         stats.prompt_tokens as u64,
@@ -378,7 +446,10 @@ impl ModelManager {
                     );
                 }
             }
-            Err(_) => self.metrics.record_error(),
+            Err(e) => {
+                tracing::error!(error = %e, elapsed_ms = elapsed_us / 1000, "generation failed");
+                self.metrics.record_error();
+            }
         }
         result
     }
@@ -405,19 +476,20 @@ impl ModelManager {
             response_tx: resp_tx,
         };
 
-        tx.send(req).map_err(|_| anyhow::anyhow!("batch scheduler is not running"))?;
+        tx.send(req)
+            .map_err(|_| anyhow::anyhow!("batch scheduler is not running"))?;
 
-        // Drain events from the batch scheduler.
         loop {
             match resp_rx.blocking_recv() {
                 Some(BatchEvent::Token(piece)) => {
                     if !on_token(&piece) {
-                        // Client abort — drop the receiver so the scheduler
-                        // detects the closed channel on its next send.
                         break;
                     }
                 }
-                Some(BatchEvent::Done { prompt_tokens, completion_tokens }) => {
+                Some(BatchEvent::Done {
+                    prompt_tokens,
+                    completion_tokens,
+                }) => {
                     return Ok(GenerateResult {
                         prompt_tokens,
                         completion_tokens,
@@ -433,8 +505,6 @@ impl ModelManager {
             }
         }
 
-        // If we broke out of the loop (client abort), wait for Done/Error.
-        // The scheduler will notice the closed channel and finish the sequence.
         Ok(GenerateResult {
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -442,29 +512,49 @@ impl ModelManager {
         })
     }
 
-    /// Per-request context path (original behavior).
+    /// Per-request context path. Uses KV cache for GGUF models when available,
+    /// otherwise delegates to the backend trait.
     fn generate_direct(
         &self,
         model_name: &str,
         prompt: &str,
         params: &GenerateParams,
         encryption_key: Option<&[u8; 32]>,
-        on_token: impl FnMut(&str) -> bool,
+        on_token: &mut dyn FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
-        self.with_model(model_name, |model, backend, n_ctx, digest| {
-            let ctx_params = LlamaContextParams::default()
-                .with_n_ctx(NonZeroU32::new(n_ctx));
-            let mut ctx = model
-                .new_context(backend, ctx_params)
-                .map_err(|e| anyhow::anyhow!("failed to create context: {e}"))?;
+        let models = self.models.read().unwrap();
+        let loaded = models
+            .get(model_name)
+            .ok_or_else(|| anyhow::anyhow!("model '{}' not loaded", model_name))?;
+        *loaded.last_used.write().unwrap() = Instant::now();
 
-            match &self.kv_cache {
-                Some(cache) => generate_streaming_cached(
-                    model, &mut ctx, prompt, params, model_name, digest, cache, encryption_key, on_token,
-                ),
-                None => generate_streaming(model, &mut ctx, prompt, params, on_token),
+        // KV cache path: GGUF models with cache enabled get the cached generate path.
+        if let Some(cache) = &self.kv_cache {
+            if let Some(llama) = loaded.model.as_any().downcast_ref::<LlamaCppModel>() {
+                // n_batch == n_ctx so prefill batches always fit. Default n_batch=512
+                // hits GGML_ASSERT and crashes on prompts longer than 512 tokens.
+                let ctx_params = LlamaContextParams::default()
+                    .with_n_ctx(NonZeroU32::new(loaded.n_ctx))
+                    .with_n_batch(loaded.n_ctx);
+                let mut ctx = llama
+                    .llama_model()
+                    .new_context(llama.llama_backend(), ctx_params)
+                    .map_err(|e| anyhow::anyhow!("failed to create context: {e}"))?;
+                return generate_streaming_cached(
+                    llama.llama_model(),
+                    &mut ctx,
+                    prompt,
+                    params,
+                    model_name,
+                    &loaded.digest,
+                    cache,
+                    encryption_key,
+                    on_token,
+                );
             }
-        })
+        }
+
+        loaded.model.generate(prompt, params, on_token)
     }
 
     /// Apply the model's built-in chat template to a list of `(role, content)` messages.
@@ -476,8 +566,16 @@ impl ModelManager {
         model_name: &str,
         messages: &[(String, String)],
     ) -> anyhow::Result<String> {
-        self.with_model(model_name, |model, _, _, _| {
-            super::apply_chat_template_with_fallback(model, messages)
-        })
+        let models = self.models.read().unwrap();
+        let loaded = models
+            .get(model_name)
+            .ok_or_else(|| anyhow::anyhow!("model '{}' not loaded", model_name))?;
+        *loaded.last_used.write().unwrap() = Instant::now();
+        loaded.model.apply_chat_template(messages)
     }
 }
+
+fn kv_bytes_for(model: &LlamaModel, n_ctx: u32) -> u64 {
+    crate::backend::llamacpp::kv_bytes_per_token(model) * n_ctx as u64
+}
+
