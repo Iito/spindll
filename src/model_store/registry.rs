@@ -137,7 +137,10 @@ impl Registry {
     pub fn backfill_metadata(&mut self) -> bool {
         let mut changed = false;
         for entry in self.models.values_mut() {
-            if !entry.metadata_read && entry.path.exists() && entry.format == ModelFormat::Gguf {
+            if (!entry.metadata_read || entry.context_length == 0)
+                && entry.path.exists()
+                && entry.format == ModelFormat::Gguf
+            {
                 let (name, desc, arch, ctx_len) = read_gguf_metadata(&entry.path);
                 entry.model_name = name;
                 entry.description = desc;
