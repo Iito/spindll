@@ -107,19 +107,39 @@ impl ModelManager {
             .read()
             .unwrap()
             .values()
-            .map(|m| m.size_bytes)
+            .map(|m| {
+                let kv = m.model.as_any()
+                    .downcast_ref::<LlamaCppModel>()
+                    .map(|lm| kv_bytes_for(lm.llama_model(), m.n_ctx))
+                    .unwrap_or(0);
+                m.size_bytes + kv
+            })
             .sum()
+    }
+
+    /// Effective budget for the next load: the configured cap, lowered to
+    /// what the system can actually provide right now. We use `available_ram`
+    /// (free + inactive + purgeable on macOS) — KV/n_ctx headroom is handled
+    /// per-backend, and the `--budget 0` (total RAM) opt-in must not be
+    /// silently downgraded.
+    fn effective_budget(&self) -> u64 {
+        if self.memory_budget == 0 {
+            return 0; // unlimited
+        }
+        let live = crate::scheduler::budget::MemoryBudget::detect(None).available_ram;
+        std::cmp::min(self.memory_budget, live)
     }
 
     /// Evict least-recently-used models until `needed` bytes fit within budget.
     fn evict_for(&self, needed: u64) -> anyhow::Result<()> {
-        if self.memory_budget == 0 {
-            return Ok(());
+        let budget = self.effective_budget();
+        if budget == 0 {
+            return Ok(()); // unlimited
         }
 
         loop {
             let used = self.total_loaded_bytes();
-            if used + needed <= self.memory_budget {
+            if used + needed <= budget {
                 return Ok(());
             }
 
@@ -128,7 +148,7 @@ impl ModelManager {
                 anyhow::bail!(
                     "model needs {:.1} GB but budget is {:.1} GB",
                     needed as f64 / 1_073_741_824.0,
-                    self.memory_budget as f64 / 1_073_741_824.0
+                    budget as f64 / 1_073_741_824.0
                 );
             }
 
@@ -209,11 +229,22 @@ impl ModelManager {
         };
         self.evict_for(file_size)?;
 
+        // Snapshot live availability BEFORE the load so the backend can
+        // budget-resolve n_ctx against memory not yet consumed by weights.
+        let available_before =
+            crate::scheduler::budget::MemoryBudget::detect(None).available_ram;
+        let load_budget = if self.memory_budget > 0 {
+            std::cmp::min(self.memory_budget, available_before)
+        } else {
+            available_before
+        };
+
         let layers = gpu_layers.unwrap_or(self.default_gpu_layers);
 
         let load_params = BackendLoadParams {
             n_ctx: self.default_n_ctx,
             n_gpu_layers: Some(layers),
+            memory_budget: load_budget,
         };
 
         let model = backend.load_model(path, load_params)?;
@@ -511,4 +542,8 @@ impl ModelManager {
         *loaded.last_used.write().unwrap() = Instant::now();
         loaded.model.apply_chat_template(messages)
     }
+}
+
+fn kv_bytes_for(model: &LlamaModel, n_ctx: u32) -> u64 {
+    crate::backend::llamacpp::kv_bytes_per_token(model) * n_ctx as u64
 }

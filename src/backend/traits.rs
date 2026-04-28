@@ -3,8 +3,14 @@ use std::path::Path;
 use crate::engine::streaming::{GenerateParams, GenerateResult};
 
 pub struct BackendLoadParams {
+    /// Requested context size. 0 = auto-resolve to the largest n_ctx that
+    /// fits weights + KV + compute buffers within `memory_budget`.
     pub n_ctx: u32,
     pub n_gpu_layers: Option<u32>,
+    /// Live memory available for this load (bytes), snapshotted before the
+    /// model's weights are mmap'd. 0 = unlimited. Backends that auto-size
+    /// n_ctx use this as the budget ceiling.
+    pub memory_budget: u64,
 }
 
 pub trait InferenceBackend: Send + Sync {
