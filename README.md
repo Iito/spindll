@@ -88,7 +88,7 @@ Quick summary of available interfaces:
 
 | Interface | Port | Feature flag | Use case |
 |-----------|------|-------------|----------|
-| gRPC | 50051 | none (always on) | Parley mesh, programmatic access |
+| gRPC | 50051 | none (always on) | Programmatic access, mesh integrations |
 | HTTP/SSE | 8080 | `http` | Web frontends, custom integrations |
 | OpenAI `/v1` | 8080 | `http` | AnythingLLM, Open WebUI, any OpenAI client (chat, completions, tool calling) |
 
@@ -153,7 +153,7 @@ Models are stored in `~/.spindll/models/<repo>/<file>`. A JSON registry at `~/.s
 | `metal` | Metal GPU support in llama.cpp |
 | `vulkan` | Vulkan GPU support in llama.cpp |
 
-The gRPC server and core engine are always compiled -- no feature flag needed for library consumers or for Parley integration.
+The gRPC server and core engine are always compiled -- no feature flag needed for library consumers or for embedding spindll in another binary.
 
 ## Prerequisites
 
