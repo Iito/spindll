@@ -81,7 +81,7 @@ impl BatchScheduler {
             // Block when idle, waiting for the first request.
             if slots.is_empty() {
                 match request_rx.recv() {
-                    Ok(req) => try_accept(&mut slots, &mut free_ids, model, req),
+                    Ok(req) => try_accept(&mut slots, &mut free_ids, model, n_ctx, max_sequences, req),
                     Err(_) => break, // channel closed — shut down
                 }
             }
@@ -89,7 +89,7 @@ impl BatchScheduler {
             // Drain any additional queued requests into free slots.
             while !free_ids.is_empty() {
                 match request_rx.try_recv() {
-                    Ok(req) => try_accept(&mut slots, &mut free_ids, model, req),
+                    Ok(req) => try_accept(&mut slots, &mut free_ids, model, n_ctx, max_sequences, req),
                     Err(_) => break,
                 }
             }
@@ -216,6 +216,8 @@ fn try_accept(
     slots: &mut HashMap<i32, Slot>,
     free_ids: &mut Vec<i32>,
     model: &LlamaModel,
+    n_ctx: u32,
+    max_sequences: usize,
     req: BatchRequest,
 ) {
     let seq_id = match free_ids.pop() {
@@ -246,6 +248,14 @@ fn try_accept(
             return;
         }
     };
+
+    let per_seq_ctx = n_ctx / max_sequences.max(1) as u32;
+    let (tokens, truncated) = super::streaming::truncate_to_fit(
+        tokens, per_seq_ctx, req.params.max_tokens, 5,
+    );
+    if truncated {
+        tracing::warn!(limit = per_seq_ctx, kept = tokens.len(), "truncating input prompt");
+    }
 
     let sampler = LlamaSampler::chain_simple([
         LlamaSampler::temp(req.params.temperature),
