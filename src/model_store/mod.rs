@@ -520,7 +520,7 @@ pub fn display_name(key: &str, entry: &registry::ModelEntry) -> String {
 
 /// Returns true if this platform should prefer MLX over GGUF.
 pub fn platform_prefers_mlx() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
 }
 
 fn format_size(bytes: u64) -> String {
