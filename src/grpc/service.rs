@@ -198,7 +198,7 @@ impl Spindll for SpindllService {
                 done: false,
             }));
 
-            match store.pull(&req.repo, quant) {
+            match store.pull(&req.repo, quant, crate::model_store::FormatPreference::Auto) {
                 Ok(path) => {
                     let filename = path.file_name()
                         .map(|n| n.to_string_lossy().to_string())
