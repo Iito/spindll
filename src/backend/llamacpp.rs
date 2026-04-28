@@ -1,5 +1,6 @@
 use std::num::NonZeroU32;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -10,15 +11,20 @@ use crate::engine::streaming::{GenerateParams, GenerateResult, generate_streamin
 use crate::engine::apply_chat_template_with_fallback;
 use super::traits::{BackendLoadParams, BackendModel, InferenceBackend};
 
-pub struct LlamaCppBackend {
-    backend: LlamaBackend,
+static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+
+pub fn shared_backend() -> &'static LlamaBackend {
+    BACKEND.get_or_init(|| {
+        LlamaBackend::init().expect("LlamaBackend::init failed")
+    })
 }
+
+pub struct LlamaCppBackend;
 
 impl LlamaCppBackend {
     pub fn new() -> anyhow::Result<Self> {
-        Ok(Self {
-            backend: LlamaBackend::init()?,
-        })
+        let _ = shared_backend();
+        Ok(Self)
     }
 }
 
@@ -41,7 +47,7 @@ impl InferenceBackend for LlamaCppBackend {
         });
 
         let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
-        let model = LlamaModel::load_from_file(&self.backend, path, &model_params)
+        let model = LlamaModel::load_from_file(shared_backend(), path, &model_params)
             .map_err(|e| anyhow::anyhow!("failed to load model: {e}"))?;
 
         let n_ctx_train = model.n_ctx_train();
@@ -76,7 +82,6 @@ impl InferenceBackend for LlamaCppBackend {
         );
 
         Ok(Box::new(LlamaCppModel {
-            backend: LlamaBackend::init()?,
             model,
             n_ctx,
             n_ctx_train,
@@ -91,7 +96,6 @@ impl InferenceBackend for LlamaCppBackend {
 }
 
 pub struct LlamaCppModel {
-    backend: LlamaBackend,
     model: LlamaModel,
     n_ctx: u32,
     n_ctx_train: u32,
@@ -105,7 +109,7 @@ impl LlamaCppModel {
     }
 
     pub fn llama_backend(&self) -> &LlamaBackend {
-        &self.backend
+        shared_backend()
     }
 
     pub fn gpu_layers(&self) -> u32 {
@@ -124,7 +128,7 @@ impl BackendModel for LlamaCppModel {
             LlamaContextParams::default().with_n_ctx(NonZeroU32::new(self.n_ctx));
         let mut ctx = self
             .model
-            .new_context(&self.backend, ctx_params)
+            .new_context(shared_backend(), ctx_params)
             .map_err(|e| anyhow::anyhow!("failed to create context: {e}"))?;
         generate_streaming(&self.model, &mut ctx, prompt, params, on_token)
     }
