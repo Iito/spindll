@@ -168,3 +168,78 @@ public func mlxGenerate(
 
     return box.value ?? -1
 }
+
+// ---------------------------------------------------------------------------
+// mlx_apply_chat_template
+// ---------------------------------------------------------------------------
+
+/// Render a chat template using the model's tokenizer.
+///
+/// `messagesJson` is a UTF-8 JSON array of `{"role": ..., "content": ...}`
+/// objects. The tokenizer's Jinja chat template is applied (with
+/// `add_generation_prompt: true` so the assistant header is injected),
+/// then decoded back to a UTF-8 string. Returns NULL on any failure;
+/// otherwise the caller owns the returned pointer and must release it
+/// via `mlx_free_string`.
+@_cdecl("mlx_apply_chat_template")
+public func mlxApplyChatTemplate(
+    _ handle: UnsafeMutableRawPointer?,
+    _ messagesJson: UnsafePointer<CChar>?
+) -> UnsafePointer<CChar>? {
+    guard let handle, let messagesJson else { return nil }
+    let state = Unmanaged<ModelState>.fromOpaque(handle).takeUnretainedValue()
+    let json = String(cString: messagesJson)
+
+    // Decode JSON → [[String: String]] (the shape Tokenizers' applyChatTemplate expects).
+    guard
+        let data = json.data(using: .utf8),
+        let parsed = try? JSONSerialization.jsonObject(with: data),
+        let messages = parsed as? [[String: String]]
+    else { return nil }
+
+    let sema = DispatchSemaphore(value: 0)
+    let box = Box<String>()
+
+    Task {
+        do {
+            try await state.container.perform { context in
+                // Tokenizers.applyChatTemplate returns token IDs; decode back
+                // to a string so we can hand a rendered prompt to llama.cpp's
+                // tokenizer (the MLX path then re-tokenizes via UserInput).
+                // add_generation_prompt is on by default in swift-transformers.
+                let ids = try context.tokenizer.applyChatTemplate(messages: messages)
+                box.value = context.tokenizer.decode(tokenIds: ids)
+            }
+        } catch {
+            // box.value stays nil → NULL returned
+        }
+        sema.signal()
+    }
+    sema.wait()
+
+    guard let rendered = box.value,
+          let cstr = rendered.cString(using: .utf8)
+    else { return nil }
+
+    // Allocate a new buffer and copy. Caller owns it and must release via
+    // mlx_free_string. We use UnsafeMutablePointer<CChar>.allocate(...) so
+    // free() in Swift matches deallocate() — same allocator end-to-end.
+    let buf = UnsafeMutablePointer<CChar>.allocate(capacity: cstr.count)
+    buf.initialize(from: cstr, count: cstr.count)
+    return UnsafePointer(buf)
+}
+
+// ---------------------------------------------------------------------------
+// mlx_free_string
+// ---------------------------------------------------------------------------
+
+/// Release a string previously returned by `mlx_apply_chat_template`.
+@_cdecl("mlx_free_string")
+public func mlxFreeString(_ s: UnsafePointer<CChar>?) {
+    guard let s else { return }
+    let mutable = UnsafeMutablePointer(mutating: s)
+    // Length includes the NUL terminator.
+    let len = strlen(s) + 1
+    mutable.deinitialize(count: len)
+    mutable.deallocate()
+}
