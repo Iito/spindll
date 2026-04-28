@@ -165,8 +165,11 @@ impl BackendModel for LlamaCppModel {
         params: &GenerateParams,
         on_token: &mut dyn FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
-        let ctx_params =
-            LlamaContextParams::default().with_n_ctx(NonZeroU32::new(self.n_ctx));
+        // n_batch == n_ctx so prefill batches always fit. Default n_batch=512
+        // hits GGML_ASSERT and crashes the engine on prompts longer than 512.
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(self.n_ctx))
+            .with_n_batch(self.n_ctx);
         let mut ctx = self
             .model
             .new_context(shared_backend(), ctx_params)
