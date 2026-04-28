@@ -33,6 +33,20 @@ int32_t mlx_generate(
     void*            user_data
 );
 
+// Render a chat template using the model's tokenizer.
+// `messages_json` is a UTF-8 JSON array: [{"role":"user","content":"..."}, ...].
+// On success, returns a newly allocated NUL-terminated UTF-8 string that the
+// caller MUST release with mlx_free_string. Returns NULL on failure (model
+// has no template, JSON malformed, or tokenizer error).
+const char* mlx_apply_chat_template(
+    MlxModelHandle* handle,
+    const char*     messages_json
+);
+
+// Release a string previously returned by mlx_apply_chat_template.
+// Safe to call with NULL.
+void mlx_free_string(const char* s);
+
 #ifdef __cplusplus
 }
 #endif
