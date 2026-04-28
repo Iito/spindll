@@ -107,6 +107,10 @@ message ListRequest {}
 
 message ListResponse {
   repeated ModelInfo models = 1;
+  // Per-host platform hint: "mlx" on Apple Silicon (with mlx feature),
+  // "gguf" elsewhere. Clients can use this to break ties when the same
+  // base_model is available in multiple formats.
+  string prefer_format = 2;
 }
 
 message ModelInfo {
@@ -121,6 +125,15 @@ message ModelInfo {
   string description = 9;
   string architecture = 10;
   uint32 context_length = 11;
+  // On-disk format: "gguf" or "mlx".
+  string format = 12;
+  // Stable cross-format identifier (e.g. "llama-3.1-8b-instruct").
+  // Same base_model in different formats refers to the same logical model.
+  string base_model = 13;
+  // Human-readable display string for UIs. Disambiguates GGUF quant
+  // variants from the same repo (e.g. "Qwen/...-GGUF (q4_k_m)" vs
+  // "Qwen/...-GGUF (fp16)") so picker labels don't collide.
+  string display_name = 14;
 }
 
 message LoadRequest {

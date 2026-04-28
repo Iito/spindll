@@ -314,7 +314,7 @@ async fn pull(
     let store = state.store.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        store.pull(&req.model, req.quantization.as_deref())
+        store.pull(&req.model, req.quantization.as_deref(), crate::model_store::FormatPreference::Auto)
     })
     .await;
 
