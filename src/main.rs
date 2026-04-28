@@ -219,6 +219,7 @@ fn bench_by_format(
     let load_params = spindll::backend::BackendLoadParams {
         n_ctx: ctx_size,
         n_gpu_layers: None,
+        memory_budget: 0,
     };
     let model = backend.load_model(path, load_params)?;
     let params = spindll::engine::GenerateParams {
@@ -419,6 +420,7 @@ async fn main() -> anyhow::Result<()> {
                     spindll::backend::BackendLoadParams {
                         n_ctx: 2048,
                         n_gpu_layers: None,
+                        memory_budget: 0,
                     },
                 )?;
                 backend_model.generate(&prompt, &params, &mut |token| {
