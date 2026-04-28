@@ -60,7 +60,8 @@ pub struct ModelManager {
 
 impl ModelManager {
     /// Create a new manager. Pass `gpu_layers = None` to auto-detect (all layers on macOS Metal,
-    /// CPU-only elsewhere). Set `memory_budget` to 0 for unlimited.
+    /// CPU-only elsewhere). Pass `memory_budget = 0` to use total physical RAM as the cap
+    /// (recommended on Apple Silicon's unified memory).
     pub fn new(n_ctx: u32, gpu_layers: Option<u32>, memory_budget: u64) -> anyhow::Result<Self> {
         #[allow(unused_mut)]
         let mut backends: Vec<Box<dyn InferenceBackend>> = vec![
@@ -81,6 +82,12 @@ impl ModelManager {
                 0
             }
         });
+
+        let memory_budget = if memory_budget == 0 {
+            sysinfo::System::new_all().total_memory()
+        } else {
+            memory_budget
+        };
 
         Ok(Self {
             backends,
@@ -120,8 +127,9 @@ impl ModelManager {
     /// Effective budget for the next load: the configured cap, lowered to
     /// what the system can actually provide right now. We use `available_ram`
     /// (free + inactive + purgeable on macOS) — KV/n_ctx headroom is handled
-    /// per-backend, and the `--budget 0` (total RAM) opt-in must not be
-    /// silently downgraded.
+    /// per-backend (`LlamaCppBackend::resolve_n_ctx` reads it from
+    /// `BackendLoadParams.memory_budget`), and the `--budget 0` (total RAM)
+    /// opt-in must not be silently downgraded.
     fn effective_budget(&self) -> u64 {
         if self.memory_budget == 0 {
             return 0; // unlimited
@@ -231,6 +239,8 @@ impl ModelManager {
 
         // Snapshot live availability BEFORE the load so the backend can
         // budget-resolve n_ctx against memory not yet consumed by weights.
+        // Once weights are mmap'd / uploaded to Metal, available memory drops,
+        // so the snapshot has to happen here, not inside the backend.
         let available_before =
             crate::scheduler::budget::MemoryBudget::detect(None).available_ram;
         let load_budget = if self.memory_budget > 0 {
@@ -260,6 +270,8 @@ impl ModelManager {
         let size_bytes = model.size_bytes();
 
         // Batch scheduling: GGUF-only, gated on supports_batching().
+        // n_ctx, device, and size are logged from inside `LlamaCppBackend::load_model`
+        // (which has direct access to `LlamaModel::n_layer` and the GPU detection).
         let batch_tx = if self.batch_slots > 0 && model.supports_batching() {
             let (tx, rx) = std::sync::mpsc::channel::<BatchRequest>();
             let max_seq = self.batch_slots;
@@ -391,6 +403,13 @@ impl ModelManager {
         encryption_key: Option<&[u8; 32]>,
         mut on_token: impl FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
+        tracing::info!(
+            model = model_name,
+            prompt_chars = prompt.len(),
+            max_tokens = params.max_tokens,
+            "generate request received"
+        );
+
         let batch_tx = {
             let models = self.models.read().unwrap();
             models.get(model_name).and_then(|m| {
@@ -409,6 +428,12 @@ impl ModelManager {
         let elapsed_us = start.elapsed().as_micros() as u64;
         match &result {
             Ok(stats) => {
+                tracing::info!(
+                    prompt_tokens = stats.prompt_tokens,
+                    completion_tokens = stats.completion_tokens,
+                    elapsed_ms = elapsed_us / 1000,
+                    "generation complete"
+                );
                 if params.prefill_only {
                     self.metrics
                         .record_prefill(stats.prompt_tokens as u64, elapsed_us, stats.cache_hit);
@@ -421,7 +446,10 @@ impl ModelManager {
                     );
                 }
             }
-            Err(_) => self.metrics.record_error(),
+            Err(e) => {
+                tracing::error!(error = %e, elapsed_ms = elapsed_us / 1000, "generation failed");
+                self.metrics.record_error();
+            }
         }
         result
     }
@@ -503,8 +531,11 @@ impl ModelManager {
         // KV cache path: GGUF models with cache enabled get the cached generate path.
         if let Some(cache) = &self.kv_cache {
             if let Some(llama) = loaded.model.as_any().downcast_ref::<LlamaCppModel>() {
-                let ctx_params =
-                    LlamaContextParams::default().with_n_ctx(NonZeroU32::new(loaded.n_ctx));
+                // n_batch == n_ctx so prefill batches always fit. Default n_batch=512
+                // hits GGML_ASSERT and crashes on prompts longer than 512 tokens.
+                let ctx_params = LlamaContextParams::default()
+                    .with_n_ctx(NonZeroU32::new(loaded.n_ctx))
+                    .with_n_batch(loaded.n_ctx);
                 let mut ctx = llama
                     .llama_model()
                     .new_context(llama.llama_backend(), ctx_params)
@@ -547,3 +578,4 @@ impl ModelManager {
 fn kv_bytes_for(model: &LlamaModel, n_ctx: u32) -> u64 {
     crate::backend::llamacpp::kv_bytes_per_token(model) * n_ctx as u64
 }
+

@@ -331,10 +331,12 @@ async fn main() -> anyhow::Result<()> {
             http_port,
         } => {
             let mem = spindll::scheduler::budget::MemoryBudget::detect(budget.as_deref());
+            const GB: f64 = 1_073_741_824.0;
             println!(
-                "memory budget: {:.1} GB / {:.1} GB available",
-                mem.budget as f64 / 1_073_741_824.0,
-                mem.available_ram as f64 / 1_073_741_824.0
+                "memory budget: {:.1} GB cap (system: {:.1} GB total, {:.1} GB free)",
+                mem.budget as f64 / GB,
+                mem.total_ram as f64 / GB,
+                mem.available_ram as f64 / GB,
             );
             let mut manager =
                 spindll::engine::ModelManager::new(ctx_size, gpu_layers, mem.budget)?;
