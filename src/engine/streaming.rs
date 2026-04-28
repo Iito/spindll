@@ -35,6 +35,36 @@ impl Default for GenerateParams {
     }
 }
 
+/// Truncate `tokens` to fit `n_ctx`, reserving `reserve_completion` tokens for
+/// generation. Mirrors ollama's behavior: keeps the first `keep` tokens (BOS +
+/// system prompt) and the most recent tail.
+///
+/// Returns `(truncated_tokens, was_truncated)`.
+pub(crate) fn truncate_to_fit(
+    tokens: Vec<llama_cpp_2::token::LlamaToken>,
+    n_ctx: u32,
+    reserve_completion: u32,
+    keep: usize,
+) -> (Vec<llama_cpp_2::token::LlamaToken>, bool) {
+    // Reserve space for generation. Clamp into [256, n_ctx/4] so an unset
+    // max_tokens (=0) still leaves room to generate, and an absurdly large
+    // max_tokens doesn't wipe the prompt entirely.
+    let reserve = reserve_completion
+        .max(256)
+        .min(n_ctx / 4)
+        .max(64);
+    let limit = n_ctx.saturating_sub(reserve).max(1) as usize;
+    if tokens.len() <= limit {
+        return (tokens, false);
+    }
+    let keep = keep.min(limit / 4);
+    let tail = limit - keep;
+    let mut out = Vec::with_capacity(limit);
+    out.extend_from_slice(&tokens[..keep]);
+    out.extend_from_slice(&tokens[tokens.len() - tail..]);
+    (out, true)
+}
+
 /// Statistics returned after a generation request completes.
 pub struct GenerateResult {
     /// Number of tokens in the encoded prompt.
@@ -59,7 +89,18 @@ pub fn generate_streaming(
         anyhow::bail!("prompt produced no tokens");
     }
 
-    let mut batch = LlamaBatch::new(512, 1);
+    let n_ctx = ctx.n_ctx();
+    let original_tokens = tokens.len();
+    let (tokens, truncated) = truncate_to_fit(tokens, n_ctx, params.max_tokens, 5);
+    tracing::info!(
+        original_tokens,
+        kept = tokens.len(),
+        n_ctx,
+        truncated,
+        "tokenized prompt"
+    );
+
+    let mut batch = LlamaBatch::new(tokens.len().max(512), 1);
     let last_idx = tokens.len() as i32 - 1;
     for (i, token) in (0_i32..).zip(tokens.iter()) {
         batch.add(*token, i, &[0], i == last_idx)?;
@@ -140,9 +181,15 @@ pub fn generate_streaming_cached(
         anyhow::bail!("prompt produced no tokens");
     }
 
+    let n_ctx_u32 = ctx.n_ctx();
+    let (tokens, truncated) = truncate_to_fit(tokens, n_ctx_u32, params.max_tokens, 5);
+    if truncated {
+        tracing::warn!(limit = n_ctx_u32, kept = tokens.len(), "truncating input prompt");
+    }
+
     let prompt_token_count = tokens.len() as u32;
     tracing::Span::current().record("prompt_tokens", prompt_token_count);
-    let n_ctx = ctx.n_ctx() as usize;
+    let n_ctx = n_ctx_u32 as usize;
     let cache_hit;
 
     // Try loading cached KV state
@@ -270,7 +317,7 @@ fn encode_prompt(
     ctx: &mut LlamaContext,
     tokens: &[llama_cpp_2::token::LlamaToken],
 ) -> anyhow::Result<()> {
-    let mut batch = LlamaBatch::new(512, 1);
+    let mut batch = LlamaBatch::new(tokens.len().max(512), 1);
     let last_idx = tokens.len() as i32 - 1;
     for (i, token) in (0_i32..).zip(tokens.iter()) {
         batch.add(*token, i, &[0], i == last_idx)?;

@@ -37,6 +37,7 @@ impl Engine {
     /// Load a model, auto-detecting GPU. Pass n_gpu_layers=None to offload all layers.
     #[tracing::instrument(skip(path), fields(n_ctx, gpu_layers))]
     pub fn load(path: &Path, n_gpu_layers: Option<u32>, n_ctx: u32) -> anyhow::Result<Self> {
+        suppress_llama_log();
         let backend = LlamaBackend::init()?;
 
         let gpu_layers = n_gpu_layers.unwrap_or_else(|| {
@@ -93,7 +94,8 @@ impl Engine {
         &self,
     ) -> anyhow::Result<llama_cpp_2::context::LlamaContext<'_>> {
         let params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(self.n_ctx));
+            .with_n_ctx(NonZeroU32::new(self.n_ctx))
+            .with_n_batch(self.n_ctx);
         self.model
             .new_context(&self.backend, params)
             .map_err(|e| anyhow::anyhow!("failed to create context: {e}"))
@@ -166,4 +168,34 @@ fn apply_chat_template_with_fallback(
     model
         .apply_chat_template(&tmpl, &chat_messages, true)
         .map_err(|e| anyhow::anyhow!("failed to apply chat template: {e}"))
+}
+
+/// Suppress llama.cpp's built-in stderr logging.
+pub(crate) fn suppress_llama_log() {
+    unsafe {
+        llama_cpp_sys_2::llama_log_set(Some(noop_llama_log), std::ptr::null_mut());
+    }
+}
+
+unsafe extern "C" fn noop_llama_log(
+    level: llama_cpp_sys_2::ggml_log_level,
+    text: *const std::ffi::c_char,
+    _user_data: *mut std::ffi::c_void,
+) {
+    // Forward only WARN (3) and ERROR (2) — drop INFO/DEBUG noise.
+    if level > 3 || text.is_null() {
+        return;
+    }
+    let msg = unsafe { std::ffi::CStr::from_ptr(text) }
+        .to_string_lossy()
+        .trim_end()
+        .to_string();
+    if msg.is_empty() {
+        return;
+    }
+    if level == 2 {
+        tracing::error!(target: "llama_cpp", "{msg}");
+    } else {
+        tracing::warn!(target: "llama_cpp", "{msg}");
+    }
 }
