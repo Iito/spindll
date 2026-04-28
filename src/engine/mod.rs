@@ -140,7 +140,7 @@ impl Engine {
 }
 
 /// Apply a model's chat template, falling back to ChatML if none is embedded.
-fn apply_chat_template_with_fallback(
+pub(crate) fn apply_chat_template_with_fallback(
     model: &LlamaModel,
     messages: &[(String, String)],
 ) -> anyhow::Result<String> {
