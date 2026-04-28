@@ -2,6 +2,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+pub const CURRENT_VERSION: u32 = 1;
+
+/// Format of the model files on disk.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelFormat {
+    #[default]
+    Gguf,
+    Mlx,
+}
+
 /// Metadata for a single model file tracked in the registry.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ModelEntry {
@@ -33,6 +44,12 @@ pub struct ModelEntry {
     /// Whether GGUF metadata has been read for this entry.
     #[serde(default)]
     pub metadata_read: bool,
+    /// On-disk format: GGUF (single file) or MLX (safetensors directory).
+    #[serde(default)]
+    pub format: ModelFormat,
+    /// Canonical base model identity (e.g. "Meta-Llama-3.1-8B-Instruct").
+    #[serde(default)]
+    pub base_model: String,
 }
 
 /// Read GGUF metadata from a file without loading tensor weights.
@@ -80,20 +97,39 @@ pub fn read_gguf_metadata(path: &Path) -> (String, String, String, u32) {
 /// Keys follow the format `"ollama/<name>/<tag>.gguf"` or `"<org>/<repo>/<file>.gguf"`.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Registry {
+    #[serde(default)]
+    pub version: u32,
     /// Map from registry key to model metadata.
     pub models: HashMap<String, ModelEntry>,
 }
 
 impl Registry {
     /// Load the registry from a JSON file, or return an empty registry if the file doesn't exist.
+    ///
+    /// Automatically migrates older registry versions and warns if the file
+    /// was written by a newer spindll.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        if path.exists() {
+        let mut reg: Self = if path.exists() {
             let data = std::fs::read_to_string(path)?;
-            let reg = serde_json::from_str(&data)?;
-            Ok(reg)
+            serde_json::from_str(&data)?
         } else {
-            Ok(Self::default())
+            return Ok(Self { version: CURRENT_VERSION, ..Self::default() });
+        };
+
+        if reg.version > CURRENT_VERSION {
+            tracing::warn!(
+                file_version = reg.version,
+                binary_version = CURRENT_VERSION,
+                "registry was written by a newer spindll — proceeding read-only"
+            );
+            return Ok(reg);
         }
+
+        if reg.migrate() {
+            reg.save(path)?;
+        }
+
+        Ok(reg)
     }
 
     /// Persist the registry to a JSON file.
@@ -101,6 +137,19 @@ impl Registry {
         let data = serde_json::to_string_pretty(self)?;
         std::fs::write(path, data)?;
         Ok(())
+    }
+
+    /// Run all pending migrations and return true if anything changed.
+    pub fn migrate(&mut self) -> bool {
+        let mut changed = false;
+
+        if self.version < 1 {
+            self.backfill_metadata();
+            self.version = 1;
+            changed = true;
+        }
+
+        changed
     }
 
     /// Insert or replace a model entry under the given key.
@@ -113,7 +162,7 @@ impl Registry {
     pub fn backfill_metadata(&mut self) -> bool {
         let mut changed = false;
         for entry in self.models.values_mut() {
-            if !entry.metadata_read && entry.path.exists() {
+            if !entry.metadata_read && entry.path.exists() && entry.format == ModelFormat::Gguf {
                 let (name, desc, arch, ctx_len) = read_gguf_metadata(&entry.path);
                 entry.model_name = name;
                 entry.description = desc;
@@ -129,5 +178,79 @@ impl Registry {
     /// Remove a model entry by key, returning it if it existed.
     pub fn remove(&mut self, key: &str) -> Option<ModelEntry> {
         self.models.remove(key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_v0_migrates_to_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        // v0: no version field
+        std::fs::write(&path, r#"{"models":{}}"#).unwrap();
+
+        let reg = Registry::load(&path).unwrap();
+        assert_eq!(reg.version, CURRENT_VERSION);
+
+        // Re-read: should already be current, no migration
+        let reg2 = Registry::load(&path).unwrap();
+        assert_eq!(reg2.version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn load_current_version_no_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        let reg = Registry { version: CURRENT_VERSION, ..Default::default() };
+        reg.save(&path).unwrap();
+
+        let data_before = std::fs::read_to_string(&path).unwrap();
+        let _ = Registry::load(&path).unwrap();
+        let data_after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(data_before, data_after);
+    }
+
+    #[test]
+    fn load_future_version_no_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        std::fs::write(&path, r#"{"version":99,"models":{}}"#).unwrap();
+
+        let reg = Registry::load(&path).unwrap();
+        assert_eq!(reg.version, 99);
+    }
+
+    #[test]
+    fn roundtrip_save_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+
+        let mut reg = Registry { version: CURRENT_VERSION, ..Default::default() };
+        reg.add("test/model.gguf".into(), ModelEntry {
+            repo: "test".into(),
+            filename: "model.gguf".into(),
+            path: PathBuf::from("/tmp/model.gguf"),
+            size_bytes: 1000,
+            downloaded_at: 12345,
+            digest: "sha256:abc".into(),
+            model_name: "Test Model".into(),
+            description: String::new(),
+            architecture: "llama".into(),
+            context_length: 4096,
+            metadata_read: true,
+            format: ModelFormat::Gguf,
+            base_model: "Test-Model-7B".into(),
+        });
+        reg.save(&path).unwrap();
+
+        let loaded = Registry::load(&path).unwrap();
+        assert_eq!(loaded.version, CURRENT_VERSION);
+        assert_eq!(loaded.models.len(), 1);
+        let entry = &loaded.models["test/model.gguf"];
+        assert_eq!(entry.base_model, "Test-Model-7B");
+        assert_eq!(entry.format, ModelFormat::Gguf);
     }
 }
