@@ -233,24 +233,50 @@ impl ModelStore {
             return Ok(());
         }
 
-        println!("{:<35} {:<5} {:>10}  {:<10}  {}", "MODEL", "FMT", "SIZE", "ARCH", "DESCRIPTION");
-        println!("{}", "-".repeat(90));
         let mut entries: Vec<_> = reg.models.iter().collect();
         entries.sort_by_key(|(k, _)| (*k).clone());
-        for (key, entry) in entries {
-            let display_name = display_name(key, entry);
-            let fmt = match entry.format {
-                registry::ModelFormat::Gguf => "gguf",
-                registry::ModelFormat::Mlx => "mlx",
-            };
-            let size = format_size(entry.size_bytes);
-            let arch = if entry.architecture.is_empty() { "-" } else { &entry.architecture };
-            let desc = if entry.description.is_empty() {
-                entry.model_name.as_str()
-            } else {
-                &entry.description
-            };
-            println!("{:<35} {:<5} {:>10}  {:<10}  {}", display_name, fmt, size, arch, desc);
+
+        // Pre-compute rows so we can size MODEL and ARCH columns to the
+        // longest entry. mlx-community paths blow past 35 chars; static
+        // widths either truncated or wasted space.
+        let rows: Vec<_> = entries
+            .iter()
+            .map(|(key, entry)| {
+                let display = display_name(key, entry);
+                let fmt = match entry.format {
+                    registry::ModelFormat::Gguf => "gguf",
+                    registry::ModelFormat::Mlx => "mlx",
+                };
+                let size = format_size(entry.size_bytes);
+                let arch = if entry.architecture.is_empty() {
+                    "-".to_string()
+                } else {
+                    entry.architecture.clone()
+                };
+                let desc = if entry.description.is_empty() {
+                    entry.model_name.clone()
+                } else {
+                    entry.description.clone()
+                };
+                (display, fmt, size, arch, desc)
+            })
+            .collect();
+
+        const PADDING: usize = 2;
+        let model_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max("MODEL".len()) + PADDING;
+        let arch_w  = rows.iter().map(|r| r.3.len()).max().unwrap_or(0).max("ARCH".len()) + PADDING;
+
+        println!(
+            "{:<model_w$} {:<5} {:>10}  {:<arch_w$}  {}",
+            "MODEL", "FMT", "SIZE", "ARCH", "DESCRIPTION"
+        );
+        let total_w = model_w + 1 + 5 + 1 + 10 + 2 + arch_w + 2 + "DESCRIPTION".len();
+        println!("{}", "-".repeat(total_w));
+        for (model, fmt, size, arch, desc) in rows {
+            println!(
+                "{:<model_w$} {:<5} {:>10}  {:<arch_w$}  {}",
+                model, fmt, size, arch, desc
+            );
         }
         Ok(())
     }
