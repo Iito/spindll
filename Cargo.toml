@@ -29,6 +29,9 @@ http = [
 cuda   = ["llama-cpp-2/cuda"]
 metal  = ["llama-cpp-2/metal"]
 vulkan = ["llama-cpp-2/vulkan"]
+# MLX Swift bridge — Apple Silicon only, compiles mlx_bridge Swift package.
+# Usage: cargo build --features mlx   (aarch64-apple-darwin only)
+mlx    = []
 
 [dependencies]
 # Core — always compiled
@@ -36,7 +39,8 @@ tokio        = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tonic        = "0.13"
 prost        = "0.13"
-llama-cpp-2  = "0.1"
+llama-cpp-2      = "0.1"
+llama-cpp-sys-2  = "0.1"
 encoding_rs  = "0.8"
 sha2         = "0.10"
 chacha20poly1305 = "0.10"
@@ -49,6 +53,7 @@ thiserror    = "2"
 anyhow       = "1"
 tracing      = "0.1"
 sysinfo      = "0.35"
+libc         = "0.2"
 urlencoding  = "2"
 
 # http server (optional)
