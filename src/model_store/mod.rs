@@ -208,7 +208,7 @@ impl ModelStore {
         let mut entries: Vec<_> = reg.models.iter().collect();
         entries.sort_by_key(|(k, _)| (*k).clone());
         for (key, entry) in entries {
-            let display_name = format_model_name(key);
+            let display_name = display_name(key, entry);
             let fmt = match entry.format {
                 registry::ModelFormat::Gguf => "gguf",
                 registry::ModelFormat::Mlx => "mlx",
@@ -431,18 +431,34 @@ fn derive_base_model(gguf_name: &str, model: &str) -> String {
     model.to_string()
 }
 
-fn format_model_name(key: &str) -> String {
-    let parts: Vec<&str> = key.splitn(3, '/').collect();
-    match parts.as_slice() {
-        [provider, name, file] if *provider == "ollama" => {
-            let tag = file.strip_suffix(".gguf").unwrap_or(file);
-            format!("{name}:{tag}")
+/// Human-readable display name for a registry entry.
+///
+/// Disambiguates by quant when the same repo holds multiple GGUF variants:
+/// `Qwen/Qwen2.5-3B-Instruct-GGUF` becomes `Qwen/Qwen2.5-3B-Instruct-GGUF (q4_k_m)`.
+/// Ollama entries keep their `name:tag` form (already disambiguated by tag).
+/// MLX entries return `repo` as-is — mlx-community names already encode
+/// quant in the repo string (`...-4bit`).
+pub fn display_name(key: &str, entry: &registry::ModelEntry) -> String {
+    match entry.format {
+        registry::ModelFormat::Mlx => {
+            if entry.repo.is_empty() { key.to_string() } else { entry.repo.clone() }
         }
-        [org, repo, file] => {
-            let tag = file.strip_suffix(".gguf").unwrap_or(file);
-            format!("{org}/{repo}:{tag}")
+        registry::ModelFormat::Gguf => {
+            // Ollama: registry key is `ollama/<name>/<tag>.gguf` → `<name>:<tag>`.
+            let parts: Vec<&str> = key.splitn(3, '/').collect();
+            if let [provider, name, file] = parts.as_slice() {
+                if *provider == "ollama" {
+                    let tag = file.strip_suffix(".gguf").unwrap_or(file);
+                    return format!("{name}:{tag}");
+                }
+            }
+            // HF: `<repo> (<quant>)` when we can detect the quant, else just repo.
+            let base = if entry.repo.is_empty() { key } else { entry.repo.as_str() };
+            match download::extract_quant(&entry.filename) {
+                Some(q) => format!("{base} ({q})"),
+                None => base.to_string(),
+            }
         }
-        _ => key.to_string(),
     }
 }
 

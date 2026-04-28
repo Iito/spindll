@@ -252,6 +252,7 @@ impl Spindll for SpindllService {
                     context_length: entry.context_length,
                     format: format.to_string(),
                     base_model: entry.base_model.clone(),
+                    display_name: crate::model_store::display_name(key, entry),
                 }
             })
             .collect();

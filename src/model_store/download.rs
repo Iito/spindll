@@ -7,12 +7,30 @@ use std::path::{Path, PathBuf};
 /// preferred. q4_k_m is the de-facto local-inference standard; fp16/bf16/f32
 /// are research-precision and 3–4× the size, so they're deprioritized.
 /// Override with `--quant` to pick a specific variant.
-const QUANT_PRIORITY: &[&str] = &[
+pub(crate) const QUANT_PRIORITY: &[&str] = &[
     "q4_k_m", "q5_k_m", "q4_k_s", "q5_k_s",
     "q4_0", "q5_0",
     "q3_k_m", "q3_k_s",
     "q8_0", "q2_k",
 ];
+
+/// Full-precision tags used as fallback quant labels when no quantized
+/// variant string appears in the filename.
+const FULL_PRECISION: &[&str] = &["fp16", "bf16", "f32"];
+
+/// Extract a quant tag from a GGUF filename, e.g.
+///   "qwen2.5-3b-instruct-q4_k_m.gguf" -> Some("q4_k_m")
+///   "qwen2.5-3b-instruct-fp16-00001-of-00002.gguf" -> Some("fp16")
+///   "model.gguf" -> None
+pub(crate) fn extract_quant(filename: &str) -> Option<&'static str> {
+    let lower = filename.to_lowercase();
+    for q in QUANT_PRIORITY.iter().chain(FULL_PRECISION.iter()) {
+        if lower.contains(q) {
+            return Some(q);
+        }
+    }
+    None
+}
 
 /// Lower rank = more preferred. Files that don't match any known quant
 /// fall between the priority list and full-precision; fp16/bf16/f32 sort
@@ -257,5 +275,29 @@ mod tests {
         let files = ["model-fp16-2.gguf", "model-fp16-1.gguf"];
         let picked = files.iter().min_by_key(|f| rank_quant(f)).unwrap();
         assert_eq!(*picked, "model-fp16-2.gguf");
+    }
+
+    #[test]
+    fn extract_quant_finds_q4_k_m() {
+        assert_eq!(extract_quant("qwen2.5-3b-instruct-q4_k_m.gguf"), Some("q4_k_m"));
+    }
+
+    #[test]
+    fn extract_quant_finds_fp16_in_sharded_name() {
+        assert_eq!(
+            extract_quant("qwen2.5-3b-instruct-fp16-00001-of-00002.gguf"),
+            Some("fp16")
+        );
+    }
+
+    #[test]
+    fn extract_quant_case_insensitive() {
+        assert_eq!(extract_quant("Model-Q4_K_M.gguf"), Some("q4_k_m"));
+        assert_eq!(extract_quant("Model-FP16.gguf"), Some("fp16"));
+    }
+
+    #[test]
+    fn extract_quant_returns_none_when_no_match() {
+        assert_eq!(extract_quant("model.gguf"), None);
     }
 }
