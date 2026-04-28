@@ -4,6 +4,56 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
+// Quant selection
+// ---------------------------------------------------------------------------
+
+/// Quant preference order for default GGUF selection. Lower index = more
+/// preferred. q4_k_m is the de-facto local-inference standard; fp16/bf16/f32
+/// are research-precision and 3–4× the size, so they're deprioritized.
+/// Override with `--quant` to pick a specific variant.
+pub(crate) const QUANT_PRIORITY: &[&str] = &[
+    "q4_k_m", "q5_k_m", "q4_k_s", "q5_k_s",
+    "q4_0", "q5_0",
+    "q3_k_m", "q3_k_s",
+    "q8_0", "q2_k",
+];
+
+/// Full-precision tags used as fallback quant labels when no quantized
+/// variant string appears in the filename.
+const FULL_PRECISION: &[&str] = &["fp16", "bf16", "f32"];
+
+/// Extract a quant tag from a GGUF filename, e.g.
+///   "qwen2.5-3b-instruct-q4_k_m.gguf" -> Some("q4_k_m")
+///   "qwen2.5-3b-instruct-fp16-00001-of-00002.gguf" -> Some("fp16")
+///   "model.gguf" -> None
+pub(crate) fn extract_quant(filename: &str) -> Option<&'static str> {
+    let lower = filename.to_lowercase();
+    for q in QUANT_PRIORITY.iter().chain(FULL_PRECISION.iter()) {
+        if lower.contains(q) {
+            return Some(q);
+        }
+    }
+    None
+}
+
+/// Lower rank = more preferred. Files that don't match any known quant
+/// fall between the priority list and full-precision; fp16/bf16/f32 sort
+/// last so we don't accidentally pull a 6 GB research weight when a 2 GB
+/// inference quant exists alongside it.
+fn rank_quant(filename: &str) -> usize {
+    let lower = filename.to_lowercase();
+    for (i, q) in QUANT_PRIORITY.iter().enumerate() {
+        if lower.contains(q) {
+            return i;
+        }
+    }
+    if lower.contains("fp16") || lower.contains("bf16") || lower.contains("f32") {
+        return usize::MAX;
+    }
+    QUANT_PRIORITY.len()
+}
+
+// ---------------------------------------------------------------------------
 // Combined HF downloader (auto-detects GGUF vs MLX from repo contents)
 // ---------------------------------------------------------------------------
 
@@ -57,11 +107,17 @@ pub fn download_hf_auto(
                 .find(|s| s.rfilename.contains(q))
                 .ok_or_else(|| anyhow::anyhow!("no file matching '{q}' in {repo_id}"))?
         } else {
-            // Prefer Q4_K_M as a sensible default; fall back to first entry.
-            gguf_files
+            // No quant specified — pick the lowest-ranked variant. Stable: ties
+            // resolve in API order via min_by_key's first-wins semantics.
+            let picked = gguf_files
                 .iter()
-                .find(|s| s.rfilename.contains("Q4_K_M"))
-                .unwrap_or(&gguf_files[0])
+                .min_by_key(|s| rank_quant(&s.rfilename))
+                .expect("non-empty checked above");
+            tracing::info!(
+                file = %picked.rfilename,
+                "no --quant specified, picked default by quant priority (q4_k_m > q5_k_m > q4_0 > … > fp16); pass --quant to override"
+            );
+            picked
         };
 
         tracing::info!(file = %target.rfilename, "downloading GGUF");
@@ -191,7 +247,17 @@ pub fn download_gguf(repo_id: &str, quant: Option<&str>, dest_dir: &Path) -> any
             .find(|s| s.rfilename.contains(q))
             .ok_or_else(|| anyhow::anyhow!("no file matching quantization '{q}' in {repo_id}"))?
     } else {
-        &gguf_files[0]
+        // No quant specified — pick the lowest-ranked variant. Stable: ties
+        // resolve in API order via min_by_key's first-wins semantics.
+        let picked = gguf_files
+            .iter()
+            .min_by_key(|s| rank_quant(&s.rfilename))
+            .expect("non-empty checked above");
+        tracing::info!(
+            file = %picked.rfilename,
+            "no --quant specified, picked default by quant priority (q4_k_m > q5_k_m > q4_0 > … > fp16); pass --quant to override"
+        );
+        picked
     };
 
     tracing::info!(file = %target.rfilename, "downloading");
@@ -252,4 +318,77 @@ pub fn validate_gguf(path: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn q4_k_m_beats_fp16_and_q8() {
+        let files = [
+            "qwen2.5-3b-instruct-fp16-00001-of-00002.gguf",
+            "qwen2.5-3b-instruct-q4_k_m.gguf",
+            "qwen2.5-3b-instruct-q8_0.gguf",
+        ];
+        let picked = files.iter().min_by_key(|f| rank_quant(f)).unwrap();
+        assert_eq!(*picked, "qwen2.5-3b-instruct-q4_k_m.gguf");
+    }
+
+    #[test]
+    fn q5_k_m_beats_q8_when_no_q4() {
+        let files = [
+            "model-q8_0.gguf",
+            "model-q5_k_m.gguf",
+            "model-fp16.gguf",
+        ];
+        let picked = files.iter().min_by_key(|f| rank_quant(f)).unwrap();
+        assert_eq!(*picked, "model-q5_k_m.gguf");
+    }
+
+    #[test]
+    fn unknown_quant_beats_fp16() {
+        let files = ["model-iq4_xs.gguf", "model-fp16.gguf"];
+        let picked = files.iter().min_by_key(|f| rank_quant(f)).unwrap();
+        assert_eq!(*picked, "model-iq4_xs.gguf");
+    }
+
+    #[test]
+    fn case_insensitive() {
+        assert_eq!(rank_quant("Model-Q4_K_M.gguf"), 0);
+        assert_eq!(rank_quant("Model-FP16.gguf"), usize::MAX);
+    }
+
+    #[test]
+    fn fp16_only_repo_picks_first() {
+        // Pathological case: only fp16 variants available. Ties go to API
+        // order — caller still gets *something*.
+        let files = ["model-fp16-2.gguf", "model-fp16-1.gguf"];
+        let picked = files.iter().min_by_key(|f| rank_quant(f)).unwrap();
+        assert_eq!(*picked, "model-fp16-2.gguf");
+    }
+
+    #[test]
+    fn extract_quant_finds_q4_k_m() {
+        assert_eq!(extract_quant("qwen2.5-3b-instruct-q4_k_m.gguf"), Some("q4_k_m"));
+    }
+
+    #[test]
+    fn extract_quant_finds_fp16_in_sharded_name() {
+        assert_eq!(
+            extract_quant("qwen2.5-3b-instruct-fp16-00001-of-00002.gguf"),
+            Some("fp16")
+        );
+    }
+
+    #[test]
+    fn extract_quant_case_insensitive() {
+        assert_eq!(extract_quant("Model-Q4_K_M.gguf"), Some("q4_k_m"));
+        assert_eq!(extract_quant("Model-FP16.gguf"), Some("fp16"));
+    }
+
+    #[test]
+    fn extract_quant_returns_none_when_no_match() {
+        assert_eq!(extract_quant("model.gguf"), None);
+    }
 }

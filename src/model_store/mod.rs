@@ -1,15 +1,34 @@
-//! Model store — download, import, and resolve GGUF model files.
+//! Model store — download, import, and resolve model files.
 //!
 //! Supports pulling from HuggingFace repos and the Ollama registry, importing
 //! existing Ollama models via symlink, and resolving flexible model name formats
-//! to on-disk GGUF paths.
+//! to on-disk paths. On Apple Silicon, automatically resolves to MLX-format
+//! models when available.
 
 pub mod download;
 pub mod registry;
 pub mod import;
+pub mod mlx_resolve;
 pub mod ollama_pull;
 
 use std::path::PathBuf;
+
+/// Caller-specified format preference for `pull()`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FormatPreference {
+    /// Let the platform decide: MLX on Apple Silicon, GGUF elsewhere.
+    Auto,
+    /// Force GGUF regardless of platform.
+    Gguf,
+    /// Force MLX — error if not found.
+    Mlx,
+}
+
+impl Default for FormatPreference {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
 
 /// Local model store backed by `~/.spindll` (or a custom directory).
 ///
@@ -50,12 +69,93 @@ impl ModelStore {
         std::fs::create_dir_all(self.models_dir())
     }
 
-    /// Pull a model. Auto-detects source and format:
-    /// - Contains "/" → HuggingFace; auto-detects GGUF vs MLX from repo contents.
-    /// - Otherwise    → Ollama registry (e.g. "llama3.1:8b"), always GGUF.
-    pub fn pull(&self, model: &str, quant: Option<&str>) -> anyhow::Result<PathBuf> {
+    /// Pull a model with format-aware resolution.
+    ///
+    /// On Apple Silicon with `FormatPreference::Auto`, attempts to find an MLX-format
+    /// model on HuggingFace before falling back to GGUF. HuggingFace repos
+    /// are auto-detected as GGUF or MLX from their contents; Ollama-style
+    /// names (e.g. `"llama3.1:8b"`) always pull GGUF unless an MLX
+    /// equivalent is resolvable.
+    pub fn pull(
+        &self,
+        model: &str,
+        quant: Option<&str>,
+        format_pref: FormatPreference,
+    ) -> anyhow::Result<PathBuf> {
         self.ensure_dirs()?;
 
+        let want_mlx = match format_pref {
+            FormatPreference::Mlx => true,
+            FormatPreference::Gguf => false,
+            FormatPreference::Auto => platform_prefers_mlx(),
+        };
+
+        // If we want MLX, try to resolve an MLX repo before downloading GGUF.
+        if want_mlx {
+            let mlx_quant = quant.unwrap_or("4bit");
+            match self.try_pull_mlx(model, mlx_quant) {
+                Ok(path) => return Ok(path),
+                Err(e) => {
+                    if format_pref == FormatPreference::Mlx {
+                        return Err(e.context("no MLX model found and --mlx was specified"));
+                    }
+                    tracing::info!("no MLX version found, falling back to GGUF: {e:#}");
+                }
+            }
+        }
+
+        self.pull_gguf(model, quant)
+    }
+
+    /// Resolve an MLX equivalent for `model` and download it. Errors if no
+    /// matching `mlx-community/...` repo is found on HuggingFace.
+    fn try_pull_mlx(&self, model: &str, mlx_quant: &str) -> anyhow::Result<PathBuf> {
+        let candidate = mlx_resolve::find_mlx_repo(model, mlx_quant)?
+            .ok_or_else(|| anyhow::anyhow!("no MLX equivalent found for '{model}'"))?;
+
+        tracing::info!(repo = %candidate.repo_id, "resolved MLX model");
+
+        let dest_dir = self.model_dir(&candidate.repo_id);
+        let (path, size_bytes, digest) = match download::download_hf_auto(&candidate.repo_id, None, &dest_dir)? {
+            download::HfDownload::Mlx { dir, size, digest } => (dir, size, digest),
+            download::HfDownload::Gguf { .. } => {
+                anyhow::bail!(
+                    "resolved repo '{}' contains GGUF, not MLX safetensors",
+                    candidate.repo_id
+                );
+            }
+        };
+
+        let (architecture, model_name) = download::read_mlx_metadata(&path);
+        let base_model = derive_base_model(&model_name, model);
+        let key = candidate.repo_id.clone();
+
+        let mut reg = registry::Registry::load(&self.registry_path())?;
+        reg.add(key, registry::ModelEntry {
+            repo: candidate.repo_id,
+            filename: String::new(),
+            path: path.clone(),
+            size_bytes,
+            downloaded_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            digest,
+            model_name,
+            description: String::new(),
+            architecture,
+            context_length: 0,
+            metadata_read: true,
+            format: registry::ModelFormat::Mlx,
+            base_model,
+        });
+        reg.save(&self.registry_path())?;
+
+        Ok(path)
+    }
+
+    /// Pull a GGUF model (the original path).
+    fn pull_gguf(&self, model: &str, quant: Option<&str>) -> anyhow::Result<PathBuf> {
         let is_hf = model.contains('/');
 
         // --- Download & detect format ---
@@ -93,6 +193,7 @@ impl ModelStore {
         };
 
         // --- Register ---
+        let base_model = derive_base_model(&model_name, model);
         let filename = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -114,6 +215,7 @@ impl ModelStore {
             context_length,
             metadata_read: true,
             format,
+            base_model,
         });
         reg.save(&self.registry_path())?;
 
@@ -131,20 +233,50 @@ impl ModelStore {
             return Ok(());
         }
 
-        println!("{:<35} {:>10}  {:<10}  {}", "MODEL", "SIZE", "ARCH", "DESCRIPTION");
-        println!("{}", "-".repeat(85));
         let mut entries: Vec<_> = reg.models.iter().collect();
         entries.sort_by_key(|(k, _)| (*k).clone());
-        for (key, entry) in entries {
-            let display_name = format_model_name(key);
-            let size = format_size(entry.size_bytes);
-            let arch = if entry.architecture.is_empty() { "-" } else { &entry.architecture };
-            let desc = if entry.description.is_empty() {
-                entry.model_name.as_str()
-            } else {
-                &entry.description
-            };
-            println!("{:<35} {:>10}  {:<10}  {}", display_name, size, arch, desc);
+
+        // Pre-compute rows so we can size MODEL and ARCH columns to the
+        // longest entry. mlx-community paths blow past 35 chars; static
+        // widths either truncated or wasted space.
+        let rows: Vec<_> = entries
+            .iter()
+            .map(|(key, entry)| {
+                let display = display_name(key, entry);
+                let fmt = match entry.format {
+                    registry::ModelFormat::Gguf => "gguf",
+                    registry::ModelFormat::Mlx => "mlx",
+                };
+                let size = format_size(entry.size_bytes);
+                let arch = if entry.architecture.is_empty() {
+                    "-".to_string()
+                } else {
+                    entry.architecture.clone()
+                };
+                let desc = if entry.description.is_empty() {
+                    entry.model_name.clone()
+                } else {
+                    entry.description.clone()
+                };
+                (display, fmt, size, arch, desc)
+            })
+            .collect();
+
+        const PADDING: usize = 2;
+        let model_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max("MODEL".len()) + PADDING;
+        let arch_w  = rows.iter().map(|r| r.3.len()).max().unwrap_or(0).max("ARCH".len()) + PADDING;
+
+        println!(
+            "{:<model_w$} {:<5} {:>10}  {:<arch_w$}  {}",
+            "MODEL", "FMT", "SIZE", "ARCH", "DESCRIPTION"
+        );
+        let total_w = model_w + 1 + 5 + 1 + 10 + 2 + arch_w + 2 + "DESCRIPTION".len();
+        println!("{}", "-".repeat(total_w));
+        for (model, fmt, size, arch, desc) in rows {
+            println!(
+                "{:<model_w$} {:<5} {:>10}  {:<arch_w$}  {}",
+                model, fmt, size, arch, desc
+            );
         }
         Ok(())
     }
@@ -181,6 +313,14 @@ impl ModelStore {
         // 4. HuggingFace repo prefix
         let hf_prefix = format!("{model}/");
         if let Some(key) = reg.models.keys().find(|k| k.starts_with(&hf_prefix)) {
+            return Ok(key.clone());
+        }
+
+        // 5. Match by base_model (finds MLX entries for Ollama-style names)
+        let normalized = model.replace(':', "-").replace(' ', "-");
+        if let Some((key, _)) = reg.models.iter().find(|(_, e)| {
+            !e.base_model.is_empty() && e.base_model.eq_ignore_ascii_case(&normalized)
+        }) {
             return Ok(key.clone());
         }
 
@@ -269,6 +409,7 @@ impl ModelStore {
             let key = format!("ollama/{name}/{filename}");
             if !reg.models.contains_key(&key) {
                 let (gguf_name, gguf_desc, gguf_arch, gguf_ctx) = registry::read_gguf_metadata(&dest);
+                let base_model = derive_base_model(&gguf_name, &format!("{name}:{tag}"));
                 reg.add(
                     key.clone(),
                     registry::ModelEntry {
@@ -287,6 +428,7 @@ impl ModelStore {
                         context_length: gguf_ctx,
                         metadata_read: true,
                         format: registry::ModelFormat::Gguf,
+                        base_model,
                     },
                 );
                 println!("imported {name}:{tag} ({:.1} GB)", layer.size as f64 / 1_073_741_824.0);
@@ -320,19 +462,65 @@ impl ModelStore {
 ///
 /// - `ollama/nemotron-3-nano/4b.gguf` → `nemotron-3-nano:4b`
 /// - `TheBloke/Llama-3-8B-GGUF/model.gguf` → `TheBloke/Llama-3-8B-GGUF:model`
-fn format_model_name(key: &str) -> String {
-    let parts: Vec<&str> = key.splitn(3, '/').collect();
-    match parts.as_slice() {
-        [provider, name, file] if *provider == "ollama" => {
-            let tag = file.strip_suffix(".gguf").unwrap_or(file);
-            format!("{name}:{tag}")
-        }
-        [org, repo, file] => {
-            let tag = file.strip_suffix(".gguf").unwrap_or(file);
-            format!("{org}/{repo}:{tag}")
-        }
-        _ => key.to_string(),
+/// Derive a canonical base model name from GGUF metadata or the user-provided model string.
+///
+/// Prefers `general.name` from GGUF metadata (most reliable), falling back to
+/// cleaning up the repo/model string by stripping GGUF-specific suffixes and org prefixes.
+fn derive_base_model(gguf_name: &str, model: &str) -> String {
+    // Use GGUF general.name if available — normalize spaces to hyphens.
+    if !gguf_name.is_empty() {
+        return gguf_name.replace(' ', "-");
     }
+
+    // HuggingFace GGUF repo: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF" → "Meta-Llama-3.1-8B-Instruct"
+    if model.contains('/') {
+        let repo_part = model.rsplit('/').next().unwrap_or(model);
+        let stripped = repo_part
+            .strip_suffix("-GGUF")
+            .or_else(|| repo_part.strip_suffix("-gguf"))
+            .or_else(|| repo_part.strip_suffix("-quantized"))
+            .unwrap_or(repo_part);
+        return stripped.to_string();
+    }
+
+    // Ollama name — just return as-is for now, HF search is fuzzy enough
+    model.to_string()
+}
+
+/// Human-readable display name for a registry entry.
+///
+/// Disambiguates by quant when the same repo holds multiple GGUF variants:
+/// `Qwen/Qwen2.5-3B-Instruct-GGUF` becomes `Qwen/Qwen2.5-3B-Instruct-GGUF (q4_k_m)`.
+/// Ollama entries keep their `name:tag` form (already disambiguated by tag).
+/// MLX entries return `repo` as-is — mlx-community names already encode
+/// quant in the repo string (`...-4bit`).
+pub fn display_name(key: &str, entry: &registry::ModelEntry) -> String {
+    match entry.format {
+        registry::ModelFormat::Mlx => {
+            if entry.repo.is_empty() { key.to_string() } else { entry.repo.clone() }
+        }
+        registry::ModelFormat::Gguf => {
+            // Ollama: registry key is `ollama/<name>/<tag>.gguf` → `<name>:<tag>`.
+            let parts: Vec<&str> = key.splitn(3, '/').collect();
+            if let [provider, name, file] = parts.as_slice() {
+                if *provider == "ollama" {
+                    let tag = file.strip_suffix(".gguf").unwrap_or(file);
+                    return format!("{name}:{tag}");
+                }
+            }
+            // HF: `<repo> (<quant>)` when we can detect the quant, else just repo.
+            let base = if entry.repo.is_empty() { key } else { entry.repo.as_str() };
+            match download::extract_quant(&entry.filename) {
+                Some(q) => format!("{base} ({q})"),
+                None => base.to_string(),
+            }
+        }
+    }
+}
+
+/// Returns true if this platform should prefer MLX over GGUF.
+pub fn platform_prefers_mlx() -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
 }
 
 fn format_size(bytes: u64) -> String {

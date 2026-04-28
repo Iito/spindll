@@ -15,9 +15,17 @@ enum Commands {
         /// Model name — Ollama format (llama3.1:8b) or HuggingFace (owner/model)
         model: String,
 
-        /// Quantization filter (HuggingFace only)
+        /// Quantization filter (HuggingFace GGUF or MLX quant like "4bit")
         #[arg(long)]
         quant: Option<String>,
+
+        /// Force GGUF format (skip MLX resolution on Apple Silicon)
+        #[arg(long, conflicts_with = "mlx")]
+        gguf: bool,
+
+        /// Force MLX format (error if no MLX equivalent found)
+        #[arg(long, conflicts_with = "gguf")]
+        mlx: bool,
     },
 
     /// List local models
@@ -307,9 +315,16 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Pull { model, quant } => {
+        Commands::Pull { model, quant, gguf, mlx } => {
+            let format_pref = if gguf {
+                spindll::model_store::FormatPreference::Gguf
+            } else if mlx {
+                spindll::model_store::FormatPreference::Mlx
+            } else {
+                spindll::model_store::FormatPreference::Auto
+            };
             let store = spindll::model_store::ModelStore::new(None);
-            let path = store.pull(&model, quant.as_deref())?;
+            let path = store.pull(&model, quant.as_deref(), format_pref)?;
             println!("model ready: {}", path.display());
         }
         Commands::List => {
