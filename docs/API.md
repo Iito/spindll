@@ -20,7 +20,7 @@ curl http://localhost:8080/health
 
 ### GET /models
 
-List all models in the store with GGUF metadata and loaded state.
+List all models in the store with format, metadata, and loaded state.
 
 ```bash
 curl http://localhost:8080/models
@@ -37,18 +37,34 @@ curl http://localhost:8080/models
     "model_name": "Llama 3.1 8B Instruct",
     "description": "",
     "architecture": "llama",
-    "context_length": 8192
+    "context_length": 8192,
+    "format": "gguf",
+    "base_model": "llama-3.1-8b-instruct",
+    "display_name": "llama3.1:8b"
+  },
+  {
+    "name": "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
+    "size_bytes": 4526682492,
+    "loaded": false,
+    "architecture": "llama",
+    "context_length": 0,
+    "format": "mlx",
+    "base_model": "llama-3.1-8b-instruct",
+    "display_name": "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
   }
 ]
 ```
 
 | Field | Source |
 |-------|--------|
-| `model_name` | GGUF `general.name` metadata |
+| `model_name` | GGUF `general.name` metadata (empty for MLX) |
 | `description` | GGUF `general.description` metadata |
-| `architecture` | GGUF `general.architecture` metadata |
-| `context_length` | Trained context size from GGUF metadata (effective size capped by `--ctx-size` when loaded) |
+| `architecture` | `general.architecture` (GGUF) or `model_type` from `config.json` (MLX) |
+| `context_length` | Trained context size from GGUF metadata (effective size capped by `--ctx-size` when loaded; 0 for MLX) |
 | `loaded` | Whether the model is currently in memory |
+| `format` | `"gguf"` or `"mlx"` — pick the matching backend automatically |
+| `base_model` | Stable cross-format identifier — same value for the GGUF and MLX variants of one logical model |
+| `display_name` | Human-readable label for picker UIs; disambiguates same-repo quants (`Repo (q4_k_m)` vs `Repo (fp16)`) |
 
 ### POST /chat (SSE)
 
@@ -108,7 +124,7 @@ curl -X POST http://localhost:8080/load \
 
 ### POST /pull
 
-Download a model from Ollama registry or HuggingFace.
+Download a model from Ollama registry or HuggingFace. On Apple Silicon, attempts to resolve an MLX-format model first (e.g. `llama3.1:8b` → `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit`), falling back to GGUF.
 
 ```bash
 curl -X POST http://localhost:8080/pull \
@@ -119,6 +135,17 @@ curl -X POST http://localhost:8080/pull \
 ```json
 {"status": "ok"}
 ```
+
+**Request body:**
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `model` | string | yes | |
+| `quantization` | string | no | Picker chooses by priority: `q4_k_m > q5_k_m > q4_0 > … > fp16` |
+
+For HuggingFace repos with multiple GGUF variants, omitting `quantization` picks the lowest-ranked match (q4_k_m by default). Pass `"fp16"` (or any specific quant string) to override.
+
+The HTTP `/pull` endpoint always uses `FormatPreference::Auto` — to force GGUF or MLX explicitly, use the CLI (`spindll pull --gguf` / `--mlx`) or the gRPC `Pull` RPC with library access.
 
 ### DELETE /models/{id}
 
@@ -420,6 +447,10 @@ See [`proto/spindll.proto`](../proto/spindll.proto) for full message definitions
 
 **Load / Unload** -- explicit model lifecycle control. Load returns `already_loaded: true` for idempotent preloading.
 
+**List** -- returns local models with their `format`, `base_model`, and `display_name`, plus a per-host `prefer_format` hint at the response level (`"mlx"` on Apple Silicon, `"gguf"` elsewhere). Clients should prefer `display_name` over `name` for picker UIs and use `base_model` to group format variants of the same logical model.
+
+**Pull** -- download a model. `PullRequest.quantization` is honored when set; empty triggers the q4_k_m-first priority picker. The server handler always uses `FormatPreference::Auto` (MLX-first on Apple Silicon, GGUF fallback).
+
 **Status** -- returns loaded models, memory info (RAM/VRAM), device list, and engine metrics (cache hit rate, tokens/second, request counts).
 
 ---
@@ -435,22 +466,28 @@ spindll = { git = "https://github.com/Iito/spindll.git" }
 
 ### ModelManager
 
-The primary entry point for multi-model inference:
+The primary entry point for multi-model inference. Routes loads to the matching `InferenceBackend` by `ModelFormat` (GGUF → llama.cpp, MLX → mlx-swift-lm on Apple Silicon).
 
 ```rust
 use spindll::engine::{ModelManager, GenerateParams};
 use spindll::model_store::ModelStore;
 
-// Create a manager with 4096 context, auto GPU, 8GB budget
-let mut manager = ModelManager::new(4096, None, 8_000_000_000)?;
+// Create a manager with 4096 context, auto GPU, dynamic memory tracking.
+// memory_budget = 0 → live-tracking auto-mode: every load and eviction
+// re-snapshots free RAM, so spindll never exceeds what the system can give.
+// Pass an explicit number (e.g. 8_000_000_000) for a hard cap, or u64::MAX
+// for "no eviction".
+let mut manager = ModelManager::new(4096, None, 0)?;
 
 // Enable KV cache (2GB)
 manager.enable_kv_cache(2_000_000_000);
 
-// Enable continuous batching (8 concurrent sequences per model)
+// Enable continuous batching (8 concurrent sequences per GGUF model;
+// MLX models are gated out via supports_batching()).
 manager.set_batch_slots(8);
 
-// Load a model
+// Load a model — the manager picks the backend automatically based on
+// the format detected from the path (file → GGUF, directory → MLX).
 let store = ModelStore::new(None);
 let path = store.resolve_model_path("llama3.1:8b")?;
 let digest = store.resolve_model_digest("llama3.1:8b").unwrap_or_default();
@@ -461,6 +498,41 @@ manager.generate("llama3.1:8b", "Hello!", &GenerateParams::default(), None, |tok
     print!("{token}");
     true // return false to stop early
 })?;
+```
+
+#### Backend traits (advanced)
+
+For direct backend access, implement `InferenceBackend` and add it to a custom `ModelManager`. The trait is:
+
+```rust
+use spindll::backend::{InferenceBackend, BackendModel, BackendLoadParams};
+
+pub trait InferenceBackend: Send + Sync {
+    fn load_model(&self, path: &Path, params: BackendLoadParams)
+        -> anyhow::Result<Box<dyn BackendModel>>;
+    fn name(&self) -> &str;
+}
+```
+
+`BackendLoadParams` carries:
+- `n_ctx: u32` — requested context size; `0` means auto-resolve to the largest n_ctx that fits weights + KV + compute buffers within `memory_budget`.
+- `n_gpu_layers: Option<u32>` — `None` to auto-detect.
+- `memory_budget: u64` — live availability snapshotted before the load; `0` means unlimited. Backends that auto-size n_ctx use this as the budget ceiling.
+
+### ModelStore (pulling)
+
+```rust
+use spindll::model_store::{ModelStore, FormatPreference};
+
+let store = ModelStore::new(None);
+
+// Auto: MLX-first on Apple Silicon, GGUF fallback. q4_k_m default for GGUF.
+let path = store.pull("llama3.1:8b", None, FormatPreference::Auto)?;
+
+// Force a specific format / quant
+let path = store.pull("Qwen/Qwen2.5-3B-Instruct-GGUF", Some("q5_k_m"), FormatPreference::Gguf)?;
+
+// FormatPreference::Mlx errors if no MLX equivalent is found
 ```
 
 ### Starting servers
