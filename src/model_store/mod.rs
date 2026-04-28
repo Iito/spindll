@@ -447,7 +447,7 @@ fn format_model_name(key: &str) -> String {
 }
 
 /// Returns true if this platform should prefer MLX over GGUF.
-fn platform_prefers_mlx() -> bool {
+pub fn platform_prefers_mlx() -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
 }
 
