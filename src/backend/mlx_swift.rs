@@ -33,6 +33,13 @@ unsafe extern "C" {
         callback:     unsafe extern "C" fn(*const c_char, *mut c_void) -> c_int,
         callback_ctx: *mut c_void,
     ) -> i32;
+
+    fn mlx_apply_chat_template(
+        handle:        *mut MlxModelHandle,
+        messages_json: *const c_char,
+    ) -> *const c_char;
+
+    fn mlx_free_string(s: *const c_char);
 }
 
 // ---------------------------------------------------------------------------
@@ -237,9 +244,37 @@ impl BackendModel for MlxSwiftEngine {
 
     fn apply_chat_template(
         &self,
-        _messages: &[(String, String)],
+        messages: &[(String, String)],
     ) -> anyhow::Result<String> {
-        anyhow::bail!("chat templates are not yet supported for MLX models")
+        // Encode messages as JSON for the Swift bridge. swift-transformers'
+        // applyChatTemplate(messages:) takes [[String: String]] — the same
+        // {role, content} shape the OpenAI/HF ecosystem uses everywhere.
+        let json: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|(role, content)| {
+                serde_json::json!({ "role": role, "content": content })
+            })
+            .collect();
+        let json_str = serde_json::to_string(&json)
+            .map_err(|e| anyhow::anyhow!("failed to encode chat messages: {e}"))?;
+        let c_json = CString::new(json_str)?;
+
+        let raw = unsafe { mlx_apply_chat_template(self.handle, c_json.as_ptr()) };
+        if raw.is_null() {
+            anyhow::bail!(
+                "MLX tokenizer returned no chat template — model may lack \
+                 tokenizer_config.json with a `chat_template` field"
+            );
+        }
+
+        // Copy the Swift-allocated string into Rust ownership, then hand the
+        // original pointer back to Swift for deallocation.
+        let rendered = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { mlx_free_string(raw) };
+
+        Ok(rendered)
     }
 
     fn n_ctx(&self) -> u32 {
