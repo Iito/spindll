@@ -416,7 +416,7 @@ See [`proto/spindll.proto`](../proto/spindll.proto) for full message definitions
 
 **Chat** -- streaming chat completion from a message history. Applies the model's built-in chat template (falls back to ChatML). Supports an optional `encryption_key` for encrypted KV cache isolation.
 
-**Prefill** -- encode a prompt into the KV cache without generating tokens. Used by orchestrators (e.g. Parley) to pre-warm the cache before the user's request arrives.
+**Prefill** -- encode a prompt into the KV cache without generating tokens. Used by orchestrators to pre-warm the cache before the user's request arrives.
 
 **Load / Unload** -- explicit model lifecycle control. Load returns `already_loaded: true` for idempotent preloading.
 
