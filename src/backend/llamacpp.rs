@@ -19,6 +19,54 @@ pub fn shared_backend() -> &'static LlamaBackend {
     })
 }
 
+/// KV cache bytes per token for a loaded model — `2 * n_layer * n_head_kv *
+/// head_dim * 2` (K+V, fp16). Used for budget-aware n_ctx sizing and for
+/// estimating already-loaded KV usage during eviction.
+pub fn kv_bytes_per_token(model: &LlamaModel) -> u64 {
+    let n_layer = model.n_layer() as u64;
+    let n_head_kv = model.n_head_kv() as u64;
+    let n_head = model.n_head().max(1) as u64;
+    let n_embd = model.n_embd() as u64;
+    let head_dim = n_embd / n_head;
+    const KV: u64 = 2;
+    const FP16: u64 = 2;
+    KV * n_layer * n_head_kv * head_dim * FP16
+}
+
+/// Pick the largest n_ctx that fits user request, model's trained max, and
+/// remaining memory budget after weights. On `requested == 0` (auto), caps
+/// n_ctx at `(memory_budget - weights) / (kv_bpt + compute_bpt)`. Explicit
+/// `requested > 0` bypasses the budget cap — let llama.cpp/Metal surface
+/// OOM rather than silently undersize what the user asked for. Floors at
+/// 512; refusing to load is the caller's job.
+fn resolve_n_ctx(
+    model: &LlamaModel,
+    requested: u32,
+    n_ctx_train: u32,
+    weights: u64,
+    memory_budget: u64,
+) -> u32 {
+    let user_explicit = requested > 0;
+    let user_cap = if user_explicit { requested } else { u32::MAX };
+    let train_cap = if n_ctx_train == 0 { u32::MAX } else { n_ctx_train };
+    let mut n_ctx = std::cmp::min(user_cap, train_cap);
+
+    // ~8 KB/token across MTL0+CPU compute buffers (n_batch == n_ctx).
+    const COMPUTE_BPT: u64 = 8 * 1024;
+
+    if !user_explicit && memory_budget > 0 {
+        let kv_bpt = kv_bytes_per_token(model);
+        let bpt = kv_bpt + COMPUTE_BPT;
+        if bpt > 0 {
+            let remaining = memory_budget.saturating_sub(weights);
+            let budget_cap = (remaining / bpt).min(u32::MAX as u64) as u32;
+            n_ctx = std::cmp::min(n_ctx, budget_cap);
+        }
+    }
+
+    std::cmp::max(n_ctx, 512)
+}
+
 pub struct LlamaCppBackend;
 
 impl LlamaCppBackend {
@@ -51,15 +99,8 @@ impl InferenceBackend for LlamaCppBackend {
             .map_err(|e| anyhow::anyhow!("failed to load model: {e}"))?;
 
         let n_ctx_train = model.n_ctx_train();
-        let n_ctx = if params.n_ctx > 0 && n_ctx_train > 0 {
-            std::cmp::min(n_ctx_train, params.n_ctx)
-        } else if params.n_ctx > 0 {
-            params.n_ctx
-        } else {
-            n_ctx_train
-        };
-
         let size_bytes = model.size();
+        let n_ctx = resolve_n_ctx(&model, params.n_ctx, n_ctx_train, size_bytes, params.memory_budget);
 
         let device = if gpu_layers == 0 {
             "cpu"
