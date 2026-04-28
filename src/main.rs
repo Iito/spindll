@@ -77,6 +77,31 @@ enum Commands {
         kv_cache: Option<Option<String>>,
     },
 
+    /// Benchmark two models side-by-side (any format: GGUF, MLX, or mixed)
+    Bench {
+        /// First model
+        model: String,
+
+        /// Second model to compare against
+        against: String,
+
+        /// Number of measured runs (plus 1 warmup)
+        #[arg(long, default_value = "3")]
+        runs: u32,
+
+        /// Max tokens to generate per run
+        #[arg(long, default_value = "100")]
+        max_tokens: u32,
+
+        /// KV cache context size for GGUF models (MLX handles context dynamically)
+        #[arg(long, default_value = "2048")]
+        ctx_size: u32,
+
+        /// Prompt to use for all runs
+        #[arg(long)]
+        prompt: Option<String>,
+    },
+
     /// Import models from Ollama
     Import {
         /// Source to import from
@@ -115,6 +140,227 @@ fn parse_size_bytes(s: Option<&str>) -> u64 {
         .map(|n| (n * mult as f64) as u64)
         .unwrap_or(DEFAULT)
 }
+
+// ---------------------------------------------------------------------------
+// Backend dispatch helpers for Run
+// ---------------------------------------------------------------------------
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+fn run_mlx(
+    path: &std::path::Path,
+    prompt: &str,
+    params: &spindll::engine::GenerateParams,
+) -> anyhow::Result<()> {
+    let engine = spindll::backend::mlx_swift::MlxSwiftEngine::load(path)?;
+    engine.generate(prompt, params, |token| {
+        use std::io::Write;
+        print!("{token}");
+        std::io::stdout().flush().ok();
+        true
+    })?;
+    println!();
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
+fn run_mlx(
+    _path: &std::path::Path,
+    _prompt: &str,
+    _params: &spindll::engine::GenerateParams,
+) -> anyhow::Result<()> {
+    anyhow::bail!("MLX backend requires Apple Silicon and --features mlx");
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark helpers
+// ---------------------------------------------------------------------------
+
+struct BenchResult {
+    format_name: &'static str,
+    ttft_ms: f64,
+    tokens_per_sec: f64,
+    total_ms: f64,
+    tokens: u32,
+    /// Peak physical memory footprint during generation (MB), 0 if unavailable.
+    mem_peak_mb: f64,
+}
+
+/// Returns the process resident memory in MB.
+/// Uses `mach_task_basic_info` / `resident_size` which includes mmap'd file-backed
+/// pages — important for GGUF where llama.cpp mmaps model weights. This makes
+/// GGUF and MLX figures comparable.
+/// Returns 0.0 on non-macOS platforms or on error.
+#[cfg(target_os = "macos")]
+fn phys_footprint_mb() -> f64 {
+    use std::mem;
+    unsafe {
+        let mut info: libc::mach_task_basic_info = mem::zeroed();
+        let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+        let ret = libc::task_info(
+            libc::mach_task_self(),
+            libc::MACH_TASK_BASIC_INFO as libc::task_flavor_t,
+            &mut info as *mut libc::mach_task_basic_info as libc::task_info_t,
+            &mut count,
+        );
+        if ret == libc::KERN_SUCCESS {
+            info.resident_size as f64 / (1024.0 * 1024.0)
+        } else {
+            0.0
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn phys_footprint_mb() -> f64 { 0.0 }
+
+fn bench_gguf(
+    path: &std::path::Path,
+    prompt: &str,
+    max_tokens: u32,
+    runs: u32,
+    ctx_size: u32,
+) -> anyhow::Result<BenchResult> {
+    let engine = spindll::engine::Engine::load(path, None, ctx_size)?;
+    let params = spindll::engine::GenerateParams { max_tokens, ..Default::default() };
+
+    // warmup
+    engine.generate(prompt, &params, |_| true)?;
+
+    let mut ttft_sum = 0.0f64;
+    let mut tps_sum = 0.0f64;
+    let mut last_tokens = 0u32;
+    let mut mem_peak = 0.0f64;
+
+    for _ in 0..runs {
+        let start = std::time::Instant::now();
+        let mut first = true;
+        let mut ttft = 0.0f64;
+        let result = engine.generate(prompt, &params, |_token| {
+            if first {
+                ttft = start.elapsed().as_secs_f64() * 1000.0;
+                first = false;
+            }
+            true
+        })?;
+        let elapsed = start.elapsed().as_secs_f64();
+        ttft_sum += ttft;
+        tps_sum += result.completion_tokens as f64 / elapsed;
+        last_tokens = result.completion_tokens;
+        let sample = phys_footprint_mb();
+        if sample > mem_peak { mem_peak = sample; }
+    }
+
+    let avg_tps = tps_sum / runs as f64;
+    Ok(BenchResult {
+        format_name: "GGUF",
+        ttft_ms: ttft_sum / runs as f64,
+        tokens_per_sec: avg_tps,
+        total_ms: last_tokens as f64 / avg_tps * 1000.0,
+        tokens: last_tokens,
+        mem_peak_mb: mem_peak,
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+fn bench_mlx(
+    path: &std::path::Path,
+    prompt: &str,
+    max_tokens: u32,
+    runs: u32,
+) -> anyhow::Result<BenchResult> {
+    let engine = spindll::backend::mlx_swift::MlxSwiftEngine::load(path)?;
+    let params = spindll::engine::GenerateParams { max_tokens, ..Default::default() };
+
+    // warmup
+    engine.generate(prompt, &params, |_| true)?;
+
+    let mut ttft_sum = 0.0f64;
+    let mut tps_sum = 0.0f64;
+    let mut last_tokens = 0u32;
+    let mut mem_peak = 0.0f64;
+
+    for _ in 0..runs {
+        let start = std::time::Instant::now();
+        let mut first = true;
+        let mut ttft = 0.0f64;
+        let result = engine.generate(prompt, &params, |_token| {
+            if first {
+                ttft = start.elapsed().as_secs_f64() * 1000.0;
+                first = false;
+            }
+            true
+        })?;
+        let elapsed = start.elapsed().as_secs_f64();
+        ttft_sum += ttft;
+        tps_sum += result.completion_tokens as f64 / elapsed;
+        last_tokens = result.completion_tokens;
+        let sample = phys_footprint_mb();
+        if sample > mem_peak { mem_peak = sample; }
+    }
+
+    let avg_tps = tps_sum / runs as f64;
+    Ok(BenchResult {
+        format_name: "MLX",
+        ttft_ms: ttft_sum / runs as f64,
+        tokens_per_sec: avg_tps,
+        total_ms: last_tokens as f64 / avg_tps * 1000.0,
+        tokens: last_tokens,
+        mem_peak_mb: mem_peak,
+    })
+}
+
+fn bench_by_format(
+    path: &std::path::Path,
+    format: spindll::model_store::registry::ModelFormat,
+    prompt: &str,
+    max_tokens: u32,
+    runs: u32,
+    ctx_size: u32,
+) -> anyhow::Result<BenchResult> {
+    use spindll::model_store::registry::ModelFormat;
+    match format {
+        ModelFormat::Gguf => bench_gguf(path, prompt, max_tokens, runs, ctx_size),
+        ModelFormat::Mlx => bench_mlx_dispatch(path, prompt, max_tokens, runs),
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+fn bench_mlx_dispatch(
+    path: &std::path::Path,
+    prompt: &str,
+    max_tokens: u32,
+    runs: u32,
+) -> anyhow::Result<BenchResult> {
+    bench_mlx(path, prompt, max_tokens, runs)
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
+fn bench_mlx_dispatch(
+    _path: &std::path::Path,
+    _prompt: &str,
+    _max_tokens: u32,
+    _runs: u32,
+) -> anyhow::Result<BenchResult> {
+    anyhow::bail!("MLX backend requires Apple Silicon and --features mlx");
+}
+
+fn format_mem(mb: f64) -> String {
+    if mb <= 0.0 { return "  —".to_string(); }
+    if mb >= 1024.0 { format!("{:.1}G", mb / 1024.0) } else { format!("{:.0}M", mb) }
+}
+
+fn print_bench_row(label: &str, r: &BenchResult) {
+    let label = if label.len() > 40 { &label[..40] } else { label };
+    println!(
+        "{:<40} {:>4} {:>8.0}ms {:>8.1} {:>7.2}s {:>6}",
+        label, r.format_name, r.ttft_ms, r.tokens_per_sec, r.total_ms / 1000.0,
+        format_mem(r.mem_peak_mb),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -211,26 +457,76 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Run { model, prompt, kv_cache } => {
             let store = spindll::model_store::ModelStore::new(None);
+            let format = store.resolve_model_format(&model)?;
             let model_path = store.resolve_model_path(&model)?;
-
-            let mut engine = spindll::engine::Engine::load(&model_path, None, 2048)?;
-
-            if let Some(cache_size) = kv_cache {
-                let bytes = parse_size_bytes(cache_size.as_deref());
-                let digest = store.resolve_model_digest(&model).unwrap_or_default();
-                engine.set_model_digest(digest);
-                engine.enable_kv_cache(bytes);
-            }
-
             let params = spindll::engine::GenerateParams::default();
 
-            engine.generate(&prompt, &params, |token| {
-                use std::io::Write;
-                print!("{token}");
-                std::io::stdout().flush().ok();
-                true
-            })?;
-            println!();
+            use spindll::model_store::registry::ModelFormat;
+            match format {
+                ModelFormat::Mlx => run_mlx(&model_path, &prompt, &params)?,
+                ModelFormat::Gguf => {
+                    let mut engine = spindll::engine::Engine::load(&model_path, None, 2048)?;
+
+                    if let Some(cache_size) = kv_cache {
+                        let bytes = parse_size_bytes(cache_size.as_deref());
+                        let digest = store.resolve_model_digest(&model).unwrap_or_default();
+                        engine.set_model_digest(digest);
+                        engine.enable_kv_cache(bytes);
+                    }
+
+                    engine.generate(&prompt, &params, |token| {
+                        use std::io::Write;
+                        print!("{token}");
+                        std::io::stdout().flush().ok();
+                        true
+                    })?;
+                    println!();
+                }
+            }
+        }
+        Commands::Bench { model, against, runs, max_tokens, ctx_size, prompt } => {
+            let store = spindll::model_store::ModelStore::new(None);
+            let default_prompt =
+                "Explain how transformers work in machine learning, step by step.";
+            let prompt_str = prompt.as_deref().unwrap_or(default_prompt);
+
+            println!("prompt    {:?}", prompt_str);
+            println!("runs      {} (+ 1 warmup)  max-tokens={}  ctx-size={} (GGUF)", runs, max_tokens, ctx_size);
+            println!("{}", "─".repeat(80));
+            println!(
+                "{:<40} {:>4} {:>9} {:>9} {:>8} {:>6}",
+                "MODEL", "FMT", "TTFT", "TOK/S", "TOTAL", "MEM"
+            );
+            println!("{}", "─".repeat(80));
+
+            let path1 = store.resolve_model_path(&model)?;
+            let fmt1 = store.resolve_model_format(&model)?;
+            let r1 = bench_by_format(&path1, fmt1, prompt_str, max_tokens, runs, ctx_size)?;
+            print_bench_row(&model, &r1);
+
+            let path2 = store.resolve_model_path(&against)?;
+            let fmt2 = store.resolve_model_format(&against)?;
+            let r2 = bench_by_format(&path2, fmt2, prompt_str, max_tokens, runs, ctx_size)?;
+            print_bench_row(&against, &r2);
+
+            println!("{}", "─".repeat(80));
+
+            let tps_ratio = r2.tokens_per_sec / r1.tokens_per_sec;
+            let ttft_ratio = r1.ttft_ms / r2.ttft_ms;
+
+            let (faster_label, slower_label, tps_pct, ttft_pct) =
+                if tps_ratio >= 1.0 {
+                    (against.as_str(), model.as_str(), (tps_ratio - 1.0) * 100.0, (ttft_ratio - 1.0) * 100.0)
+                } else {
+                    (model.as_str(), against.as_str(), (1.0 / tps_ratio - 1.0) * 100.0, (1.0 / ttft_ratio - 1.0) * 100.0)
+                };
+
+            let fl = if faster_label.len() > 30 { &faster_label[..30] } else { faster_label };
+            let sl = if slower_label.len() > 30 { &slower_label[..30] } else { slower_label };
+            println!(
+                "{} is {:.0}% faster throughput, {:.0}% faster TTFT vs {}",
+                fl, tps_pct, ttft_pct, sl,
+            );
         }
         Commands::Import { from_ollama } => {
             if from_ollama {
