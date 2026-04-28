@@ -49,6 +49,7 @@ thiserror    = "2"
 anyhow       = "1"
 tracing      = "0.1"
 sysinfo      = "0.35"
+urlencoding  = "2"
 
 # http server (optional)
 axum       = { version = "0.8", features = ["macros"], optional = true }
@@ -57,6 +58,9 @@ tower-http = { version = "0.6", features = ["cors"], optional = true }
 # cli binary only
 clap               = { version = "4", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [build-dependencies]
 tonic-build = "0.13"
