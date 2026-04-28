@@ -233,22 +233,39 @@ impl Spindll for SpindllService {
         let models = reg
             .models
             .iter()
-            .map(|(key, entry)| ModelInfo {
-                name: key.clone(),
-                repo: entry.repo.clone(),
-                file: entry.filename.clone(),
-                quantization: String::new(),
-                size_bytes: entry.size_bytes,
-                last_used: String::new(),
-                digest: entry.digest.clone(),
-                model_name: entry.model_name.clone(),
-                description: entry.description.clone(),
-                architecture: entry.architecture.clone(),
-                context_length: entry.context_length,
+            .map(|(key, entry)| {
+                let format = match entry.format {
+                    crate::model_store::registry::ModelFormat::Gguf => "gguf",
+                    crate::model_store::registry::ModelFormat::Mlx => "mlx",
+                };
+                ModelInfo {
+                    name: key.clone(),
+                    repo: entry.repo.clone(),
+                    file: entry.filename.clone(),
+                    quantization: String::new(),
+                    size_bytes: entry.size_bytes,
+                    last_used: String::new(),
+                    digest: entry.digest.clone(),
+                    model_name: entry.model_name.clone(),
+                    description: entry.description.clone(),
+                    architecture: entry.architecture.clone(),
+                    context_length: entry.context_length,
+                    format: format.to_string(),
+                    base_model: entry.base_model.clone(),
+                }
             })
             .collect();
 
-        Ok(Response::new(ListResponse { models }))
+        let prefer_format = if crate::model_store::platform_prefers_mlx() {
+            "mlx"
+        } else {
+            "gguf"
+        };
+
+        Ok(Response::new(ListResponse {
+            models,
+            prefer_format: prefer_format.to_string(),
+        }))
     }
 
     #[tracing::instrument(skip_all, fields(model))]
