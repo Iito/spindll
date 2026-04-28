@@ -6,14 +6,17 @@ pub struct MemoryBudget {
     pub total_ram: u64,
     /// Currently available RAM in bytes.
     pub available_ram: u64,
-    /// Maximum bytes allowed for loaded models (user-configured or 80% of available).
+    /// Maximum bytes allowed for loaded models (user-configured, or full
+    /// `available_ram` if omitted).
     pub budget: u64,
 }
 
 impl MemoryBudget {
     /// Detect system memory. If budget_str is provided (e.g. "8G"), use that
-    /// (clamped to total RAM). `"0"` means total RAM. If omitted, use 80% of
-    /// currently available RAM.
+    /// (clamped to total RAM). `"0"` means total RAM. If omitted, use the
+    /// full live availability — `available_memory_platform` already excludes
+    /// wired+active pages the OS is using, so reserving an extra margin on
+    /// top of that double-counts the OS overhead.
     pub fn detect(budget_str: Option<&str>) -> Self {
         let sys = System::new_all();
         let total_ram = sys.total_memory();
@@ -23,9 +26,9 @@ impl MemoryBudget {
             Some(s) => match parse_size(s) {
                 Some(0) => total_ram,
                 Some(n) => std::cmp::min(n, total_ram),
-                None => available_ram * 80 / 100,
+                None => available_ram,
             },
-            None => available_ram * 80 / 100,
+            None => available_ram,
         };
 
         Self {
@@ -42,8 +45,9 @@ impl MemoryBudget {
 }
 
 /// On macOS, sysinfo's `available_memory()` only returns free pages. macOS
-/// aggressively caches files in inactive/purgeable pages that are immediately
-/// reclaimable under pressure. We query `host_statistics64` to include those.
+/// aggressively caches files in inactive/purgeable/speculative pages that
+/// are immediately reclaimable under pressure. We query `host_statistics64`
+/// to include those — matches Activity Monitor's "Memory Available".
 #[cfg(target_os = "macos")]
 fn available_memory_platform(_sys: &System) -> u64 {
     use std::mem::{MaybeUninit, size_of};
@@ -108,9 +112,14 @@ fn available_memory_platform(_sys: &System) -> u64 {
             page_size = 16384;
         }
 
+        // Activity Monitor's "Available" = free + inactive + purgeable +
+        // speculative. Speculative pages are file-cache prefetch that the
+        // kernel reclaims first under pressure, so leaving them out
+        // understates by 1–2 GB on a typical Mac.
         (info.free_count as u64
             + info.inactive_count as u64
-            + info.purgeable_count as u64)
+            + info.purgeable_count as u64
+            + info.speculative_count as u64)
             * page_size
     }
 }
