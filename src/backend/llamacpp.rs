@@ -15,6 +15,9 @@ static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
 
 pub fn shared_backend() -> &'static LlamaBackend {
     BACKEND.get_or_init(|| {
+        // Install the log filter BEFORE init so the backend's own ggml /
+        // Metal init banners go through it instead of straight to stderr.
+        crate::engine::suppress_llama_log();
         LlamaBackend::init().expect("LlamaBackend::init failed")
     })
 }
