@@ -59,8 +59,9 @@ fn build_mlx_bridge() -> Result<(), Box<dyn std::error::Error>> {
     // Static compatibility shims (auto-linked from compiled Swift objects).
     println!("cargo:rustc-link-search=native={toolchain}/macosx");
 
-    // Resolve @rpath/libswift_Concurrency.dylib etc. via the OS dyld shared cache.
-    // The files may not exist on disk on macOS 15+ but are present in the shared cache.
+    // Resolve @rpath/libswift_Concurrency.dylib at runtime.
+    // Toolchain path covers Xcode installs; /usr/lib/swift covers the dyld shared cache.
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{toolchain}/macosx");
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
 
     // System frameworks required by MLX.
