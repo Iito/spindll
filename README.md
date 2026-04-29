@@ -45,7 +45,7 @@ spindll pull <model> [flags]          # pull from Ollama registry or HuggingFace
 spindll list                          # show local models with metadata
 spindll rm <model>                    # delete a local model
 spindll run [options] <model> "prompt" # one-shot inference (no server)
-spindll bench <model> <other>         # side-by-side benchmark of two models (any format)
+spindll bench <model> [other]         # benchmark one or two models (any format)
 spindll serve [options]               # start gRPC + HTTP server
 spindll import --from-ollama          # migrate existing Ollama models
 spindll status                        # query a running server
