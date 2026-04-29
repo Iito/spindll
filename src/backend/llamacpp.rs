@@ -18,7 +18,9 @@ pub fn shared_backend() -> &'static LlamaBackend {
         // Install the log filter BEFORE init so the backend's own ggml /
         // Metal init banners go through it instead of straight to stderr.
         crate::engine::suppress_llama_log();
-        LlamaBackend::init().expect("LlamaBackend::init failed")
+        let mut backend = LlamaBackend::init().expect("LlamaBackend::init failed");
+        backend.void_logs();
+        backend
     })
 }
 
