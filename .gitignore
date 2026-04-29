@@ -1,1 +1,15 @@
 /target
+/mlx_bridge/.build
+
+# Local-only agent state (skills, scratch, tools)
+tools/
+.agents/
+
+# Claude Code project dir is mostly local, but we DO commit harness pieces.
+# Per-file un-ignore requires ignoring the children, not the directory itself.
+.claude/*
+!.claude/commands/
+!.claude/settings.json
+
+# Agent run artifacts (review outputs, autoloop trial logs, sessions)
+.refs/

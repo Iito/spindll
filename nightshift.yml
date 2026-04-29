@@ -1,0 +1,59 @@
+# nightshift.yml — scheduler + budget gate for spindll harness.
+# https://github.com/marcus/nightshift
+#
+# Bootstrap on a fresh host:
+#   brew install marcus/tap/nightshift   # or: go install github.com/marcus/nightshift/cmd/nightshift@latest
+#   nightshift daemon start
+#
+# Adjust schedules per host: ubuntu = primary 24/7, mac = MLX-only kicked manually.
+
+# --- safety ---
+auto_create_pr: false           # Agent stops at `git commit`. User runs `gh pr create` manually.
+auto_merge: false               # Never auto-merge. Even if a PR is open, human approves.
+budget:
+  max_daily_token_pct: 75       # Stop scheduling new runs after 75% of daily allotment used.
+  per_run_token_cap: 500000
+
+# --- providers ---
+providers:
+  - claude                      # claude-code CLI (`claude /login` first)
+  - codex                       # codex CLI (`codex --login` first)
+
+# --- repos under management ---
+repos:
+  - path: .                     # this repo (spindll)
+    branch_prefix: nightshift/  # all auto-branches go nightshift/<task>-<date>
+    base_branch: next           # branch off `next`
+    skip_if_dirty: true
+
+# --- task lanes ---
+tasks:
+  - name: implement
+    schedule: "*/30 * * * *"    # every 30 min
+    command: "claude -p '/implement' --output-format json"
+    fallback: "codex exec 'Run /implement per AGENTS.md'"
+    skip_if: "git -C @REPO@ ls-files --modified --others --exclude-standard | grep -q ."
+    when_punchlist_empty: skip
+    cooldown_minutes: 15
+    hosts: [ubuntu]             # ubuntu only, mac stays free
+
+  - name: autoloop
+    schedule: "0 2 * * *"        # 02:00 daily
+    command: "bash scripts/autoloop.sh decode_tps .refs/autoloop/grids/default.jsonl"
+    requires_file: ".refs/autoloop/grids/default.jsonl"
+    timeout_minutes: 240
+    hosts: [ubuntu]
+
+  - name: review-tip
+    schedule: "0 */4 * * *"      # every 4h on the active feature branch
+    command: "bash scripts/review-fanout.sh origin/next"
+    when_branch_matches: "^feat/|^fix/|^nightshift/"
+    hosts: [ubuntu]
+
+  - name: mlx-validate
+    schedule: manual             # mac runs this on demand via scripts/mlx-validate.sh
+    hosts: [mac]
+
+# --- logging ---
+log_dir: ~/.local/state/nightshift/spindll
+keep_runs: 200
