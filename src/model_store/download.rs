@@ -196,9 +196,8 @@ pub fn download_hf_auto(
     })
 }
 
-/// Per-token KV cache bytes for an MLX model from its `config.json`.
-/// `2 (K+V) × n_layers × n_kv_heads × head_dim × 2 (fp16)`. Returns 0 if
-/// any required field is missing.
+/// MLX per-token KV bytes from `config.json`:
+/// `2 (K+V) × n_layers × n_kv_heads × head_dim × 2 (fp16)`. 0 if missing fields.
 pub fn kv_bpt_from_mlx_config(config: &serde_json::Value) -> u64 {
     fn calc(c: &serde_json::Value) -> Option<u64> {
         let n_layers = c.get("num_hidden_layers")?.as_u64()?;
@@ -410,9 +409,7 @@ mod tests {
         assert_eq!(extract_quant("model.gguf"), None);
     }
 
-    /// Locks down the KV-bytes-per-token formula against accidental
-    /// "simplification" — the manager's eviction sizing depends on it.
-    /// Numbers come from `mlx-community/Qwen3-0.6B-4bit/config.json`.
+    /// Regression: locks KV math. Numbers from Qwen3-0.6B-4bit config.json.
     #[test]
     fn kv_bpt_matches_qwen3_0_6b_shape() {
         let cfg = serde_json::json!({
@@ -421,7 +418,7 @@ mod tests {
             "num_key_value_heads": 8,
             "hidden_size": 1024,
         });
-        // 2 (K+V) × 28 layers × 8 kv-heads × (1024/16=64 head_dim) × 2 (fp16) = 57344
+        // 2 × 28 × 8 × 64 × 2 = 57344
         assert_eq!(kv_bpt_from_mlx_config(&cfg), 57344);
     }
 

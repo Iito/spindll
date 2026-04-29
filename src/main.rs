@@ -183,7 +183,7 @@ struct BenchResult {
 }
 
 #[cfg(target_os = "macos")]
-#[allow(deprecated)] // libc::mach_task_self_ is fine for our needs; mach2 crate would be scope creep.
+#[allow(deprecated)] // mach_task_self_ deprecated -> mach2 crate; scope creep.
 fn phys_footprint_mb() -> f64 {
     use std::mem;
     unsafe {
