@@ -80,6 +80,14 @@ enum Commands {
         /// Prompt text
         prompt: String,
 
+        /// Context size for the model (default 2048)
+        #[arg(long, default_value = "2048")]
+        ctx_size: u32,
+
+        /// Memory budget (e.g. "8G", omit=live RAM, "0"=total RAM)
+        #[arg(long)]
+        budget: Option<String>,
+
         /// Enable KV cache for prompt prefixes (e.g. "2G", default 2G when enabled)
         #[arg(long)]
         kv_cache: Option<Option<String>>,
@@ -148,6 +156,25 @@ fn parse_size_bytes(s: Option<&str>) -> u64 {
     num.parse::<f64>()
         .map(|n| (n * mult as f64) as u64)
         .unwrap_or(DEFAULT)
+}
+
+fn parse_size_arg(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s == "0" {
+        return Some(0);
+    }
+    if s.is_empty() {
+        return None;
+    }
+    Some(parse_size_bytes(Some(s)))
+}
+
+fn manager_memory_budget(raw_budget: Option<&str>, detected_budget: u64) -> u64 {
+    if raw_budget.and_then(parse_size_arg) == Some(0) {
+        0
+    } else {
+        detected_budget
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -399,46 +426,33 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run {
             model,
             prompt,
+            ctx_size,
+            budget,
             kv_cache,
         } => {
             let store = spindll::model_store::ModelStore::new(None);
-            let format = store.resolve_model_format(&model)?;
             let model_path = store.resolve_model_path(&model)?;
-            let params = spindll::engine::GenerateParams::default();
+            let digest = store.resolve_model_digest(&model).unwrap_or_default();
 
-            use spindll::model_store::registry::ModelFormat;
-            if kv_cache.is_some() && format == ModelFormat::Gguf {
-                // KV cache path: use Engine directly (GGUF-only feature)
-                let mut engine = spindll::engine::Engine::load(&model_path, None, 2048)?;
-                if let Some(cache_size) = kv_cache {
-                    let bytes = parse_size_bytes(cache_size.as_deref());
-                    let digest = store.resolve_model_digest(&model).unwrap_or_default();
-                    engine.set_model_digest(digest);
-                    engine.enable_kv_cache(bytes);
-                }
-                engine.generate(&prompt, &params, |token| {
-                    use std::io::Write;
-                    print!("{token}");
-                    std::io::stdout().flush().ok();
-                    true
-                })?;
-            } else {
-                let backend = backend_for_format(&format)?;
-                let backend_model = backend.load_model(
-                    &model_path,
-                    spindll::backend::BackendLoadParams {
-                        n_ctx: 2048,
-                        n_gpu_layers: None,
-                        memory_budget: 0,
-                    },
-                )?;
-                backend_model.generate(&prompt, &params, &mut |token| {
-                    use std::io::Write;
-                    print!("{token}");
-                    std::io::stdout().flush().ok();
-                    true
-                })?;
+            let mem = spindll::scheduler::budget::MemoryBudget::detect(budget.as_deref());
+            let mgr_budget = manager_memory_budget(budget.as_deref(), mem.budget);
+            let mut manager =
+                spindll::engine::ModelManager::new(ctx_size, None, mgr_budget)?;
+
+            if let Some(cache_size) = kv_cache {
+                let bytes = parse_size_bytes(cache_size.as_deref());
+                manager.enable_kv_cache(bytes);
             }
+
+            manager.load_model_with_digest(&model, &model_path, None, digest)?;
+
+            let params = spindll::engine::GenerateParams::default();
+            manager.generate(&model, &prompt, &params, None, |token| {
+                use std::io::Write;
+                print!("{token}");
+                std::io::stdout().flush().ok();
+                true
+            })?;
             println!();
         }
         #[cfg(debug_assertions)]
