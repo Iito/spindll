@@ -165,3 +165,45 @@ pub(crate) fn apply_chat_template_with_fallback(
         .apply_chat_template(&tmpl, &chat_messages, true)
         .map_err(|e| anyhow::anyhow!("failed to apply chat template: {e}"))
 }
+
+/// Suppress llama.cpp's built-in stderr logging.
+///
+/// Installs a callback that drops INFO / DEBUG noise (model metadata
+/// dumps, Metal device discovery, ggml init banners) while forwarding
+/// WARN and ERROR through tracing so real failures aren't silenced.
+/// Idempotent — `llama_log_set` overwrites the previous callback.
+pub(crate) fn suppress_llama_log() {
+    unsafe {
+        llama_cpp_sys_2::llama_log_set(Some(noop_llama_log), std::ptr::null_mut());
+    }
+}
+
+unsafe extern "C" fn noop_llama_log(
+    level: llama_cpp_sys_2::ggml_log_level,
+    text: *const std::ffi::c_char,
+    _user_data: *mut std::ffi::c_void,
+) {
+    // Current ggml.h enum: 0=NONE, 1=DEBUG, 2=INFO, 3=WARN, 4=ERROR, 5=CONT.
+    // Forward WARN and ERROR through tracing; drop everything else.
+    if text.is_null() {
+        return;
+    }
+    const GGML_LOG_LEVEL_WARN: u32 = 3;
+    const GGML_LOG_LEVEL_ERROR: u32 = 4;
+    let lvl = level as u32;
+    if lvl != GGML_LOG_LEVEL_WARN && lvl != GGML_LOG_LEVEL_ERROR {
+        return;
+    }
+    let msg = unsafe { std::ffi::CStr::from_ptr(text) }
+        .to_string_lossy()
+        .trim_end()
+        .to_string();
+    if msg.is_empty() {
+        return;
+    }
+    if lvl == GGML_LOG_LEVEL_ERROR {
+        tracing::error!(target: "llama_cpp", "{msg}");
+    } else {
+        tracing::warn!(target: "llama_cpp", "{msg}");
+    }
+}
