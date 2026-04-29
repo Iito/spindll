@@ -527,8 +527,7 @@ fn find_json_end(text: &str, start: usize) -> Option<usize> {
     let mut depth = 0i32;
     let mut in_string = false;
     let mut escape = false;
-    for i in start..bytes.len() {
-        let ch = bytes[i];
+    for (i, ch) in bytes.iter().copied().enumerate().skip(start) {
         if escape {
             escape = false;
             continue;
@@ -603,10 +602,8 @@ fn prepare_messages_with_tools(
     }
 
     // If there was no system message but we have tools, inject one
-    if !system_injected {
-        if let Some(preamble) = tool_preamble {
-            result.insert(0, ("system".to_string(), preamble));
-        }
+    if let (false, Some(preamble)) = (system_injected, tool_preamble) {
+        result.insert(0, ("system".to_string(), preamble));
     }
 
     result

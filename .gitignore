@@ -1,2 +1,5 @@
 /target
 /mlx_bridge/.build
+.agents/
+.claude/
+skills-lock.json

@@ -60,9 +60,9 @@ fn resolve_n_ctx(
     if !user_explicit && memory_budget > 0 {
         let kv_bpt = kv_bytes_per_token(model);
         let bpt = kv_bpt + COMPUTE_BPT;
-        if bpt > 0 {
-            let remaining = memory_budget.saturating_sub(weights);
-            let budget_cap = (remaining / bpt).min(u32::MAX as u64) as u32;
+        let remaining = memory_budget.saturating_sub(weights);
+        if let Some(tokens) = remaining.checked_div(bpt) {
+            let budget_cap = tokens.min(u32::MAX as u64) as u32;
             n_ctx = std::cmp::min(n_ctx, budget_cap);
         }
     }
@@ -85,7 +85,7 @@ impl InferenceBackend for LlamaCppBackend {
         path: &Path,
         params: BackendLoadParams,
     ) -> anyhow::Result<Box<dyn BackendModel>> {
-        let gpu_layers = params.n_gpu_layers.unwrap_or_else(|| {
+        let gpu_layers = params.n_gpu_layers.unwrap_or({
             if cfg!(target_os = "macos")
                 || cfg!(feature = "cuda")
                 || cfg!(feature = "metal")

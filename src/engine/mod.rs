@@ -23,7 +23,7 @@ use std::path::Path;
 
 /// Single-model inference engine wrapping a loaded GGUF model.
 ///
-/// For multi-model use cases (the common Parley path), prefer [`ModelManager`] instead.
+/// For multi-model use cases, prefer [`ModelManager`] instead.
 /// `Engine` is useful when you need a lightweight wrapper around exactly one model.
 pub struct Engine {
     model: LlamaModel,
@@ -38,7 +38,7 @@ impl Engine {
     pub fn load(path: &Path, n_gpu_layers: Option<u32>, n_ctx: u32) -> anyhow::Result<Self> {
         let backend = crate::backend::llamacpp::shared_backend();
 
-        let gpu_layers = n_gpu_layers.unwrap_or_else(|| {
+        let gpu_layers = n_gpu_layers.unwrap_or({
             if cfg!(target_os = "macos")
                 || cfg!(feature = "cuda")
                 || cfg!(feature = "metal")
@@ -52,7 +52,7 @@ impl Engine {
 
         let model_params = LlamaModelParams::default()
             .with_n_gpu_layers(gpu_layers);
-        let model = LlamaModel::load_from_file(&backend, path, &model_params)
+        let model = LlamaModel::load_from_file(backend, path, &model_params)
             .map_err(|e| anyhow::anyhow!("failed to load model: {e}"))?;
 
         let device = if gpu_layers == 0 {
@@ -130,7 +130,17 @@ impl Engine {
         let mut ctx = self.create_context()?;
         match &self.kv_cache {
             Some(cache) => streaming::generate_streaming_cached(
-                &self.model, &mut ctx, prompt, params, "default", &self.model_digest, cache, None, on_token,
+                streaming::CachedGenerateRequest {
+                    model: &self.model,
+                    ctx: &mut ctx,
+                    prompt,
+                    params,
+                    model_name: "default",
+                    model_digest: &self.model_digest,
+                    cache,
+                    encryption_key: None,
+                },
+                on_token,
             ),
             None => streaming::generate_streaming(&self.model, &mut ctx, prompt, params, on_token),
         }
@@ -188,10 +198,10 @@ unsafe extern "C" fn noop_llama_log(
     if text.is_null() {
         return;
     }
-    const GGML_LOG_LEVEL_WARN: u32 = 3;
-    const GGML_LOG_LEVEL_ERROR: u32 = 4;
-    let lvl = level as u32;
-    if lvl != GGML_LOG_LEVEL_WARN && lvl != GGML_LOG_LEVEL_ERROR {
+    let lvl = level;
+    if lvl != llama_cpp_sys_2::GGML_LOG_LEVEL_WARN
+        && lvl != llama_cpp_sys_2::GGML_LOG_LEVEL_ERROR
+    {
         return;
     }
     let msg = unsafe { std::ffi::CStr::from_ptr(text) }
@@ -201,7 +211,7 @@ unsafe extern "C" fn noop_llama_log(
     if msg.is_empty() {
         return;
     }
-    if lvl == GGML_LOG_LEVEL_ERROR {
+    if lvl == llama_cpp_sys_2::GGML_LOG_LEVEL_ERROR {
         tracing::error!(target: "llama_cpp", "{msg}");
     } else {
         tracing::warn!(target: "llama_cpp", "{msg}");

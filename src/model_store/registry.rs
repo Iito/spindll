@@ -192,10 +192,11 @@ impl Registry {
             // Backfill missing size for MLX directory entries (size was stored as 0 due to
             // symlink_metadata not following HF hub symlinks).
             if entry.size_bytes == 0 && entry.format == ModelFormat::Mlx && entry.path.is_dir() {
-                if let Ok(size) = dir_size(&entry.path) {
-                    entry.size_bytes = size;
-                    changed = true;
-                }
+                let Ok(size) = dir_size(&entry.path) else {
+                    continue;
+                };
+                entry.size_bytes = size;
+                changed = true;
             }
         }
         changed

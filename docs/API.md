@@ -472,22 +472,16 @@ The primary entry point for multi-model inference. Routes loads to the matching 
 use spindll::engine::{ModelManager, GenerateParams};
 use spindll::model_store::ModelStore;
 
-// Create a manager with 4096 context, auto GPU, dynamic memory tracking.
-// memory_budget = 0 → live-tracking auto-mode: every load and eviction
-// re-snapshots free RAM, so spindll never exceeds what the system can give.
-// Pass an explicit number (e.g. 8_000_000_000) for a hard cap, or u64::MAX
-// for "no eviction".
-let mut manager = ModelManager::new(4096, None, 0)?;
+// n_ctx=0 autosizes; memory_budget=0 uses total RAM.
+let mut manager = ModelManager::new(0, None, 0)?;
 
 // Enable KV cache (2GB)
 manager.enable_kv_cache(2_000_000_000);
 
-// Enable continuous batching (8 concurrent sequences per GGUF model;
-// MLX models are gated out via supports_batching()).
+// Enable GGUF batching.
 manager.set_batch_slots(8);
 
-// Load a model — the manager picks the backend automatically based on
-// the format detected from the path (file → GGUF, directory → MLX).
+// Load; manager picks backend from path.
 let store = ModelStore::new(None);
 let path = store.resolve_model_path("llama3.1:8b")?;
 let digest = store.resolve_model_digest("llama3.1:8b").unwrap_or_default();
@@ -517,7 +511,7 @@ pub trait InferenceBackend: Send + Sync {
 `BackendLoadParams` carries:
 - `n_ctx: u32` — requested context size; `0` means auto-resolve to the largest n_ctx that fits weights + KV + compute buffers within `memory_budget`.
 - `n_gpu_layers: Option<u32>` — `None` to auto-detect.
-- `memory_budget: u64` — live availability snapshotted before the load; `0` means unlimited. Backends that auto-size n_ctx use this as the budget ceiling.
+- `memory_budget: u64` — load budget in bytes; `0` means no backend cap.
 
 ### ModelStore (pulling)
 

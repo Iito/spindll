@@ -51,7 +51,7 @@ enum Commands {
         #[arg(long)]
         gpu_layers: Option<u32>,
 
-        /// Memory budget for loaded models (e.g. "8G", omit for 80% of available RAM)
+        /// Memory budget (e.g. "8G"; omit=live RAM, "0"=total RAM)
         #[arg(long)]
         budget: Option<String>,
 
@@ -80,18 +80,26 @@ enum Commands {
         /// Prompt text
         prompt: String,
 
+        /// GGUF context size (0 = budget-safe auto)
+        #[arg(long, default_value = "0")]
+        ctx_size: u32,
+
+        /// Memory budget (e.g. "8G"; omit=live RAM, "0"=total RAM)
+        #[arg(long)]
+        budget: Option<String>,
+
         /// Enable KV cache for prompt prefixes (e.g. "2G", default 2G when enabled)
         #[arg(long)]
         kv_cache: Option<Option<String>>,
     },
 
-    /// Benchmark two models side-by-side (any format: GGUF, MLX, or mixed)
+    /// Benchmark one or two models (any format: GGUF, MLX, or mixed)
     Bench {
         /// First model
         model: String,
 
-        /// Second model to compare against
-        against: String,
+        /// Optional second model to compare against
+        against: Option<String>,
 
         /// Number of measured runs (plus 1 warmup)
         #[arg(long, default_value = "3")]
@@ -125,15 +133,15 @@ enum Commands {
     },
 }
 
-/// Parse a human-readable size like "2G", "512M" into bytes. Defaults to 2GB.
 fn parse_size_bytes(s: Option<&str>) -> u64 {
     const DEFAULT: u64 = 2 * 1_073_741_824; // 2 GB
-    let s = match s {
-        Some(s) => s.trim(),
-        None => return DEFAULT,
-    };
+    s.and_then(parse_size_arg).unwrap_or(DEFAULT)
+}
+
+fn parse_size_arg(s: &str) -> Option<u64> {
+    let s = s.trim();
     if s.is_empty() {
-        return DEFAULT;
+        return None;
     }
 
     let (num, mult) = if s.ends_with('G') || s.ends_with('g') {
@@ -141,12 +149,18 @@ fn parse_size_bytes(s: Option<&str>) -> u64 {
     } else if s.ends_with('M') || s.ends_with('m') {
         (&s[..s.len() - 1], 1_048_576u64)
     } else {
-        (s, 1u64) // raw bytes
+        (s, 1u64)
     };
 
-    num.parse::<f64>()
-        .map(|n| (n * mult as f64) as u64)
-        .unwrap_or(DEFAULT)
+    num.parse::<f64>().ok().map(|n| (n * mult as f64) as u64)
+}
+
+fn manager_memory_budget(raw_budget: Option<&str>, detected_budget: u64) -> u64 {
+    if raw_budget.and_then(parse_size_arg) == Some(0) {
+        0
+    } else {
+        detected_budget
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -176,10 +190,12 @@ fn backend_for_format(
 
 struct BenchResult {
     format_name: &'static str,
+    prompt_tokens: u32,
+    completion_tokens: u32,
     ttft_ms: f64,
-    tokens_per_sec: f64,
+    decode_tokens_per_sec: f64,
+    total_tokens_per_sec: f64,
     total_ms: f64,
-    tokens: u32,
     mem_peak_mb: f64,
 }
 
@@ -218,6 +234,10 @@ fn bench_by_format(
 ) -> anyhow::Result<BenchResult> {
     use spindll::model_store::registry::ModelFormat;
 
+    if runs == 0 {
+        anyhow::bail!("--runs must be greater than 0");
+    }
+
     let format_name = match format {
         ModelFormat::Gguf => "GGUF",
         ModelFormat::Mlx => "MLX",
@@ -239,8 +259,11 @@ fn bench_by_format(
     model.generate(prompt, &params, &mut |_| true)?;
 
     let mut ttft_sum = 0.0f64;
-    let mut tps_sum = 0.0f64;
-    let mut last_tokens = 0u32;
+    let mut decode_tps_sum = 0.0f64;
+    let mut total_tps_sum = 0.0f64;
+    let mut total_ms_sum = 0.0f64;
+    let mut prompt_token_sum = 0u64;
+    let mut completion_token_sum = 0u64;
     let mut mem_peak = 0.0f64;
 
     for _ in 0..runs {
@@ -255,24 +278,49 @@ fn bench_by_format(
             true
         })?;
         let elapsed = start.elapsed().as_secs_f64();
+        let (decode_tps, total_tps) = bench_sample_rates(result.completion_tokens, elapsed, ttft);
         ttft_sum += ttft;
-        tps_sum += result.completion_tokens as f64 / elapsed;
-        last_tokens = result.completion_tokens;
+        decode_tps_sum += decode_tps;
+        total_tps_sum += total_tps;
+        total_ms_sum += elapsed * 1000.0;
+        prompt_token_sum += u64::from(result.prompt_tokens);
+        completion_token_sum += u64::from(result.completion_tokens);
         let sample = phys_footprint_mb();
         if sample > mem_peak {
             mem_peak = sample;
         }
     }
 
-    let avg_tps = tps_sum / runs as f64;
     Ok(BenchResult {
         format_name,
+        prompt_tokens: average_tokens(prompt_token_sum, runs),
+        completion_tokens: average_tokens(completion_token_sum, runs),
         ttft_ms: ttft_sum / runs as f64,
-        tokens_per_sec: avg_tps,
-        total_ms: last_tokens as f64 / avg_tps * 1000.0,
-        tokens: last_tokens,
+        decode_tokens_per_sec: decode_tps_sum / runs as f64,
+        total_tokens_per_sec: total_tps_sum / runs as f64,
+        total_ms: total_ms_sum / runs as f64,
         mem_peak_mb: mem_peak,
     })
+}
+
+fn bench_sample_rates(completion_tokens: u32, total_seconds: f64, ttft_ms: f64) -> (f64, f64) {
+    if completion_tokens == 0 || total_seconds <= 0.0 {
+        return (0.0, 0.0);
+    }
+
+    let tokens = completion_tokens as f64;
+    let total_tps = tokens / total_seconds;
+    let decode_seconds = total_seconds - ttft_ms / 1000.0;
+    let decode_tps = if decode_seconds > 0.0 {
+        tokens / decode_seconds
+    } else {
+        0.0
+    };
+    (decode_tps, total_tps)
+}
+
+fn average_tokens(sum: u64, runs: u32) -> u32 {
+    ((sum as f64 / runs as f64).round()).min(u32::MAX as f64) as u32
 }
 
 fn format_mem(mb: f64) -> String {
@@ -287,13 +335,16 @@ fn format_mem(mb: f64) -> String {
 }
 
 fn print_bench_row(label: &str, r: &BenchResult) {
-    let label = if label.len() > 40 { &label[..40] } else { label };
+    let label = if label.len() > 36 { &label[..36] } else { label };
+    let tokens = format!("{}/{}", r.prompt_tokens, r.completion_tokens);
     println!(
-        "{:<40} {:>4} {:>8.0}ms {:>8.1} {:>7.2}s {:>6}",
+        "{:<36} {:>4} {:>9} {:>7.0}ms {:>9.1} {:>9.1} {:>7.2}s {:>6}",
         label,
         r.format_name,
+        tokens,
         r.ttft_ms,
-        r.tokens_per_sec,
+        r.decode_tokens_per_sec,
+        r.total_tokens_per_sec,
         r.total_ms / 1000.0,
         format_mem(r.mem_peak_mb),
     );
@@ -353,8 +404,9 @@ async fn main() -> anyhow::Result<()> {
                 mem.total_ram as f64 / GB,
                 mem.available_ram as f64 / GB,
             );
+            let manager_budget = manager_memory_budget(budget.as_deref(), mem.budget);
             let mut manager =
-                spindll::engine::ModelManager::new(ctx_size, gpu_layers, mem.budget)?;
+                spindll::engine::ModelManager::new(ctx_size, gpu_layers, manager_budget)?;
 
             if let Some(cache_size) = kv_cache {
                 let bytes = parse_size_bytes(cache_size.as_deref());
@@ -407,46 +459,30 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run {
             model,
             prompt,
+            ctx_size,
+            budget,
             kv_cache,
         } => {
             let store = spindll::model_store::ModelStore::new(None);
-            let format = store.resolve_model_format(&model)?;
             let model_path = store.resolve_model_path(&model)?;
+            let digest = store.resolve_model_digest(&model).unwrap_or_default();
             let params = spindll::engine::GenerateParams::default();
+            let mem = spindll::scheduler::budget::MemoryBudget::detect(budget.as_deref());
+            let manager_budget = manager_memory_budget(budget.as_deref(), mem.budget);
+            let mut manager = spindll::engine::ModelManager::new(ctx_size, None, manager_budget)?;
 
-            use spindll::model_store::registry::ModelFormat;
-            if kv_cache.is_some() && format == ModelFormat::Gguf {
-                // KV cache path: use Engine directly (GGUF-only feature)
-                let mut engine = spindll::engine::Engine::load(&model_path, None, 2048)?;
-                if let Some(cache_size) = kv_cache {
-                    let bytes = parse_size_bytes(cache_size.as_deref());
-                    let digest = store.resolve_model_digest(&model).unwrap_or_default();
-                    engine.set_model_digest(digest);
-                    engine.enable_kv_cache(bytes);
-                }
-                engine.generate(&prompt, &params, |token| {
-                    use std::io::Write;
-                    print!("{token}");
-                    std::io::stdout().flush().ok();
-                    true
-                })?;
-            } else {
-                let backend = backend_for_format(&format)?;
-                let backend_model = backend.load_model(
-                    &model_path,
-                    spindll::backend::BackendLoadParams {
-                        n_ctx: 2048,
-                        n_gpu_layers: None,
-                        memory_budget: 0,
-                    },
-                )?;
-                backend_model.generate(&prompt, &params, &mut |token| {
-                    use std::io::Write;
-                    print!("{token}");
-                    std::io::stdout().flush().ok();
-                    true
-                })?;
+            if let Some(cache_size) = kv_cache {
+                let bytes = parse_size_bytes(cache_size.as_deref());
+                manager.enable_kv_cache(bytes);
             }
+
+            manager.load_model_with_digest(&model, &model_path, None, digest)?;
+            manager.generate(&model, &prompt, &params, None, |token| {
+                use std::io::Write;
+                print!("{token}");
+                std::io::stdout().flush().ok();
+                true
+            })?;
             println!();
         }
         Commands::Bench {
@@ -469,8 +505,8 @@ async fn main() -> anyhow::Result<()> {
             );
             println!("{}", "─".repeat(80));
             println!(
-                "{:<40} {:>4} {:>9} {:>9} {:>8} {:>6}",
-                "MODEL", "FMT", "TTFT", "TOK/S", "TOTAL", "MEM"
+                "{:<36} {:>4} {:>9} {:>8} {:>9} {:>9} {:>8} {:>6}",
+                "MODEL", "FMT", "P/C TOK", "TTFT", "DEC/S", "TOTAL/S", "TOTAL", "MEM"
             );
             println!("{}", "─".repeat(80));
 
@@ -479,6 +515,11 @@ async fn main() -> anyhow::Result<()> {
             let r1 = bench_by_format(&path1, fmt1, prompt_str, max_tokens, runs, ctx_size)?;
             print_bench_row(&model, &r1);
 
+            let Some(against) = against else {
+                println!("{}", "─".repeat(80));
+                return Ok(());
+            };
+
             let path2 = store.resolve_model_path(&against)?;
             let fmt2 = store.resolve_model_format(&against)?;
             let r2 = bench_by_format(&path2, fmt2, prompt_str, max_tokens, runs, ctx_size)?;
@@ -486,7 +527,7 @@ async fn main() -> anyhow::Result<()> {
 
             println!("{}", "─".repeat(80));
 
-            let tps_ratio = r2.tokens_per_sec / r1.tokens_per_sec;
+            let tps_ratio = r2.total_tokens_per_sec / r1.total_tokens_per_sec;
             let ttft_ratio = r1.ttft_ms / r2.ttft_ms;
 
             let (faster_label, slower_label, tps_pct, ttft_pct) = if tps_ratio >= 1.0 {
@@ -516,7 +557,7 @@ async fn main() -> anyhow::Result<()> {
                 slower_label
             };
             println!(
-                "{} is {:.0}% faster throughput, {:.0}% faster TTFT vs {}",
+                "{} is {:.0}% faster total throughput, {:.0}% faster TTFT vs {}",
                 fl, tps_pct, ttft_pct, sl,
             );
         }
@@ -556,8 +597,8 @@ async fn main() -> anyhow::Result<()> {
                 println!("no models loaded");
             } else {
                 println!(
-                    "{:<35} {:>10} {:>6}  {}",
-                    "MODEL", "MEMORY", "GPU", "DIGEST"
+                    "{:<35} {:>10} {:>6}  DIGEST",
+                    "MODEL", "MEMORY", "GPU"
                 );
                 println!("{}", "-".repeat(75));
                 for m in &resp.models {
@@ -609,4 +650,36 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manager_memory_budget_preserves_zero_as_total_ram_mode() {
+        assert_eq!(manager_memory_budget(Some("0"), 123), 0);
+    }
+
+    #[test]
+    fn manager_memory_budget_uses_detected_live_budget_when_omitted() {
+        assert_eq!(manager_memory_budget(None, 123), 123);
+    }
+
+    #[test]
+    fn manager_memory_budget_uses_detected_cap_for_explicit_size() {
+        assert_eq!(manager_memory_budget(Some("8G"), 123), 123);
+    }
+
+    #[test]
+    fn bench_sample_rates_split_decode_from_total_elapsed() {
+        let (decode_tps, total_tps) = bench_sample_rates(128, 5.859_230_309, 42.624_710);
+        assert!((total_tps - 21.85).abs() < 0.01);
+        assert!((decode_tps - 22.01).abs() < 0.01);
+    }
+
+    #[test]
+    fn average_tokens_rounds_across_runs() {
+        assert_eq!(average_tokens(385, 3), 128);
+    }
 }

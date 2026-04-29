@@ -5,7 +5,7 @@
 //! Supports multi-model concurrency with LRU eviction, continuous batching,
 //! encrypted KV caching, and configurable memory budgets.
 //!
-//! The default library includes the gRPC server so embedders (e.g. Parley)
+//! The default library includes the gRPC server so embedders
 //! can start it in-process. The `cli` feature adds the standalone binary extras
 //! (argument parsing, pretty logging). The `http` feature adds an HTTP/SSE server
 //! with an OpenAI-compatible `/v1` API for use with AnythingLLM, Open WebUI, etc.

@@ -226,7 +226,7 @@ pub fn save_state_to_disk(
             let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
             let ciphertext = cipher
                 .encrypt(&nonce, data)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
             let mut buf = Vec::with_capacity(1 + 12 + ciphertext.len());
             buf.push(ENCRYPTED_MAGIC);
             buf.extend_from_slice(&nonce);

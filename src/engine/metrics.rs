@@ -85,6 +85,12 @@ impl Metrics {
     }
 }
 
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MetricsSnapshot {
     /// KV cache hit rate as a fraction in `[0.0, 1.0]`. Returns 0.0 if no requests recorded.
     pub fn cache_hit_rate(&self) -> f32 {
