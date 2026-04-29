@@ -142,9 +142,8 @@ public func mlxGenerate(
                         let shouldContinue = chunk.withCString { ptr in
                             callback(ptr, callbackCtx)
                         }
-                        // Caller dropped the receiver — stop driving GPU
-                        // compute instead of running the loop to EOS while
-                        // discarding chunks (Codex #4).
+                        // Caller dropped -- break instead of decoding to EOS
+                        // and discarding chunks.
                         if shouldContinue == 0 {
                             cancelled = true
                             break

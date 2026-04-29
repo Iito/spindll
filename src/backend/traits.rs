@@ -48,9 +48,7 @@ pub trait BackendModel: Send + Sync {
         false
     }
 
-    /// Per-token KV cache footprint in bytes. Used by `ModelManager` to size
-    /// already-loaded KV usage during eviction. Default is 0 — backends that
-    /// can compute it precisely (e.g. llama.cpp from model metadata) override.
+    /// Per-token KV bytes for eviction sizing. Override when computable.
     fn kv_bytes_per_token(&self) -> u64 {
         0
     }

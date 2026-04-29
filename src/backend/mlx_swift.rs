@@ -73,10 +73,8 @@ impl InferenceBackend for MlxBackend {
     ) -> anyhow::Result<Box<dyn BackendModel>> {
         let mut engine = MlxSwiftEngine::load(path)?;
 
-        // Honor the requested n_ctx if smaller than what config.json reports.
-        // MLX's TokenIterator handles context length dynamically, so this is
-        // purely a bookkeeping clamp — it controls what n_ctx() returns to the
-        // manager, which drives KV-aware eviction sizing in total_loaded_bytes.
+        // Bookkeeping clamp -- TokenIterator handles ctx dynamically, but
+        // n_ctx() drives KV-aware eviction in total_loaded_bytes.
         if params.n_ctx > 0 && params.n_ctx < engine.model_n_ctx {
             engine.model_n_ctx = params.n_ctx;
         }
@@ -108,8 +106,7 @@ pub struct MlxSwiftEngine {
     handle: *mut MlxModelHandle,
     pub model_n_ctx: u32,
     pub model_size_bytes: u64,
-    /// Per-token KV cache footprint, derived from config.json at load.
-    /// 0 if the config lacked enough fields to compute it.
+    /// Per-token KV bytes from config.json. 0 if config incomplete.
     pub kv_bytes_per_token: u64,
 }
 
@@ -187,11 +184,8 @@ impl MlxSwiftEngine {
         params: &GenerateParams,
         on_token: &mut dyn FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
-        // MLX has no disk-backed KV cache (the GGUF code path with
-        // `state_load_file` doesn't apply here), so a prefill request would
-        // otherwise burn full generation work and discard the result. Return
-        // a zero-token no-op so callers (gRPC Prefill on MLX models) don't
-        // silently waste compute (Codex #3).
+        // No disk KV cache on MLX -- prefill would burn full decode then drop
+        // the result. Return zeros so gRPC Prefill is a cheap no-op.
         if params.prefill_only {
             return Ok(GenerateResult {
                 prompt_tokens: 0,

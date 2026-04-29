@@ -111,10 +111,8 @@ impl ModelStore {
     /// Resolve an MLX equivalent for `model` and download it. Errors if no
     /// matching `mlx-community/...` repo is found on HuggingFace.
     fn try_pull_mlx(&self, model: &str, mlx_quant: &str) -> anyhow::Result<PathBuf> {
-        // If the user passed a full HF repo path, try it directly as an MLX
-        // repo before falling back to mlx-community resolution. Lets
-        // `--mlx other-org/some-mlx-repo` actually pull from other-org instead
-        // of silently resolving to a mlx-community lookalike (Codex #2).
+        // Direct probe first when input is a full HF repo path -- lets
+        // `--mlx other-org/foo` pull from other-org, not just mlx-community.
         let candidate = if model.contains('/') {
             mlx_resolve::probe_repo(model)?
                 .map(Ok)
@@ -141,11 +139,8 @@ impl ModelStore {
         };
 
         let (architecture, model_name) = download::read_mlx_metadata(&path);
-        // For Ollama-style aliases ("llama3.1:8b") we stamp the normalized alias
-        // ("llama3.1-8b") as base_model so resolve_key's step-5 alias match
-        // ("model.replace(':', '-')") finds this MLX entry. Without this, the
-        // alias is unresolvable after pull because the registry key is the
-        // mlx-community/... repo and resolve_key has no other path back.
+        // Stamp normalized alias ("llama3.1:8b" -> "llama3.1-8b") as base_model
+        // so resolve_key step 5 matches. Otherwise alias unresolvable post-pull.
         let base_model = if !model.contains('/') && model.contains(':') {
             model.replace(':', "-")
         } else {
@@ -177,10 +172,8 @@ impl ModelStore {
         Ok(path)
     }
 
-    /// Pull a GGUF model (the original path).
-    ///
-    /// `strict_gguf = true` rejects HF repos that resolve to MLX-only contents,
-    /// so `--gguf` does not silently land an MLX directory (Codex #2).
+    /// Pull a GGUF model. `strict_gguf=true` rejects MLX-only repos so
+    /// `--gguf` does not silently land MLX safetensors.
     fn pull_gguf(&self, model: &str, quant: Option<&str>, strict_gguf: bool) -> anyhow::Result<PathBuf> {
         let is_hf = model.contains('/');
 
@@ -480,7 +473,7 @@ impl ModelStore {
             .ok_or_else(|| anyhow::anyhow!("model '{}' not found", model))?;
 
         if entry.path.exists() {
-            // MLX entries are directories of safetensors shards + config; GGUF is a single file.
+            // MLX = dir, GGUF = file.
             match entry.format {
                 registry::ModelFormat::Mlx => std::fs::remove_dir_all(&entry.path)?,
                 registry::ModelFormat::Gguf => std::fs::remove_file(&entry.path)?,
@@ -598,10 +591,8 @@ mod tests {
         }
     }
 
-    /// Regression for Codex finding #1: pulling `llama3.1:8b --mlx` registers
-    /// under the mlx-community key, and `spindll run llama3.1:8b` must still
-    /// find it. The MLX pull path now stamps the normalized alias as
-    /// `base_model` so resolve_key step 5 hits.
+    /// Regression: alias must resolve when registry key is mlx-community/...
+    /// Pull stamps normalized alias as base_model; this exercises the read side.
     #[test]
     fn resolve_key_finds_mlx_by_ollama_alias() {
         let dir = tempfile::tempdir().unwrap();
@@ -617,15 +608,14 @@ mod tests {
         assert_eq!(resolved, "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit");
     }
 
-    /// Regression for Codex finding #5: removing an MLX entry must use
-    /// remove_dir_all, not remove_file (which errors on directories).
+    /// Regression: MLX entry uses remove_dir_all (remove_file errors on dirs).
     #[test]
     fn remove_mlx_handles_directory() {
         let dir = tempfile::tempdir().unwrap();
         let store = ModelStore::new(Some(dir.path().to_path_buf()));
         std::fs::create_dir_all(store.models_dir()).unwrap();
 
-        // Real on-disk MLX layout: dir with a config + safetensors shard.
+        // Real MLX layout: config + safetensors shard.
         let model_dir = store.models_dir().join("mlx-community/test-4bit");
         std::fs::create_dir_all(&model_dir).unwrap();
         std::fs::write(model_dir.join("config.json"), "{}").unwrap();
