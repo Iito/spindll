@@ -15,7 +15,7 @@ required-features = ["cli"]
 
 [features]
 # cli adds the standalone binary extras (argument parsing, pretty logging).
-# The gRPC server is part of the default library — parley needs it.
+# The gRPC server is part of the default library for embedders.
 cli = [
     "dep:clap",
     "dep:tracing-subscriber",
