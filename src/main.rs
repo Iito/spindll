@@ -183,12 +183,13 @@ struct BenchResult {
     mem_peak_mb: f64,
 }
 
-/// Resident memory of this process in MB. Cross-platform via sysinfo.
+/// Resident memory of this process in MB. Uses `memory-stats` which wraps
+/// task_info on macOS, /proc on Linux, GetProcessMemoryInfo on Windows --
+/// ~370 ns/call, no self-pollution. (sysinfo::System::new_all takes ~5 ms
+/// and inflates RSS by ~5 MB per call: see tools/mem_bench/.)
 fn phys_footprint_mb() -> f64 {
-    let sys = sysinfo::System::new_all();
-    let pid = sysinfo::Pid::from_u32(std::process::id());
-    sys.process(pid)
-        .map(|p| p.memory() as f64 / (1024.0 * 1024.0))
+    memory_stats::memory_stats()
+        .map(|s| s.physical_mem as f64 / (1024.0 * 1024.0))
         .unwrap_or(0.0)
 }
 
