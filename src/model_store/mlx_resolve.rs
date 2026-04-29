@@ -92,7 +92,7 @@ fn resolve_base_name(model_name: &str) -> String {
 }
 
 /// Check if a specific repo exists on HuggingFace and looks like a valid MLX model.
-fn probe_repo(repo_id: &str) -> anyhow::Result<Option<MlxCandidate>> {
+pub fn probe_repo(repo_id: &str) -> anyhow::Result<Option<MlxCandidate>> {
     let api = Api::new()?;
     let repo = api.model(repo_id.to_string());
 

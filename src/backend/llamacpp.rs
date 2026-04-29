@@ -203,6 +203,10 @@ impl BackendModel for LlamaCppModel {
         true
     }
 
+    fn kv_bytes_per_token(&self) -> u64 {
+        kv_bytes_per_token(&self.model)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

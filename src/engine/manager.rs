@@ -44,7 +44,7 @@ pub struct LoadedModel {
 
 /// Multi-model manager with LRU eviction and memory budgeting.
 ///
-/// This is the primary entry point for Parley: load models by name, run inference,
+/// Primary entry point for spindll: load models by name, run inference,
 /// and let the manager handle eviction when memory is tight.
 pub struct ModelManager {
     backends: Vec<Box<dyn InferenceBackend>>,
@@ -114,13 +114,7 @@ impl ModelManager {
             .read()
             .unwrap()
             .values()
-            .map(|m| {
-                let kv = m.model.as_any()
-                    .downcast_ref::<LlamaCppModel>()
-                    .map(|lm| kv_bytes_for(lm.llama_model(), m.n_ctx))
-                    .unwrap_or(0);
-                m.size_bytes + kv
-            })
+            .map(|m| m.size_bytes + m.model.kv_bytes_per_token() * m.n_ctx as u64)
             .sum()
     }
 
@@ -573,9 +567,5 @@ impl ModelManager {
         *loaded.last_used.write().unwrap() = Instant::now();
         loaded.model.apply_chat_template(messages)
     }
-}
-
-fn kv_bytes_for(model: &LlamaModel, n_ctx: u32) -> u64 {
-    crate::backend::llamacpp::kv_bytes_per_token(model) * n_ctx as u64
 }
 
