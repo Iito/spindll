@@ -133,23 +133,28 @@ public func mlxGenerate(
                     }
                 }
 
-                var stopped = false
+                var cancelled = false
                 while let tokenId = iterator.next() {
                     if stopTokenIds.contains(tokenId) { break }
                     generated += 1
                     detokenizer.append(token: tokenId)
-                    if stopped { continue }
                     if let chunk = detokenizer.next() {
                         let shouldContinue = chunk.withCString { ptr in
                             callback(ptr, callbackCtx)
                         }
-                        if shouldContinue == 0 { stopped = true }
+                        // Caller dropped the receiver — stop driving GPU
+                        // compute instead of running the loop to EOS while
+                        // discarding chunks (Codex #4).
+                        if shouldContinue == 0 {
+                            cancelled = true
+                            break
+                        }
                     }
                 }
 
                 // Flush any partial-UTF-8 bytes the detokenizer was holding
                 // back (e.g. when the loop hits maxTokens mid-codepoint).
-                if !stopped, let chunk = detokenizer.next() {
+                if !cancelled, let chunk = detokenizer.next() {
                     _ = chunk.withCString { ptr in callback(ptr, callbackCtx) }
                 }
 

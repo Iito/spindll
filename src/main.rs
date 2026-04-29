@@ -51,7 +51,7 @@ enum Commands {
         #[arg(long)]
         gpu_layers: Option<u32>,
 
-        /// Memory budget for loaded models (e.g. "8G", omit for 80% of available RAM)
+        /// Memory budget for loaded models (e.g. "8G", omit for full live availability)
         #[arg(long)]
         budget: Option<String>,
 
@@ -179,18 +179,18 @@ struct BenchResult {
     ttft_ms: f64,
     tokens_per_sec: f64,
     total_ms: f64,
-    tokens: u32,
     mem_peak_mb: f64,
 }
 
 #[cfg(target_os = "macos")]
+#[allow(deprecated)] // libc::mach_task_self_ is fine for our needs; mach2 crate would be scope creep.
 fn phys_footprint_mb() -> f64 {
     use std::mem;
     unsafe {
         let mut info: libc::mach_task_basic_info = mem::zeroed();
         let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
         let ret = libc::task_info(
-            libc::mach_task_self(),
+            libc::mach_task_self_,
             libc::MACH_TASK_BASIC_INFO as libc::task_flavor_t,
             &mut info as *mut libc::mach_task_basic_info as libc::task_info_t,
             &mut count,
@@ -270,7 +270,6 @@ fn bench_by_format(
         ttft_ms: ttft_sum / runs as f64,
         tokens_per_sec: avg_tps,
         total_ms: last_tokens as f64 / avg_tps * 1000.0,
-        tokens: last_tokens,
         mem_peak_mb: mem_peak,
     })
 }

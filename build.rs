@@ -109,10 +109,6 @@ fn compile_mlx_metallib(manifest_dir: &str) -> Result<(), Box<dyn std::error::Er
     // Compile each .metal → .air in OUT_DIR.
     let mut air_files: Vec<PathBuf> = Vec::new();
     for metal_file in &metal_files {
-        let stem = metal_file
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or("invalid metal filename")?;
         // Disambiguate files with the same stem in different subdirs.
         let rel = metal_file.strip_prefix(&metal_src)?.to_string_lossy();
         let safe_name = rel.replace(['/', '\\', '.'], "_");
