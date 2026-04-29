@@ -25,6 +25,12 @@ pub struct MetricsSnapshot {
     pub generate_errors: u64,
 }
 
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Metrics {
     /// Create a new metrics instance with all counters at zero.
     pub fn new() -> Self {

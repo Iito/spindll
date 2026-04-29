@@ -61,6 +61,8 @@ pub struct LoadedModel {
     pub n_ctx_train: u32,
     /// Approximate memory footprint in bytes.
     pub size_bytes: u64,
+    /// Memory used by the batch scheduler's GGUF model copy (0 if no scheduler).
+    pub scheduler_size_bytes: u64,
     /// Timestamp of the last inference request (used for LRU eviction).
     pub last_used: RwLock<Instant>,
     /// Number of layers offloaded to GPU.
@@ -87,16 +89,16 @@ struct PendingReload {
     idle_reload: Duration,
 }
 
-/// Multi-model manager with LRU eviction and memory budgeting.
+/// Multi-model manager with LRU memory budgeting.
 ///
-/// Primary entry point for spindll: load models by name, run inference,
-/// and let the manager handle eviction when memory is tight.
+/// Load by name, run inference, evict when tight.
 pub struct ModelManager {
     backends: Vec<Box<dyn InferenceBackend>>,
     models: RwLock<HashMap<String, LoadedModel>>,
     default_n_ctx: u32,
     default_gpu_layers: u32,
     memory_budget: u64,
+    clamp_budget_to_live: bool,
     kv_cache: Option<KvCache>,
     ram_cache: Option<RamCache>,
     metrics: Arc<Metrics>,
@@ -108,6 +110,24 @@ pub struct ModelManager {
     /// Set by [`ModelManager::into_arc`]; required for idle-reload watchers.
     weak_self: OnceLock<Weak<ModelManager>>,
     watchers: Mutex<HashMap<String, JoinHandle<()>>>,
+}
+
+fn scheduler_weight_bytes(format: &ModelFormat, model_weight: u64, batch_slots: usize) -> u64 {
+    if batch_slots > 0 && *format == ModelFormat::Gguf {
+        model_weight
+    } else {
+        0
+    }
+}
+
+fn planned_load_weight_bytes(model_weight: u64, scheduler_weight: u64) -> u64 {
+    model_weight + scheduler_weight
+}
+
+fn loaded_model_memory_bytes(m: &LoadedModel) -> u64 {
+    m.size_bytes
+        + m.scheduler_size_bytes
+        + m.model.kv_bytes_per_token() * m.n_ctx as u64
 }
 
 /// Bumps `active_requests` for the lifetime of an inference call.
@@ -155,10 +175,10 @@ impl ModelManager {
             }
         });
 
-        let memory_budget = if memory_budget == 0 {
-            sysinfo::System::new_all().total_memory()
+        let (memory_budget, clamp_budget_to_live) = if memory_budget == 0 {
+            (sysinfo::System::new_all().total_memory(), false)
         } else {
-            memory_budget
+            (memory_budget, true)
         };
 
         Ok(Self {
@@ -167,6 +187,7 @@ impl ModelManager {
             default_n_ctx: n_ctx,
             default_gpu_layers,
             memory_budget,
+            clamp_budget_to_live,
             kv_cache: None,
             ram_cache: None,
             metrics: Arc::new(Metrics::new()),
@@ -186,6 +207,7 @@ impl ModelManager {
             default_n_ctx: 2048,
             default_gpu_layers: 0,
             memory_budget,
+            clamp_budget_to_live: memory_budget > 0,
             kv_cache: None,
             ram_cache: None,
             metrics: Arc::new(Metrics::new()),
@@ -217,15 +239,16 @@ impl ModelManager {
             .read()
             .unwrap()
             .values()
-            .map(|m| m.size_bytes + m.model.kv_bytes_per_token() * m.n_ctx as u64)
+            .map(loaded_model_memory_bytes)
             .sum()
     }
 
+    /// Budget for next load. Live budgets clamp to current RAM.
     fn effective_budget(&self) -> u64 {
-        let mem = crate::scheduler::budget::MemoryBudget::detect(None);
-        if self.memory_budget == 0 || self.memory_budget >= mem.total_ram {
+        if !self.clamp_budget_to_live {
             return self.memory_budget;
         }
+        let mem = crate::scheduler::budget::MemoryBudget::detect(None);
         std::cmp::min(self.memory_budget, mem.available_ram)
     }
 
@@ -355,7 +378,10 @@ impl ModelManager {
         } else {
             std::fs::metadata(path)?.len()
         };
-        let pending_reloads = self.evict_for(file_size)?;
+        let planned_scheduler_bytes = scheduler_weight_bytes(&format, file_size, self.batch_slots);
+        let pending_reloads = self.evict_for(
+            planned_load_weight_bytes(file_size, planned_scheduler_bytes),
+        )?;
 
         for spec in pending_reloads {
             self.arm_reload_watcher(spec);
@@ -366,11 +392,12 @@ impl ModelManager {
         // Once weights are mmap'd / uploaded to Metal, available memory drops,
         // so the snapshot has to happen here, not inside the backend.
         let mem = crate::scheduler::budget::MemoryBudget::detect(None);
-        let load_budget = if self.memory_budget == 0 || self.memory_budget >= mem.total_ram {
+        let load_budget = if !self.clamp_budget_to_live {
             self.memory_budget
         } else {
             std::cmp::min(self.memory_budget, mem.available_ram)
         };
+        let load_budget = load_budget.saturating_sub(planned_scheduler_bytes);
 
         let layers = gpu_layers.unwrap_or(self.default_gpu_layers);
 
@@ -392,9 +419,7 @@ impl ModelManager {
         let n_ctx_train = model.n_ctx_train();
         let size_bytes = model.size_bytes();
 
-        // Batch scheduling: GGUF-only, gated on supports_batching().
-        // n_ctx, device, and size are logged from inside `LlamaCppBackend::load_model`
-        // (which has direct access to `LlamaModel::n_layer` and the GPU detection).
+        // Scheduler needs its own GGUF model copy.
         let batch_tx = if self.batch_slots > 0 && model.supports_batching() {
             let (tx, rx) = std::sync::mpsc::channel::<BatchRequest>();
             let max_seq = self.batch_slots;
@@ -421,12 +446,14 @@ impl ModelManager {
             None
         };
 
+        let scheduler_size_bytes = if batch_tx.is_some() { size_bytes } else { 0 };
         let loaded = LoadedModel {
             model,
             file_path: path.to_path_buf(),
             n_ctx,
             n_ctx_train,
             size_bytes,
+            scheduler_size_bytes,
             last_used: RwLock::new(Instant::now()),
             gpu_layers: layers,
             requested_gpu_layers: gpu_layers,
@@ -490,7 +517,7 @@ impl ModelManager {
         self.models.read().unwrap().contains_key(name)
     }
 
-    /// List all loaded models as `(name, size_bytes, gpu_layers, digest, n_ctx, n_ctx_train)` tuples.
+    /// List all loaded models as `(name, memory_bytes, gpu_layers, digest, n_ctx, n_ctx_train)` tuples.
     pub fn loaded_models(&self) -> Vec<(String, u64, u32, String, u32, u32)> {
         self.models
             .read()
@@ -499,7 +526,7 @@ impl ModelManager {
             .map(|(name, m)| {
                 (
                     name.clone(),
-                    m.size_bytes,
+                    loaded_model_memory_bytes(m),
                     m.gpu_layers,
                     m.digest.clone(),
                     m.n_ctx,
@@ -1247,5 +1274,41 @@ mod tests {
             &params, None, |_| { token_count += 1; false },
         );
         assert!(token_count <= 1, "expected at most 1 token, got {token_count}");
+    }
+
+    #[test]
+    fn scheduler_weight_bytes_gguf_with_batch() {
+        assert_eq!(scheduler_weight_bytes(&ModelFormat::Gguf, 1000, 4), 1000);
+    }
+
+    #[test]
+    fn scheduler_weight_bytes_mlx_is_zero() {
+        assert_eq!(scheduler_weight_bytes(&ModelFormat::Mlx, 1000, 4), 0);
+    }
+
+    #[test]
+    fn scheduler_weight_bytes_no_batch_is_zero() {
+        assert_eq!(scheduler_weight_bytes(&ModelFormat::Gguf, 1000, 0), 0);
+    }
+
+    #[test]
+    fn planned_load_includes_scheduler() {
+        assert_eq!(planned_load_weight_bytes(500, 500), 1000);
+    }
+
+    #[test]
+    fn effective_budget_unclamped_when_total_ram_mode() {
+        let mut mgr = test_manager(1_000_000);
+        mgr.clamp_budget_to_live = false;
+        let b = mgr.effective_budget();
+        assert_eq!(b, 1_000_000, "unclamped mode returns stored budget directly");
+    }
+
+    #[test]
+    fn effective_budget_clamped_when_explicit() {
+        let mgr = test_manager(u64::MAX);
+        assert!(mgr.clamp_budget_to_live);
+        let b = mgr.effective_budget();
+        assert!(b < u64::MAX, "clamped mode should cap to available RAM");
     }
 }

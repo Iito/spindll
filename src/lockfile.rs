@@ -20,7 +20,7 @@ impl Lockfile {
             http_port,
         };
         let json = serde_json::to_string(&lock)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         std::fs::write(lockfile_path(), json)
     }
 
