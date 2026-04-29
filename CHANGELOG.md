@@ -48,7 +48,7 @@ All notable changes to this project will be documented in this file.
   backends report weight size only.
 - Context window sizing moved from the manager into each backend's `load_model`, threaded
   through `BackendLoadParams.memory_budget`.
-- `BackendLoadParams` gains a `memory_budget: u64` field; pass `0` for live-tracking auto-mode.
+- `BackendLoadParams` gains a `memory_budget: u64` field; pass `0` for no backend cap.
 - Default memory budget no longer applies a 20% reserve — `available_memory_platform` already
   excludes wired/active pages so the reserve was double-counting OS overhead.
 - `pull` default GGUF picker prefers q4_k_m (was: first file in repo, often fp16).
@@ -57,8 +57,8 @@ All notable changes to this project will be documented in this file.
 
 - `BackendAlreadyInitialized` error on chat requests after engine startup —
   `LlamaBackend::init()` is now a `OnceLock` singleton in `backend::llamacpp`.
-- Context window silently exceeding available memory — `resolve_n_ctx` clamps to
-  `min(budget, available_ram)` and floors at 512 tokens.
+- Context window silently exceeding budget — `resolve_n_ctx` clamps auto context
+  sizing to the backend load budget and floors at 512 tokens.
 - `n_batch == n_ctx` now set in every context-creation site (Engine, BatchScheduler,
   manager's KV-cached path, `LlamaCppModel::generate`) — prevents GGML_ASSERT crashes on
   prompts longer than 512 tokens.

@@ -7,9 +7,7 @@ pub struct BackendLoadParams {
     /// fits weights + KV + compute buffers within `memory_budget`.
     pub n_ctx: u32,
     pub n_gpu_layers: Option<u32>,
-    /// Live memory available for this load (bytes), snapshotted before the
-    /// model's weights are mmap'd. 0 = unlimited. Backends that auto-size
-    /// n_ctx use this as the budget ceiling.
+    /// Live load budget in bytes. 0 = no backend cap.
     pub memory_budget: u64,
 }
 

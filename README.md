@@ -44,7 +44,7 @@ Models are loaded automatically on first request, or explicitly via the `Load` R
 spindll pull <model> [flags]          # pull from Ollama registry or HuggingFace
 spindll list                          # show local models with metadata
 spindll rm <model>                    # delete a local model
-spindll run <model> "prompt"          # one-shot inference (no server)
+spindll run [options] <model> "prompt" # one-shot inference (no server)
 spindll bench <model> <other>         # side-by-side benchmark of two models (any format)
 spindll serve [options]               # start gRPC + HTTP server
 spindll import --from-ollama          # migrate existing Ollama models
@@ -76,6 +76,14 @@ Model names follow Ollama conventions (`llama3.1:8b`, `qwen2:0.5b`) or HuggingFa
 --kv-cache [<SIZE>]        Enable KV cache for prompt prefixes [default: 2G]
 --batch-slots <N>          Concurrent sequence slots per model [default: 0 = disabled]
 --ram-cache [<SIZE>]       Keep recently-evicted models warm in RAM [default: 4G; no-op on macOS]
+```
+
+### Run options
+
+```
+--ctx-size <N>             Context window [default: 0 = budget-safe auto]
+--budget <SIZE>            Memory budget, e.g. "8G"; omit=live RAM, "0"=total RAM
+--kv-cache [<SIZE>]        Enable KV cache for prompt prefixes [default: 2G]
 ```
 
 While `serve` is running it writes a JSON lockfile (`pid`, `grpc_port`, `http_port`) to the system temp dir. `spindll status` reads this file to auto-detect the port, so `--port` is optional when a local server is running. Stale lockfiles are cleaned automatically when the referenced PID is no longer alive.

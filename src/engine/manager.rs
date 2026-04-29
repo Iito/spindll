@@ -16,7 +16,9 @@ use super::batch::{BatchEvent, BatchRequest, BatchScheduler};
 use super::kv_cache::KvCache;
 use super::metrics::Metrics;
 use super::ram_cache::RamCache;
-use super::streaming::{GenerateParams, GenerateResult, generate_streaming_cached};
+use super::streaming::{
+    CachedGenerateRequest, GenerateParams, GenerateResult, generate_streaming_cached,
+};
 
 /// A model that has been loaded into memory and is ready for inference.
 pub struct LoadedModel {
@@ -30,6 +32,8 @@ pub struct LoadedModel {
     pub n_ctx_train: u32,
     /// Approximate memory footprint in bytes.
     pub size_bytes: u64,
+    /// Batch scheduler GGUF weight copy.
+    pub scheduler_size_bytes: u64,
     /// Timestamp of the last inference request (used for LRU eviction).
     pub last_used: RwLock<Instant>,
     /// Number of layers offloaded to GPU.
@@ -42,16 +46,16 @@ pub struct LoadedModel {
     pub batch_tx: Option<std::sync::mpsc::Sender<BatchRequest>>,
 }
 
-/// Multi-model manager with LRU eviction and memory budgeting.
+/// Multi-model manager with LRU memory budgeting.
 ///
-/// This is the primary entry point for Parley: load models by name, run inference,
-/// and let the manager handle eviction when memory is tight.
+/// Load by name, run inference, evict when tight.
 pub struct ModelManager {
     backends: Vec<Box<dyn InferenceBackend>>,
     models: RwLock<HashMap<String, LoadedModel>>,
     default_n_ctx: u32,
     default_gpu_layers: u32,
     memory_budget: u64,
+    clamp_budget_to_live: bool,
     kv_cache: Option<KvCache>,
     ram_cache: Option<RamCache>,
     metrics: Arc<Metrics>,
@@ -59,19 +63,16 @@ pub struct ModelManager {
 }
 
 impl ModelManager {
-    /// Create a new manager. Pass `gpu_layers = None` to auto-detect (all layers on macOS Metal,
-    /// CPU-only elsewhere). Pass `memory_budget = 0` to use total physical RAM as the cap
-    /// (recommended on Apple Silicon's unified memory).
+    /// Create a manager. `memory_budget = 0` means total RAM cap.
     pub fn new(n_ctx: u32, gpu_layers: Option<u32>, memory_budget: u64) -> anyhow::Result<Self> {
         #[allow(unused_mut)]
-        let mut backends: Vec<Box<dyn InferenceBackend>> = vec![
-            Box::new(crate::backend::llamacpp::LlamaCppBackend::new()?),
-        ];
+        let mut backends: Vec<Box<dyn InferenceBackend>> =
+            vec![Box::new(crate::backend::llamacpp::LlamaCppBackend::new()?)];
 
         #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
         backends.push(Box::new(crate::backend::mlx_swift::MlxBackend));
 
-        let default_gpu_layers = gpu_layers.unwrap_or_else(|| {
+        let default_gpu_layers = gpu_layers.unwrap_or({
             if cfg!(target_os = "macos")
                 || cfg!(feature = "cuda")
                 || cfg!(feature = "metal")
@@ -83,10 +84,10 @@ impl ModelManager {
             }
         });
 
-        let memory_budget = if memory_budget == 0 {
-            sysinfo::System::new_all().total_memory()
+        let (memory_budget, clamp_budget_to_live) = if memory_budget == 0 {
+            (sysinfo::System::new_all().total_memory(), false)
         } else {
-            memory_budget
+            (memory_budget, true)
         };
 
         Ok(Self {
@@ -95,6 +96,7 @@ impl ModelManager {
             default_n_ctx: n_ctx,
             default_gpu_layers,
             memory_budget,
+            clamp_budget_to_live,
             kv_cache: None,
             ram_cache: None,
             metrics: Arc::new(Metrics::new()),
@@ -114,25 +116,14 @@ impl ModelManager {
             .read()
             .unwrap()
             .values()
-            .map(|m| {
-                let kv = m.model.as_any()
-                    .downcast_ref::<LlamaCppModel>()
-                    .map(|lm| kv_bytes_for(lm.llama_model(), m.n_ctx))
-                    .unwrap_or(0);
-                m.size_bytes + kv
-            })
+            .map(loaded_model_memory_bytes)
             .sum()
     }
 
-    /// Effective budget for the next load: the configured cap, lowered to
-    /// what the system can actually provide right now. We use `available_ram`
-    /// (free + inactive + purgeable on macOS) — KV/n_ctx headroom is handled
-    /// per-backend (`LlamaCppBackend::resolve_n_ctx` reads it from
-    /// `BackendLoadParams.memory_budget`), and the `--budget 0` (total RAM)
-    /// opt-in must not be silently downgraded.
+    /// Budget for next load. Live budgets clamp to current RAM.
     fn effective_budget(&self) -> u64 {
-        if self.memory_budget == 0 {
-            return 0; // unlimited
+        if !self.clamp_budget_to_live {
+            return self.memory_budget;
         }
         let live = crate::scheduler::budget::MemoryBudget::detect(None).available_ram;
         std::cmp::min(self.memory_budget, live)
@@ -142,7 +133,7 @@ impl ModelManager {
     fn evict_for(&self, needed: u64) -> anyhow::Result<()> {
         let budget = self.effective_budget();
         if budget == 0 {
-            return Ok(()); // unlimited
+            return Ok(());
         }
 
         loop {
@@ -220,11 +211,7 @@ impl ModelManager {
         let format = Self::infer_format(path);
         let backend = self.backend_for_format(&format)?;
 
-        let from_ram_cache = self
-            .ram_cache
-            .as_ref()
-            .and_then(|c| c.get(name))
-            .is_some();
+        let from_ram_cache = self.ram_cache.as_ref().and_then(|c| c.get(name)).is_some();
 
         let file_size = if path.is_dir() {
             std::fs::read_dir(path)?
@@ -235,19 +222,20 @@ impl ModelManager {
         } else {
             std::fs::metadata(path)?.len()
         };
-        self.evict_for(file_size)?;
+        let planned_scheduler_bytes = scheduler_weight_bytes(&format, file_size, self.batch_slots);
+        self.evict_for(planned_load_weight_bytes(
+            file_size,
+            planned_scheduler_bytes,
+        ))?;
 
-        // Snapshot live availability BEFORE the load so the backend can
-        // budget-resolve n_ctx against memory not yet consumed by weights.
-        // Once weights are mmap'd / uploaded to Metal, available memory drops,
-        // so the snapshot has to happen here, not inside the backend.
-        let available_before =
-            crate::scheduler::budget::MemoryBudget::detect(None).available_ram;
-        let load_budget = if self.memory_budget > 0 {
+        // Snapshot before weights consume live RAM.
+        let available_before = crate::scheduler::budget::MemoryBudget::detect(None).available_ram;
+        let load_budget = if self.clamp_budget_to_live {
             std::cmp::min(self.memory_budget, available_before)
         } else {
-            available_before
+            self.memory_budget
         };
+        let load_budget = load_budget.saturating_sub(planned_scheduler_bytes);
 
         let layers = gpu_layers.unwrap_or(self.default_gpu_layers);
 
@@ -259,20 +247,17 @@ impl ModelManager {
 
         let model = backend.load_model(path, load_params)?;
 
-        if from_ram_cache {
-            if let Some(cache) = &self.ram_cache {
-                cache.remove(name);
-            }
+        if let (true, Some(cache)) = (from_ram_cache, &self.ram_cache) {
+            cache.remove(name);
         }
 
         let n_ctx = model.n_ctx();
         let n_ctx_train = model.n_ctx_train();
         let size_bytes = model.size_bytes();
 
-        // Batch scheduling: GGUF-only, gated on supports_batching().
-        // n_ctx, device, and size are logged from inside `LlamaCppBackend::load_model`
-        // (which has direct access to `LlamaModel::n_layer` and the GPU detection).
-        let batch_tx = if self.batch_slots > 0 && model.supports_batching() {
+        // Scheduler needs its own GGUF model.
+        let (batch_tx, scheduler_size_bytes) = if self.batch_slots > 0 && model.supports_batching()
+        {
             let (tx, rx) = std::sync::mpsc::channel::<BatchRequest>();
             let max_seq = self.batch_slots;
             let model_name = name.to_string();
@@ -281,6 +266,7 @@ impl ModelManager {
             let sched_params = LlamaModelParams::default().with_n_gpu_layers(layers);
             let sched_model = LlamaModel::load_from_file(sched_backend, path, &sched_params)
                 .map_err(|e| anyhow::anyhow!("failed to load scheduler model: {e}"))?;
+            let scheduler_size_bytes = sched_model.size();
 
             std::thread::Builder::new()
                 .name(format!("batch-{model_name}"))
@@ -293,9 +279,9 @@ impl ModelManager {
                 })?;
 
             tracing::info!(name, slots = max_seq, "batch scheduler started");
-            Some(tx)
+            (Some(tx), scheduler_size_bytes)
         } else {
-            None
+            (None, 0)
         };
 
         let loaded = LoadedModel {
@@ -304,6 +290,7 @@ impl ModelManager {
             n_ctx,
             n_ctx_train,
             size_bytes,
+            scheduler_size_bytes,
             last_used: RwLock::new(Instant::now()),
             gpu_layers: layers,
             digest,
@@ -311,7 +298,10 @@ impl ModelManager {
             batch_tx,
         };
 
-        self.models.write().unwrap().insert(name.to_string(), loaded);
+        self.models
+            .write()
+            .unwrap()
+            .insert(name.to_string(), loaded);
         Ok(())
     }
 
@@ -335,7 +325,7 @@ impl ModelManager {
         self.models.read().unwrap().contains_key(name)
     }
 
-    /// List all loaded models as `(name, size_bytes, gpu_layers, digest, n_ctx, n_ctx_train)` tuples.
+    /// List all loaded models as `(name, memory_bytes, gpu_layers, digest, n_ctx, n_ctx_train)` tuples.
     pub fn loaded_models(&self) -> Vec<(String, u64, u32, String, u32, u32)> {
         self.models
             .read()
@@ -344,7 +334,7 @@ impl ModelManager {
             .map(|(name, m)| {
                 (
                     name.clone(),
-                    m.size_bytes,
+                    loaded_model_memory_bytes(m),
                     m.gpu_layers,
                     m.digest.clone(),
                     m.n_ctx,
@@ -435,8 +425,11 @@ impl ModelManager {
                     "generation complete"
                 );
                 if params.prefill_only {
-                    self.metrics
-                        .record_prefill(stats.prompt_tokens as u64, elapsed_us, stats.cache_hit);
+                    self.metrics.record_prefill(
+                        stats.prompt_tokens as u64,
+                        elapsed_us,
+                        stats.cache_hit,
+                    );
                 } else {
                     self.metrics.record_generate(
                         stats.prompt_tokens as u64,
@@ -529,29 +522,31 @@ impl ModelManager {
         *loaded.last_used.write().unwrap() = Instant::now();
 
         // KV cache path: GGUF models with cache enabled get the cached generate path.
-        if let Some(cache) = &self.kv_cache {
-            if let Some(llama) = loaded.model.as_any().downcast_ref::<LlamaCppModel>() {
-                // n_batch == n_ctx so prefill batches always fit. Default n_batch=512
-                // hits GGML_ASSERT and crashes on prompts longer than 512 tokens.
-                let ctx_params = LlamaContextParams::default()
-                    .with_n_ctx(NonZeroU32::new(loaded.n_ctx))
-                    .with_n_batch(loaded.n_ctx);
-                let mut ctx = llama
-                    .llama_model()
-                    .new_context(llama.llama_backend(), ctx_params)
-                    .map_err(|e| anyhow::anyhow!("failed to create context: {e}"))?;
-                return generate_streaming_cached(
-                    llama.llama_model(),
-                    &mut ctx,
+        if let (Some(cache), Some(llama)) = (
+            &self.kv_cache,
+            loaded.model.as_any().downcast_ref::<LlamaCppModel>(),
+        ) {
+            // Avoid llama.cpp's 512-token default batch cap.
+            let ctx_params = LlamaContextParams::default()
+                .with_n_ctx(NonZeroU32::new(loaded.n_ctx))
+                .with_n_batch(loaded.n_ctx);
+            let mut ctx = llama
+                .llama_model()
+                .new_context(llama.llama_backend(), ctx_params)
+                .map_err(|e| anyhow::anyhow!("failed to create context: {e}"))?;
+            return generate_streaming_cached(
+                CachedGenerateRequest {
+                    model: llama.llama_model(),
+                    ctx: &mut ctx,
                     prompt,
                     params,
                     model_name,
-                    &loaded.digest,
+                    model_digest: &loaded.digest,
                     cache,
                     encryption_key,
-                    on_token,
-                );
-            }
+                },
+                on_token,
+            );
         }
 
         loaded.model.generate(prompt, params, on_token)
@@ -579,3 +574,191 @@ fn kv_bytes_for(model: &LlamaModel, n_ctx: u32) -> u64 {
     crate::backend::llamacpp::kv_bytes_per_token(model) * n_ctx as u64
 }
 
+fn loaded_model_memory_bytes(model: &LoadedModel) -> u64 {
+    let kv = model
+        .model
+        .as_any()
+        .downcast_ref::<LlamaCppModel>()
+        .map(|lm| kv_bytes_for(lm.llama_model(), model.n_ctx))
+        .unwrap_or(0);
+
+    model
+        .size_bytes
+        .saturating_add(model.scheduler_size_bytes)
+        .saturating_add(kv)
+}
+
+fn scheduler_weight_bytes(
+    format: &ModelFormat,
+    model_weight_bytes: u64,
+    batch_slots: usize,
+) -> u64 {
+    if batch_slots > 0 && *format == ModelFormat::Gguf {
+        model_weight_bytes
+    } else {
+        0
+    }
+}
+
+fn planned_load_weight_bytes(model_weight_bytes: u64, scheduler_weight_bytes: u64) -> u64 {
+    model_weight_bytes.saturating_add(scheduler_weight_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::any::Any;
+
+    struct DummyModel;
+
+    impl BackendModel for DummyModel {
+        fn generate(
+            &self,
+            _prompt: &str,
+            _params: &GenerateParams,
+            _on_token: &mut dyn FnMut(&str) -> bool,
+        ) -> anyhow::Result<GenerateResult> {
+            Ok(GenerateResult {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                cache_hit: false,
+            })
+        }
+
+        fn apply_chat_template(&self, _messages: &[(String, String)]) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn n_ctx(&self) -> u32 {
+            0
+        }
+
+        fn size_bytes(&self) -> u64 {
+            0
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn dummy_loaded(size_bytes: u64, scheduler_size_bytes: u64) -> LoadedModel {
+        LoadedModel {
+            model: Box::new(DummyModel),
+            file_path: PathBuf::new(),
+            n_ctx: 0,
+            n_ctx_train: 0,
+            size_bytes,
+            scheduler_size_bytes,
+            last_used: RwLock::new(Instant::now()),
+            gpu_layers: 0,
+            digest: String::new(),
+            format: ModelFormat::Mlx,
+            batch_tx: None,
+        }
+    }
+
+    fn dummy_manager(memory_budget: u64, clamp_budget_to_live: bool) -> ModelManager {
+        ModelManager {
+            backends: Vec::new(),
+            models: RwLock::new(HashMap::new()),
+            default_n_ctx: 0,
+            default_gpu_layers: 0,
+            memory_budget,
+            clamp_budget_to_live,
+            kv_cache: None,
+            ram_cache: None,
+            metrics: Arc::new(Metrics::new()),
+            batch_slots: 0,
+        }
+    }
+
+    mod scheduler_weight_bytes {
+        use super::*;
+
+        #[test]
+        fn returns_model_size_when_batching_gguf() {
+            let extra = super::super::scheduler_weight_bytes(&ModelFormat::Gguf, 128, 1);
+
+            assert_eq!(extra, 128);
+        }
+
+        #[test]
+        fn returns_zero_when_batching_disabled() {
+            let extra = super::super::scheduler_weight_bytes(&ModelFormat::Gguf, 128, 0);
+
+            assert_eq!(extra, 0);
+        }
+
+        #[test]
+        fn returns_zero_for_mlx_models() {
+            let extra = super::super::scheduler_weight_bytes(&ModelFormat::Mlx, 128, 1);
+
+            assert_eq!(extra, 0);
+        }
+    }
+
+    mod planned_load_weight_bytes {
+        #[test]
+        fn includes_scheduler_weight_copy() {
+            let needed = super::super::planned_load_weight_bytes(128, 128);
+
+            assert_eq!(needed, 256);
+        }
+
+        #[test]
+        fn saturates_on_overflow() {
+            let needed = super::super::planned_load_weight_bytes(u64::MAX, 1);
+
+            assert_eq!(needed, u64::MAX);
+        }
+    }
+
+    mod loaded_model_memory_bytes {
+        use super::*;
+
+        #[test]
+        fn includes_scheduler_weight_copy() {
+            let loaded = dummy_loaded(128, 256);
+
+            assert_eq!(super::super::loaded_model_memory_bytes(&loaded), 384);
+        }
+    }
+
+    mod model_manager {
+        use super::*;
+
+        #[test]
+        fn effective_budget_keeps_total_ram_mode() {
+            let manager = dummy_manager(123, false);
+
+            assert_eq!(manager.effective_budget(), 123);
+        }
+
+        #[test]
+        fn loaded_models_reports_scheduler_weight_copy() {
+            let manager = dummy_manager(1_000, false);
+            manager
+                .models
+                .write()
+                .unwrap()
+                .insert("model".to_string(), dummy_loaded(128, 256));
+
+            assert_eq!(manager.loaded_models()[0].1, 384);
+        }
+
+        #[test]
+        fn evict_for_counts_scheduler_weight_copy() {
+            let manager = dummy_manager(500, false);
+            manager
+                .models
+                .write()
+                .unwrap()
+                .insert("model".to_string(), dummy_loaded(128, 256));
+
+            manager.evict_for(128).unwrap();
+
+            assert!(!manager.is_loaded("model"));
+        }
+    }
+}

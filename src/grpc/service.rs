@@ -334,17 +334,17 @@ impl Spindll for SpindllService {
             if !mgr.is_loaded(&req.model) {
                 let path = store
                     .resolve_model_path(&req.model)
-                    .map_err(|e| Status::not_found(format!("model '{}' not found in store: {e}", req.model)))?;
+                    .map_err(|e| Box::new(Status::not_found(format!("model '{}' not found in store: {e}", req.model))))?;
                 let digest = store.resolve_model_digest(&req.model).unwrap_or_default();
                 mgr.load_model_with_digest(&req.model, &path, None, digest)
-                    .map_err(|e| Status::internal(format!("failed to load model '{}': {e}", req.model)))?;
+                    .map_err(|e| Box::new(Status::internal(format!("failed to load model '{}': {e}", req.model))))?;
             }
 
             let messages: Vec<_> = req.messages.iter()
                 .map(|m| (m.role.clone(), m.content.clone()))
                 .collect();
             let prompt = mgr.apply_chat_template(&req.model, &messages)
-                .map_err(|e| Status::internal(format!("chat template error: {e}")))?;
+                .map_err(|e| Box::new(Status::internal(format!("chat template error: {e}"))))?;
 
             let enc_key: Option<[u8; 32]> = if req.encryption_key.len() == 32 {
                 let mut arr = [0u8; 32];
@@ -360,16 +360,16 @@ impl Spindll for SpindllService {
             };
 
             let stats = mgr.generate(&req.model, &prompt, &params, enc_key.as_ref(), |_| true)
-                .map_err(|e| Status::internal(e.to_string()))?;
+                .map_err(|e| Box::new(Status::internal(e.to_string())))?;
 
-            Ok::<_, Status>(PrefillResponse {
+            Ok::<_, Box<Status>>(PrefillResponse {
                 tokens_cached: stats.prompt_tokens,
             })
         })
         .await
         .map_err(|e| Status::internal(format!("task join error: {e}")))?;
 
-        result.map(Response::new)
+        result.map(Response::new).map_err(|status| *status)
     }
 
     async fn delete(

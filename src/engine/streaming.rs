@@ -75,6 +75,17 @@ pub struct GenerateResult {
     pub cache_hit: bool,
 }
 
+pub struct CachedGenerateRequest<'a, 'ctx> {
+    pub model: &'a LlamaModel,
+    pub ctx: &'a mut LlamaContext<'ctx>,
+    pub prompt: &'a str,
+    pub params: &'a GenerateParams,
+    pub model_name: &'a str,
+    pub model_digest: &'a str,
+    pub cache: &'a KvCache,
+    pub encryption_key: Option<&'a [u8; 32]>,
+}
+
 /// Generate tokens from a prompt, calling `on_token` for each piece of text produced.
 #[tracing::instrument(skip_all, fields(prompt_tokens, completion_tokens))]
 pub fn generate_streaming(
@@ -127,10 +138,9 @@ pub fn generate_streaming(
     ]);
 
     let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut n_cur = batch.n_tokens();
     let mut completion_tokens = 0u32;
 
-    for _ in 0..params.max_tokens {
+    for n_cur in (batch.n_tokens()..).take(params.max_tokens as usize) {
         let token = sampler.sample(ctx, batch.n_tokens() - 1);
         sampler.accept(token);
 
@@ -150,7 +160,6 @@ pub fn generate_streaming(
         batch.clear();
         batch.add(token, n_cur, &[0], true)?;
         ctx.decode(&mut batch)?;
-        n_cur += 1;
     }
 
     tracing::Span::current().record("completion_tokens", completion_tokens);
@@ -166,16 +175,20 @@ pub fn generate_streaming(
 /// of re-encoding the prompt. On miss, saves the post-prompt state for next time.
 #[tracing::instrument(skip_all, fields(prompt_tokens, completion_tokens, cache_hit))]
 pub fn generate_streaming_cached(
-    model: &LlamaModel,
-    ctx: &mut LlamaContext,
-    prompt: &str,
-    params: &GenerateParams,
-    model_name: &str,
-    model_digest: &str,
-    cache: &KvCache,
-    encryption_key: Option<&[u8; 32]>,
+    request: CachedGenerateRequest<'_, '_>,
     mut on_token: impl FnMut(&str) -> bool,
 ) -> anyhow::Result<GenerateResult> {
+    let CachedGenerateRequest {
+        model,
+        ctx,
+        prompt,
+        params,
+        model_name,
+        model_digest,
+        cache,
+        encryption_key,
+    } = request;
+
     let tokens = model.str_to_token(prompt, AddBos::Always)?;
     if tokens.is_empty() {
         anyhow::bail!("prompt produced no tokens");
@@ -241,10 +254,10 @@ pub fn generate_streaming_cached(
         let save_path = cache.save_path(prompt, model_name, model_digest, encryption_key);
         let tmp = save_path.with_extension("tmp");
         if ctx.state_save_file(&tmp, &tokens).is_ok() {
-            if let Ok(raw) = std::fs::read(&tmp) {
-                if save_state_to_disk(&save_path, &raw, encryption_key).is_ok() {
-                    cache.register(prompt, model_name, model_digest, encryption_key);
-                }
+            if let Ok(raw) = std::fs::read(&tmp)
+                && save_state_to_disk(&save_path, &raw, encryption_key).is_ok()
+            {
+                cache.register(prompt, model_name, model_digest, encryption_key);
             }
             std::fs::remove_file(&tmp).ok();
         }
@@ -269,17 +282,17 @@ pub fn generate_streaming_cached(
     ]);
 
     let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut n_cur = tokens.len() as i32;
+    let start_pos = tokens.len() as i32;
     let mut completion_tokens = 0u32;
 
     // Need an initial logits position — on cache hit we need to re-eval the last token
     if cache_hit {
         let mut batch = LlamaBatch::new(1, 1);
-        batch.add(tokens[tokens.len() - 1], n_cur - 1, &[0], true)?;
+        batch.add(tokens[tokens.len() - 1], start_pos - 1, &[0], true)?;
         ctx.decode(&mut batch)?;
     }
 
-    for _ in 0..params.max_tokens {
+    for n_cur in (start_pos..).take(params.max_tokens as usize) {
         let token = sampler.sample(ctx, 0);
         sampler.accept(token);
 
@@ -299,7 +312,6 @@ pub fn generate_streaming_cached(
         let mut batch = LlamaBatch::new(1, 1);
         batch.add(token, n_cur, &[0], true)?;
         ctx.decode(&mut batch)?;
-        n_cur += 1;
     }
 
     tracing::Span::current().record("completion_tokens", completion_tokens);
