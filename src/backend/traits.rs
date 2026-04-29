@@ -48,10 +48,9 @@ pub trait BackendModel: Send + Sync {
         false
     }
 
-    /// Per-token KV bytes for eviction sizing. Override when computable.
-    fn kv_bytes_per_token(&self) -> u64 {
-        0
-    }
+    /// Per-token KV bytes for eviction sizing. Required so a new backend
+    /// cannot silently underflow `total_loaded_bytes` by forgetting it.
+    fn kv_bytes_per_token(&self) -> u64;
 
     fn as_any(&self) -> &dyn std::any::Any;
 }
