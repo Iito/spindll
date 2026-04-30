@@ -9,7 +9,7 @@ pub mod streaming;
 
 pub use batch::{BatchEvent, BatchRequest, BatchScheduler};
 pub use kv_cache::KvCache;
-pub use manager::ModelManager;
+pub use manager::{EvictionPriority, LoadOptions, ModelManager};
 pub use metrics::Metrics;
 pub use ram_cache::RamCache;
 pub use streaming::{GenerateParams, GenerateResult};
