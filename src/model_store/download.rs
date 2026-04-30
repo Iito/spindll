@@ -196,6 +196,23 @@ pub fn download_hf_auto(
     })
 }
 
+/// MLX per-token KV bytes from `config.json`:
+/// `2 (K+V) × n_layers × n_kv_heads × head_dim × 2 (fp16)`. 0 if missing fields.
+pub fn kv_bpt_from_mlx_config(config: &serde_json::Value) -> u64 {
+    fn calc(c: &serde_json::Value) -> Option<u64> {
+        let n_layers = c.get("num_hidden_layers")?.as_u64()?;
+        let n_heads = c.get("num_attention_heads")?.as_u64()?;
+        let n_kv_heads = c
+            .get("num_key_value_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(n_heads);
+        let hidden = c.get("hidden_size")?.as_u64()?;
+        let head_dim = hidden.checked_div(n_heads).filter(|&d| d > 0)?;
+        Some(2 * n_layers * n_kv_heads * head_dim * 2)
+    }
+    calc(config).unwrap_or(0)
+}
+
 /// Read `model_type` and `_name_or_path` from an MLX model's `config.json`.
 ///
 /// Returns `(architecture, model_name)`.
@@ -390,5 +407,28 @@ mod tests {
     #[test]
     fn extract_quant_returns_none_when_no_match() {
         assert_eq!(extract_quant("model.gguf"), None);
+    }
+
+    /// Regression: locks KV math. Numbers from Qwen3-0.6B-4bit config.json.
+    #[test]
+    fn kv_bpt_matches_qwen3_0_6b_shape() {
+        let cfg = serde_json::json!({
+            "num_hidden_layers": 28,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "hidden_size": 1024,
+        });
+        // 2 × 28 × 8 × 64 × 2 = 57344
+        assert_eq!(kv_bpt_from_mlx_config(&cfg), 57344);
+    }
+
+    #[test]
+    fn kv_bpt_returns_zero_when_field_missing() {
+        let cfg = serde_json::json!({
+            "num_hidden_layers": 28,
+            // num_attention_heads missing
+            "hidden_size": 1024,
+        });
+        assert_eq!(kv_bpt_from_mlx_config(&cfg), 0);
     }
 }
