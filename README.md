@@ -1,8 +1,8 @@
 # Spindll
 
-**Spindle + LL(ama).** A Rust-native GGUF inference engine with model management.
+**Spindle + LL(ama).** A Rust-native GGUF and MLX inference engine with model management.
 
-A single binary that pulls models from Ollama's registry or HuggingFace, manages local storage, and serves streaming inference over gRPC and HTTP. Multi-model, memory-aware, GPU-accelerated, with an OpenAI-compatible API.
+A single binary that pulls models from Ollama's registry or HuggingFace, manages local storage, and serves streaming inference over gRPC and HTTP. Multi-model, memory-aware, GPU-accelerated, with an OpenAI-compatible API. On Apple Silicon, runs MLX models natively via a Swift bridge in addition to GGUF via llama.cpp.
 
 ## Quick Start
 
@@ -24,7 +24,9 @@ Models are loaded automatically on first request, or explicitly via the `Load` R
 
 ## Features
 
-- **Pull from Ollama or HuggingFace** -- auto-detects source from model name format
+- **Pull from Ollama or HuggingFace** -- auto-detects source from model name format; on Apple Silicon, resolves to MLX-format models when available, falls back to GGUF
+- **Pluggable backends** -- `InferenceBackend` trait dispatches to `llama.cpp` for GGUF and `mlx-swift-lm` for MLX, with an extension point for new engines
+- **Smart quant default** -- `pull` without `--quant` picks q4_k_m by priority list (q4_k_m > q5_k_m > q4_0 > … > fp16) instead of grabbing the first GGUF in the repo
 - **Streaming inference** -- token-by-token output over gRPC, HTTP/SSE, or OpenAI-compatible API
 - **OpenAI-compatible API** -- `/v1/chat/completions`, `/v1/completions`, and tool/function calling for AnythingLLM, Open WebUI, and any OpenAI client
 - **Multi-model** -- multiple models loaded concurrently, LRU eviction when budget exceeded
@@ -32,23 +34,33 @@ Models are loaded automatically on first request, or explicitly via the `Load` R
 - **KV cache** -- disk-backed prefix caching with optional ChaCha20-Poly1305 encryption at rest
 - **Chat template fallback** -- reads template from GGUF metadata, falls back to ChatML for models without one
 - **GGUF metadata** -- extracts model name, description, and architecture from file headers
-- **Memory-aware** -- configurable budget, auto-detects available RAM/VRAM
-- **GPU acceleration** -- Metal (macOS) auto-detected, CUDA (Linux) supported
+- **Memory-aware** -- configurable budget; budget-aware n_ctx auto-resolution at load time prevents silent OOMs
+- **GPU acceleration** -- Metal (macOS) auto-detected, CUDA / Vulkan (Linux) supported
 - **Embeddable** -- use as a Rust crate in your own project, no subprocess needed
 
 ## CLI
 
 ```
-spindll pull <model>                  # pull from Ollama registry or HuggingFace
+spindll pull <model> [flags]          # pull from Ollama registry or HuggingFace
 spindll list                          # show local models with metadata
 spindll rm <model>                    # delete a local model
 spindll run <model> "prompt"          # one-shot inference (no server)
+spindll bench <model> <other>         # side-by-side benchmark of two models (any format)
 spindll serve [options]               # start gRPC + HTTP server
 spindll import --from-ollama          # migrate existing Ollama models
 spindll status                        # query a running server
 ```
 
-Model names follow Ollama conventions (`llama3.1:8b`, `qwen2:0.5b`) or HuggingFace repos (`TheBloke/Llama-3-8B-GGUF`).
+Model names follow Ollama conventions (`llama3.1:8b`, `qwen2:0.5b`) or HuggingFace repos (`TheBloke/Llama-3-8B-GGUF`, `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit`).
+
+### Pull options
+
+```
+--quant <STR>              Pick a specific quant (e.g. q4_k_m, q5_k_m, fp16). Without
+                           this flag, the picker prefers q4_k_m by default.
+--gguf                     Force GGUF, skip MLX resolution on Apple Silicon
+--mlx                      Force MLX, error if no MLX equivalent is found
+```
 
 ### Serve options
 
@@ -57,7 +69,10 @@ Model names follow Ollama conventions (`llama3.1:8b`, `qwen2:0.5b`) or HuggingFa
 --http-port <PORT>         HTTP/SSE port [default: 8080]
 --ctx-size <N>             Context window size [default: 2048]
 --gpu-layers <N>           GPU layers (omit to auto-detect)
---budget <SIZE>            Memory budget, e.g. "8G" (default: 80% of available RAM)
+--budget <SIZE>            Memory budget, e.g. "8G". Default: full live availability
+                           (free + inactive + purgeable + speculative on macOS;
+                           sysinfo's available_memory elsewhere). Pass "0" to use
+                           total RAM (trust unified-memory paging).
 --kv-cache [<SIZE>]        Enable KV cache for prompt prefixes [default: 2G]
 --batch-slots <N>          Concurrent sequence slots per model [default: 0 = disabled]
 --ram-cache [<SIZE>]       Keep recently-evicted models warm in RAM [default: 4G; no-op on macOS]
@@ -73,7 +88,7 @@ Quick summary of available interfaces:
 
 | Interface | Port | Feature flag | Use case |
 |-----------|------|-------------|----------|
-| gRPC | 50051 | none (always on) | Parley mesh, programmatic access |
+| gRPC | 50051 | none (always on) | Programmatic access, mesh integrations |
 | HTTP/SSE | 8080 | `http` | Web frontends, custom integrations |
 | OpenAI `/v1` | 8080 | `http` | AnythingLLM, Open WebUI, any OpenAI client (chat, completions, tool calling) |
 
@@ -114,7 +129,11 @@ CLI / gRPC / HTTP+SSE / OpenAI /v1
   (continuous batching,   (KV cache, encryption)
    sequence pooling)
          |                |
-    Inference Engine (llama.cpp via llama-cpp-2, streaming, GPU offload)
+    Inference Backends (`InferenceBackend` trait)
+       │                                  │
+   llama.cpp via llama-cpp-2     mlx-swift-lm via Swift FFI
+   (GGUF, all platforms,         (MLX, Apple Silicon only,
+    GPU offload)                  --features mlx)
               |
     Model Store (Ollama registry, HuggingFace, GGUF metadata, local registry)
 ```
@@ -129,13 +148,18 @@ Models are stored in `~/.spindll/models/<repo>/<file>`. A JSON registry at `~/.s
 |------|-------------|
 | `cli` | Standalone binary (clap argument parsing, pretty logging) |
 | `http` | HTTP/SSE server with OpenAI-compatible `/v1` API (axum) |
+| `mlx` | MLX Swift backend on `aarch64-apple-darwin` (links against the bundled `mlx_bridge` Swift package) |
+| `cuda` | CUDA GPU support in llama.cpp |
+| `metal` | Metal GPU support in llama.cpp |
+| `vulkan` | Vulkan GPU support in llama.cpp |
 
-The gRPC server and core engine are always compiled -- no feature flag needed for library consumers or for Parley integration.
+The gRPC server and core engine are always compiled -- no feature flag needed for library consumers or for embedding spindll in another binary.
 
 ## Prerequisites
 
 - [Rust toolchain](https://rustup.rs/) (stable, edition 2024)
 - CMake (for llama.cpp compilation)
+- Swift toolchain ≥ 5.9 and Xcode command-line tools (only when building with `--features mlx` on Apple Silicon)
 
 ## License
 

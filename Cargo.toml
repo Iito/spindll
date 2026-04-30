@@ -1,8 +1,8 @@
 [package]
 name = "spindll"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
-description = "A Rust-native GGUF inference engine with model management"
+description = "A Rust-native GGUF and MLX inference engine with model management"
 license = "Apache-2.0"
 repository = "https://github.com/Iito/spindll"
 keywords = ["llm", "inference", "gguf", "llama", "gpu"]
@@ -29,6 +29,9 @@ http = [
 cuda   = ["llama-cpp-2/cuda"]
 metal  = ["llama-cpp-2/metal"]
 vulkan = ["llama-cpp-2/vulkan"]
+# MLX Swift bridge — Apple Silicon only, compiles mlx_bridge Swift package.
+# Usage: cargo build --features mlx   (aarch64-apple-darwin only)
+mlx    = []
 
 [dependencies]
 # Core — always compiled
@@ -36,7 +39,8 @@ tokio        = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tonic        = "0.13"
 prost        = "0.13"
-llama-cpp-2  = "0.1"
+llama-cpp-2      = "0.1"
+llama-cpp-sys-2  = "0.1"
 encoding_rs  = "0.8"
 sha2         = "0.10"
 chacha20poly1305 = "0.10"
@@ -49,6 +53,9 @@ thiserror    = "2"
 anyhow       = "1"
 tracing      = "0.1"
 sysinfo      = "0.35"
+memory-stats = "1"
+libc         = "0.2"
+urlencoding  = "2"
 
 # http server (optional)
 axum       = { version = "0.8", features = ["macros"], optional = true }
@@ -57,6 +64,9 @@ tower-http = { version = "0.6", features = ["cors"], optional = true }
 # cli binary only
 clap               = { version = "4", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [build-dependencies]
 tonic-build = "0.13"

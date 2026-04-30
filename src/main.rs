@@ -15,9 +15,17 @@ enum Commands {
         /// Model name — Ollama format (llama3.1:8b) or HuggingFace (owner/model)
         model: String,
 
-        /// Quantization filter (HuggingFace only)
+        /// Quantization filter (HuggingFace GGUF or MLX quant like "4bit")
         #[arg(long)]
         quant: Option<String>,
+
+        /// Force GGUF format (skip MLX resolution on Apple Silicon)
+        #[arg(long, conflicts_with = "mlx")]
+        gguf: bool,
+
+        /// Force MLX format (error if no MLX equivalent found)
+        #[arg(long, conflicts_with = "gguf")]
+        mlx: bool,
     },
 
     /// List local models
@@ -43,7 +51,7 @@ enum Commands {
         #[arg(long)]
         gpu_layers: Option<u32>,
 
-        /// Memory budget for loaded models (e.g. "8G", omit for 80% of available RAM)
+        /// Memory budget for loaded models (e.g. "8G", omit for full live availability)
         #[arg(long)]
         budget: Option<String>,
 
@@ -75,6 +83,31 @@ enum Commands {
         /// Enable KV cache for prompt prefixes (e.g. "2G", default 2G when enabled)
         #[arg(long)]
         kv_cache: Option<Option<String>>,
+    },
+
+    /// Benchmark two models side-by-side (any format: GGUF, MLX, or mixed)
+    Bench {
+        /// First model
+        model: String,
+
+        /// Second model to compare against
+        against: String,
+
+        /// Number of measured runs (plus 1 warmup)
+        #[arg(long, default_value = "3")]
+        runs: u32,
+
+        /// Max tokens to generate per run
+        #[arg(long, default_value = "100")]
+        max_tokens: u32,
+
+        /// KV cache context size for GGUF models (MLX handles context dynamically)
+        #[arg(long, default_value = "2048")]
+        ctx_size: u32,
+
+        /// Prompt to use for all runs
+        #[arg(long)]
+        prompt: Option<String>,
     },
 
     /// Import models from Ollama
@@ -116,6 +149,146 @@ fn parse_size_bytes(s: Option<&str>) -> u64 {
         .unwrap_or(DEFAULT)
 }
 
+// ---------------------------------------------------------------------------
+// Backend dispatch
+// ---------------------------------------------------------------------------
+
+fn backend_for_format(
+    format: &spindll::model_store::registry::ModelFormat,
+) -> anyhow::Result<Box<dyn spindll::backend::InferenceBackend>> {
+    use spindll::model_store::registry::ModelFormat;
+    match format {
+        ModelFormat::Gguf => Ok(Box::new(
+            spindll::backend::llamacpp::LlamaCppBackend::new()?,
+        )),
+        ModelFormat::Mlx => {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+            return Ok(Box::new(spindll::backend::mlx_swift::MlxBackend));
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
+            anyhow::bail!("MLX backend requires Apple Silicon and --features mlx");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark helpers
+// ---------------------------------------------------------------------------
+
+struct BenchResult {
+    format_name: &'static str,
+    ttft_ms: f64,
+    tokens_per_sec: f64,
+    total_ms: f64,
+    tokens: u32,
+    mem_peak_mb: f64,
+}
+
+/// Resident memory of this process in MB. Uses `memory-stats` which wraps
+/// task_info on macOS, /proc on Linux, GetProcessMemoryInfo on Windows --
+/// ~370 ns/call, no self-pollution. (sysinfo::System::new_all takes ~5 ms
+/// and inflates RSS by ~5 MB per call: see tools/mem_bench/.)
+fn phys_footprint_mb() -> f64 {
+    memory_stats::memory_stats()
+        .map(|s| s.physical_mem as f64 / (1024.0 * 1024.0))
+        .unwrap_or(0.0)
+}
+
+fn bench_by_format(
+    path: &std::path::Path,
+    format: spindll::model_store::registry::ModelFormat,
+    prompt: &str,
+    max_tokens: u32,
+    runs: u32,
+    ctx_size: u32,
+) -> anyhow::Result<BenchResult> {
+    use spindll::model_store::registry::ModelFormat;
+
+    let format_name = match format {
+        ModelFormat::Gguf => "GGUF",
+        ModelFormat::Mlx => "MLX",
+    };
+
+    let backend = backend_for_format(&format)?;
+    let load_params = spindll::backend::BackendLoadParams {
+        n_ctx: ctx_size,
+        n_gpu_layers: None,
+        memory_budget: 0,
+    };
+    let model = backend.load_model(path, load_params)?;
+    let params = spindll::engine::GenerateParams {
+        max_tokens,
+        ..Default::default()
+    };
+
+    // warmup
+    model.generate(prompt, &params, &mut |_| true)?;
+
+    let mut ttft_sum = 0.0f64;
+    let mut tps_sum = 0.0f64;
+    let mut last_tokens = 0u32;
+    let mut mem_peak = 0.0f64;
+
+    for _ in 0..runs {
+        let start = std::time::Instant::now();
+        let mut first = true;
+        let mut ttft = 0.0f64;
+        let result = model.generate(prompt, &params, &mut |_token| {
+            if first {
+                ttft = start.elapsed().as_secs_f64() * 1000.0;
+                first = false;
+            }
+            true
+        })?;
+        let elapsed = start.elapsed().as_secs_f64();
+        ttft_sum += ttft;
+        tps_sum += result.completion_tokens as f64 / elapsed;
+        last_tokens = result.completion_tokens;
+        let sample = phys_footprint_mb();
+        if sample > mem_peak {
+            mem_peak = sample;
+        }
+    }
+
+    let avg_tps = tps_sum / runs as f64;
+    Ok(BenchResult {
+        format_name,
+        ttft_ms: ttft_sum / runs as f64,
+        tokens_per_sec: avg_tps,
+        total_ms: last_tokens as f64 / avg_tps * 1000.0,
+        tokens: last_tokens,
+        mem_peak_mb: mem_peak,
+    })
+}
+
+fn format_mem(mb: f64) -> String {
+    if mb <= 0.0 {
+        return "  —".to_string();
+    }
+    if mb >= 1024.0 {
+        format!("{:.1}G", mb / 1024.0)
+    } else {
+        format!("{:.0}M", mb)
+    }
+}
+
+fn print_bench_row(label: &str, r: &BenchResult) {
+    let label = if label.len() > 40 { &label[..40] } else { label };
+    println!(
+        "{:<40} {:>4} {:>8.0}ms {:>8.1} {:>7.2}s {:>5} {:>6}",
+        label,
+        r.format_name,
+        r.ttft_ms,
+        r.tokens_per_sec,
+        r.total_ms / 1000.0,
+        r.tokens,
+        format_mem(r.mem_peak_mb),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -128,9 +301,16 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Pull { model, quant } => {
+        Commands::Pull { model, quant, gguf, mlx } => {
+            let format_pref = if gguf {
+                spindll::model_store::FormatPreference::Gguf
+            } else if mlx {
+                spindll::model_store::FormatPreference::Mlx
+            } else {
+                spindll::model_store::FormatPreference::Auto
+            };
             let store = spindll::model_store::ModelStore::new(None);
-            let path = store.pull(&model, quant.as_deref())?;
+            let path = store.pull(&model, quant.as_deref(), format_pref)?;
             println!("model ready: {}", path.display());
         }
         Commands::List => {
@@ -152,12 +332,15 @@ async fn main() -> anyhow::Result<()> {
             http_port,
         } => {
             let mem = spindll::scheduler::budget::MemoryBudget::detect(budget.as_deref());
+            const GB: f64 = 1_073_741_824.0;
             println!(
-                "memory budget: {:.1} GB / {:.1} GB available",
-                mem.budget as f64 / 1_073_741_824.0,
-                mem.available_ram as f64 / 1_073_741_824.0
+                "memory budget: {:.1} GB cap (system: {:.1} GB total, {:.1} GB free)",
+                mem.budget as f64 / GB,
+                mem.total_ram as f64 / GB,
+                mem.available_ram as f64 / GB,
             );
-            let mut manager = spindll::engine::ModelManager::new(ctx_size, gpu_layers, mem.budget)?;
+            let mut manager =
+                spindll::engine::ModelManager::new(ctx_size, gpu_layers, mem.budget)?;
 
             if let Some(cache_size) = kv_cache {
                 let bytes = parse_size_bytes(cache_size.as_deref());
@@ -184,16 +367,16 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let manager = std::sync::Arc::new(manager);
-            let store = std::sync::Arc::new(
-                spindll::model_store::ModelStore::new(None),
-            );
+            let store = std::sync::Arc::new(spindll::model_store::ModelStore::new(None));
 
             #[cfg(feature = "http")]
             if http_port > 0 {
                 let http_mgr = manager.clone();
                 let http_store = store.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = spindll::http::start_http_server(http_port, http_mgr, http_store).await {
+                    if let Err(e) =
+                        spindll::http::start_http_server(http_port, http_mgr, http_store).await
+                    {
                         tracing::error!("HTTP server error: {e}");
                     }
                 });
@@ -207,28 +390,121 @@ async fn main() -> anyhow::Result<()> {
             spindll::lockfile::Lockfile::remove();
             result?;
         }
-        Commands::Run { model, prompt, kv_cache } => {
+        Commands::Run {
+            model,
+            prompt,
+            kv_cache,
+        } => {
             let store = spindll::model_store::ModelStore::new(None);
+            let format = store.resolve_model_format(&model)?;
             let model_path = store.resolve_model_path(&model)?;
-
-            let mut engine = spindll::engine::Engine::load(&model_path, None, 2048)?;
-
-            if let Some(cache_size) = kv_cache {
-                let bytes = parse_size_bytes(cache_size.as_deref());
-                let digest = store.resolve_model_digest(&model).unwrap_or_default();
-                engine.set_model_digest(digest);
-                engine.enable_kv_cache(bytes);
-            }
-
             let params = spindll::engine::GenerateParams::default();
 
-            engine.generate(&prompt, &params, |token| {
-                use std::io::Write;
-                print!("{token}");
-                std::io::stdout().flush().ok();
-                true
-            })?;
+            use spindll::model_store::registry::ModelFormat;
+            if kv_cache.is_some() && format == ModelFormat::Gguf {
+                // KV cache path: use Engine directly (GGUF-only feature)
+                let mut engine = spindll::engine::Engine::load(&model_path, None, 2048)?;
+                if let Some(cache_size) = kv_cache {
+                    let bytes = parse_size_bytes(cache_size.as_deref());
+                    let digest = store.resolve_model_digest(&model).unwrap_or_default();
+                    engine.set_model_digest(digest);
+                    engine.enable_kv_cache(bytes);
+                }
+                engine.generate(&prompt, &params, |token| {
+                    use std::io::Write;
+                    print!("{token}");
+                    std::io::stdout().flush().ok();
+                    true
+                })?;
+            } else {
+                let backend = backend_for_format(&format)?;
+                let backend_model = backend.load_model(
+                    &model_path,
+                    spindll::backend::BackendLoadParams {
+                        n_ctx: 2048,
+                        n_gpu_layers: None,
+                        memory_budget: 0,
+                    },
+                )?;
+                backend_model.generate(&prompt, &params, &mut |token| {
+                    use std::io::Write;
+                    print!("{token}");
+                    std::io::stdout().flush().ok();
+                    true
+                })?;
+            }
             println!();
+        }
+        Commands::Bench {
+            model,
+            against,
+            runs,
+            max_tokens,
+            ctx_size,
+            prompt,
+        } => {
+            let store = spindll::model_store::ModelStore::new(None);
+            let default_prompt =
+                "Explain how transformers work in machine learning, step by step.";
+            let prompt_str = prompt.as_deref().unwrap_or(default_prompt);
+
+            println!("prompt    {:?}", prompt_str);
+            println!(
+                "runs      {} (+ 1 warmup)  max-tokens={}  ctx-size={} (GGUF)",
+                runs, max_tokens, ctx_size
+            );
+            println!("{}", "─".repeat(86));
+            println!(
+                "{:<40} {:>4} {:>9} {:>9} {:>8} {:>5} {:>6}",
+                "MODEL", "FMT", "TTFT", "TOK/S", "TOTAL", "TOKS", "MEM"
+            );
+            println!("{}", "─".repeat(86));
+
+            let path1 = store.resolve_model_path(&model)?;
+            let fmt1 = store.resolve_model_format(&model)?;
+            let r1 = bench_by_format(&path1, fmt1, prompt_str, max_tokens, runs, ctx_size)?;
+            print_bench_row(&model, &r1);
+
+            let path2 = store.resolve_model_path(&against)?;
+            let fmt2 = store.resolve_model_format(&against)?;
+            let r2 = bench_by_format(&path2, fmt2, prompt_str, max_tokens, runs, ctx_size)?;
+            print_bench_row(&against, &r2);
+
+            println!("{}", "─".repeat(86));
+
+            let tps_ratio = r2.tokens_per_sec / r1.tokens_per_sec;
+            let ttft_ratio = r1.ttft_ms / r2.ttft_ms;
+
+            let (faster_label, slower_label, tps_pct, ttft_pct) = if tps_ratio >= 1.0 {
+                (
+                    against.as_str(),
+                    model.as_str(),
+                    (tps_ratio - 1.0) * 100.0,
+                    (ttft_ratio - 1.0) * 100.0,
+                )
+            } else {
+                (
+                    model.as_str(),
+                    against.as_str(),
+                    (1.0 / tps_ratio - 1.0) * 100.0,
+                    (1.0 / ttft_ratio - 1.0) * 100.0,
+                )
+            };
+
+            let fl = if faster_label.len() > 30 {
+                &faster_label[..30]
+            } else {
+                faster_label
+            };
+            let sl = if slower_label.len() > 30 {
+                &slower_label[..30]
+            } else {
+                slower_label
+            };
+            println!(
+                "{} is {:.0}% faster throughput, {:.0}% faster TTFT vs {}",
+                fl, tps_pct, ttft_pct, sl,
+            );
         }
         Commands::Import { from_ollama } => {
             if from_ollama {
@@ -242,25 +518,33 @@ async fn main() -> anyhow::Result<()> {
         Commands::Status { port } => {
             let port = match port {
                 Some(p) => p,
-                None => {
-                    match spindll::lockfile::Lockfile::read() {
-                        Some(lf) => lf.grpc_port,
-                        None => anyhow::bail!("no running server found (no lockfile); specify --port"),
+                None => match spindll::lockfile::Lockfile::read() {
+                    Some(lf) => lf.grpc_port,
+                    None => {
+                        anyhow::bail!("no running server found (no lockfile); specify --port")
                     }
-                }
+                },
             };
             let addr = format!("http://localhost:{port}");
-            let mut client = spindll::proto::spindll_client::SpindllClient::connect(addr).await
-                .map_err(|e| anyhow::anyhow!("cannot connect to server on port {port}: {e}"))?;
+            let mut client =
+                spindll::proto::spindll_client::SpindllClient::connect(addr)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("cannot connect to server on port {port}: {e}")
+                    })?;
 
-            let resp = client.status(spindll::proto::StatusRequest {}).await?
+            let resp = client
+                .status(spindll::proto::StatusRequest {})
+                .await?
                 .into_inner();
 
-            // Models
             if resp.models.is_empty() {
                 println!("no models loaded");
             } else {
-                println!("{:<35} {:>10} {:>6}  {}", "MODEL", "MEMORY", "GPU", "DIGEST");
+                println!(
+                    "{:<35} {:>10} {:>6}  {}",
+                    "MODEL", "MEMORY", "GPU", "DIGEST"
+                );
                 println!("{}", "-".repeat(75));
                 for m in &resp.models {
                     let size = if m.memory_used >= 1_073_741_824 {
@@ -268,12 +552,18 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         format!("{:.0} MB", m.memory_used as f64 / 1_048_576.0)
                     };
-                    let digest_short = if m.digest.len() > 19 { &m.digest[..19] } else { &m.digest };
-                    println!("{:<35} {:>10} {:>4}L  {}", m.name, size, m.gpu_layers, digest_short);
+                    let digest_short = if m.digest.len() > 19 {
+                        &m.digest[..19]
+                    } else {
+                        &m.digest
+                    };
+                    println!(
+                        "{:<35} {:>10} {:>4}L  {}",
+                        m.name, size, m.gpu_layers, digest_short
+                    );
                 }
             }
 
-            // Memory
             if let Some(mem) = &resp.memory {
                 println!();
                 println!(
@@ -284,7 +574,6 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            // Metrics
             if let Some(m) = &resp.metrics {
                 println!();
                 println!(
@@ -298,7 +587,6 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            // Devices
             if !resp.devices.is_empty() {
                 println!();
                 println!("devices: {}", resp.devices.join(", "));
