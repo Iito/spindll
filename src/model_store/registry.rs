@@ -147,7 +147,21 @@ impl Registry {
     }
 
     /// Persist the registry to a JSON file.
+    ///
+    /// Refuses to overwrite a registry written by a newer spindll.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        if path.exists() {
+            let data = std::fs::read_to_string(path)?;
+            if let Ok(on_disk) = serde_json::from_str::<Self>(&data) {
+                if on_disk.version > CURRENT_VERSION {
+                    anyhow::bail!(
+                        "registry was written by a newer spindll (version {}); \
+                         refusing to overwrite — upgrade spindll first",
+                        on_disk.version
+                    );
+                }
+            }
+        }
         let data = serde_json::to_string_pretty(self)?;
         std::fs::write(path, data)?;
         Ok(())

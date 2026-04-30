@@ -131,11 +131,11 @@ impl ModelManager {
     /// `BackendLoadParams.memory_budget`), and the `--budget 0` (total RAM)
     /// opt-in must not be silently downgraded.
     fn effective_budget(&self) -> u64 {
-        if self.memory_budget == 0 {
-            return 0; // unlimited
+        let mem = crate::scheduler::budget::MemoryBudget::detect(None);
+        if self.memory_budget == 0 || self.memory_budget >= mem.total_ram {
+            return self.memory_budget;
         }
-        let live = crate::scheduler::budget::MemoryBudget::detect(None).available_ram;
-        std::cmp::min(self.memory_budget, live)
+        std::cmp::min(self.memory_budget, mem.available_ram)
     }
 
     /// Evict least-recently-used models until `needed` bytes fit within budget.
@@ -241,12 +241,11 @@ impl ModelManager {
         // budget-resolve n_ctx against memory not yet consumed by weights.
         // Once weights are mmap'd / uploaded to Metal, available memory drops,
         // so the snapshot has to happen here, not inside the backend.
-        let available_before =
-            crate::scheduler::budget::MemoryBudget::detect(None).available_ram;
-        let load_budget = if self.memory_budget > 0 {
-            std::cmp::min(self.memory_budget, available_before)
+        let mem = crate::scheduler::budget::MemoryBudget::detect(None);
+        let load_budget = if self.memory_budget == 0 || self.memory_budget >= mem.total_ram {
+            self.memory_budget
         } else {
-            available_before
+            std::cmp::min(self.memory_budget, mem.available_ram)
         };
 
         let layers = gpu_layers.unwrap_or(self.default_gpu_layers);
