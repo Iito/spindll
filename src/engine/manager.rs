@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
 use std::num::NonZeroU32;
+use tokio::task::JoinHandle;
 
 use crate::backend::llamacpp::LlamaCppModel;
 use crate::backend::{BackendLoadParams, BackendModel, InferenceBackend};
@@ -17,6 +19,35 @@ use super::kv_cache::KvCache;
 use super::metrics::Metrics;
 use super::ram_cache::RamCache;
 use super::streaming::{GenerateParams, GenerateResult, generate_streaming_cached};
+
+/// Eviction tier. Low evicts first, LRU tiebreak within tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EvictionPriority {
+    Low,
+    #[default]
+    Normal,
+    High,
+}
+
+impl EvictionPriority {
+    fn evict_order(self) -> u8 {
+        match self {
+            Self::Low => 0,
+            Self::Normal => 1,
+            Self::High => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LoadOptions {
+    /// `None` = auto.
+    pub gpu_layers: Option<u32>,
+    pub digest: String,
+    pub priority: EvictionPriority,
+    /// Reload this long after eviction under VRAM pressure. `None` disables.
+    pub idle_reload: Option<Duration>,
+}
 
 /// A model that has been loaded into memory and is ready for inference.
 pub struct LoadedModel {
@@ -34,12 +65,26 @@ pub struct LoadedModel {
     pub last_used: RwLock<Instant>,
     /// Number of layers offloaded to GPU.
     pub gpu_layers: u32,
+    /// Original gpu_layers request, reused on idle-reload.
+    pub requested_gpu_layers: Option<u32>,
     /// SHA-256 digest of the model file, used for KV cache keying.
     pub digest: String,
     /// On-disk format of this model.
     pub format: ModelFormat,
     /// Channel to submit requests to this model's batch scheduler (if running).
     pub batch_tx: Option<std::sync::mpsc::Sender<BatchRequest>>,
+    pub priority: EvictionPriority,
+    pub idle_reload: Option<Duration>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingReload {
+    name: String,
+    path: PathBuf,
+    digest: String,
+    gpu_layers: Option<u32>,
+    priority: EvictionPriority,
+    idle_reload: Duration,
 }
 
 /// Multi-model manager with LRU eviction and memory budgeting.
@@ -56,6 +101,27 @@ pub struct ModelManager {
     ram_cache: Option<RamCache>,
     metrics: Arc<Metrics>,
     batch_slots: usize,
+    /// Idle-reload gating: timestamp of last load/generate.
+    last_activity: RwLock<Instant>,
+    /// Idle-reload waits for this to hit zero.
+    active_requests: AtomicUsize,
+    /// Set by [`ModelManager::into_arc`]; required for idle-reload watchers.
+    weak_self: OnceLock<Weak<ModelManager>>,
+    watchers: Mutex<HashMap<String, JoinHandle<()>>>,
+}
+
+/// Bumps `active_requests` for the lifetime of an inference call.
+struct ActiveGuard<'a>(&'a AtomicUsize);
+impl<'a> ActiveGuard<'a> {
+    fn new(c: &'a AtomicUsize) -> Self {
+        c.fetch_add(1, Ordering::SeqCst);
+        Self(c)
+    }
+}
+impl<'a> Drop for ActiveGuard<'a> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl ModelManager {
@@ -105,7 +171,19 @@ impl ModelManager {
             ram_cache: None,
             metrics: Arc::new(Metrics::new()),
             batch_slots: 0,
+            last_activity: RwLock::new(Instant::now()),
+            active_requests: AtomicUsize::new(0),
+            weak_self: OnceLock::new(),
+            watchers: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Wrap into `Arc<Self>` with a `Weak` self-ref for idle-reload watchers.
+    /// Required if any load uses `idle_reload`; `Arc::new(mgr)` disables it silently.
+    pub fn into_arc(self) -> Arc<Self> {
+        let arc = Arc::new(self);
+        let _ = arc.weak_self.set(Arc::downgrade(&arc));
+        arc
     }
 
     /// Set the number of concurrent sequence slots for batch scheduling.
@@ -124,12 +202,6 @@ impl ModelManager {
             .sum()
     }
 
-    /// Effective budget for the next load: the configured cap, lowered to
-    /// what the system can actually provide right now. We use `available_ram`
-    /// (free + inactive + purgeable on macOS) — KV/n_ctx headroom is handled
-    /// per-backend (`LlamaCppBackend::resolve_n_ctx` reads it from
-    /// `BackendLoadParams.memory_budget`), and the `--budget 0` (total RAM)
-    /// opt-in must not be silently downgraded.
     fn effective_budget(&self) -> u64 {
         let mem = crate::scheduler::budget::MemoryBudget::detect(None);
         if self.memory_budget == 0 || self.memory_budget >= mem.total_ram {
@@ -138,39 +210,53 @@ impl ModelManager {
         std::cmp::min(self.memory_budget, mem.available_ram)
     }
 
-    /// Evict least-recently-used models until `needed` bytes fit within budget.
-    fn evict_for(&self, needed: u64) -> anyhow::Result<()> {
+    /// Evict by (priority, LRU) until `needed` bytes fit. Returns reload specs
+    /// for any evicted model with `idle_reload` set; caller arms watchers.
+    fn evict_for(&self, needed: u64) -> anyhow::Result<Vec<PendingReload>> {
+        let mut pending = Vec::new();
         let budget = self.effective_budget();
         if budget == 0 {
-            return Ok(()); // unlimited
+            return Ok(pending);
         }
 
         loop {
             let used = self.total_loaded_bytes();
             if used + needed <= budget {
-                return Ok(());
+                return Ok(pending);
             }
 
-            let models = self.models.read().unwrap();
-            if models.is_empty() {
-                anyhow::bail!(
-                    "model needs {:.1} GB but budget is {:.1} GB",
-                    needed as f64 / 1_073_741_824.0,
-                    budget as f64 / 1_073_741_824.0
-                );
-            }
+            let victim = {
+                let models = self.models.read().unwrap();
+                if models.is_empty() {
+                    anyhow::bail!(
+                        "model needs {:.1} GB but budget is {:.1} GB",
+                        needed as f64 / 1_073_741_824.0,
+                        budget as f64 / 1_073_741_824.0
+                    );
+                }
+                pick_evict_victim(models.iter().map(|(name, m)| {
+                    (name.as_str(), m.priority, *m.last_used.read().unwrap())
+                }))
+                .map(|s| s.to_string())
+                .unwrap()
+            };
 
-            let lru_name = models
-                .iter()
-                .min_by_key(|(_, m)| *m.last_used.read().unwrap())
-                .map(|(name, _)| name.clone())
-                .unwrap();
-            drop(models);
-
-            tracing::warn!(model = %lru_name, "evicting LRU model");
-            let evicted = self.models.write().unwrap().remove(&lru_name);
-            if let (Some(cache), Some(model)) = (&self.ram_cache, &evicted) {
-                cache.warm(&lru_name, &model.file_path);
+            tracing::warn!(model = %victim, "evicting model under VRAM pressure");
+            let evicted = self.models.write().unwrap().remove(&victim);
+            if let Some(model) = evicted {
+                if let Some(cache) = &self.ram_cache {
+                    cache.warm(&victim, &model.file_path);
+                }
+                if let Some(d) = model.idle_reload {
+                    pending.push(PendingReload {
+                        name: victim.clone(),
+                        path: model.file_path.clone(),
+                        digest: model.digest.clone(),
+                        gpu_layers: model.requested_gpu_layers,
+                        priority: model.priority,
+                        idle_reload: d,
+                    });
+                }
             }
         }
     }
@@ -202,14 +288,14 @@ impl ModelManager {
         path: &Path,
         gpu_layers: Option<u32>,
     ) -> anyhow::Result<()> {
-        self.load_model_with_digest(name, path, gpu_layers, String::new())
+        self.load_model_with_options(
+            name,
+            path,
+            LoadOptions { gpu_layers, ..LoadOptions::default() },
+        )
     }
 
     /// Load a model with an explicit file digest for KV cache keying.
-    ///
-    /// Prefer this over [`load_model`](Self::load_model) when the digest is already known
-    /// (e.g. from the model store registry) to avoid recomputing it.
-    #[tracing::instrument(skip(self, path, digest), fields(file_size))]
     pub fn load_model_with_digest(
         &self,
         name: &str,
@@ -217,9 +303,24 @@ impl ModelManager {
         gpu_layers: Option<u32>,
         digest: String,
     ) -> anyhow::Result<()> {
+        self.load_model_with_options(
+            name,
+            path,
+            LoadOptions { gpu_layers, digest, ..LoadOptions::default() },
+        )
+    }
+
+    #[tracing::instrument(skip(self, path, opts), fields(file_size))]
+    pub fn load_model_with_options(
+        &self,
+        name: &str,
+        path: &Path,
+        opts: LoadOptions,
+    ) -> anyhow::Result<()> {
+        self.cancel_watcher(name);
+        let LoadOptions { gpu_layers, digest, priority, idle_reload } = opts;
         let format = Self::infer_format(path);
         let backend = self.backend_for_format(&format)?;
-
         let from_ram_cache = self
             .ram_cache
             .as_ref()
@@ -235,7 +336,11 @@ impl ModelManager {
         } else {
             std::fs::metadata(path)?.len()
         };
-        self.evict_for(file_size)?;
+        let pending_reloads = self.evict_for(file_size)?;
+
+        for spec in pending_reloads {
+            self.arm_reload_watcher(spec);
+        }
 
         // Snapshot live availability BEFORE the load so the backend can
         // budget-resolve n_ctx against memory not yet consumed by weights.
@@ -305,17 +410,49 @@ impl ModelManager {
             size_bytes,
             last_used: RwLock::new(Instant::now()),
             gpu_layers: layers,
+            requested_gpu_layers: gpu_layers,
             digest,
             format,
             batch_tx,
+            priority,
+            idle_reload,
         };
 
         self.models.write().unwrap().insert(name.to_string(), loaded);
+        self.record_activity();
         Ok(())
+    }
+
+    fn record_activity(&self) {
+        *self.last_activity.write().unwrap() = Instant::now();
+    }
+
+    fn cancel_watcher(&self, name: &str) {
+        if let Some(handle) = self.watchers.lock().unwrap().remove(name) {
+            handle.abort();
+        }
+    }
+
+    /// No-ops without `into_arc` or a tokio runtime.
+    fn arm_reload_watcher(&self, spec: PendingReload) {
+        let Some(weak) = self.weak_self.get().cloned() else {
+            tracing::debug!(model = %spec.name, "idle-reload disabled: manager not in Arc");
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!(model = %spec.name, "idle-reload disabled: no tokio runtime");
+            return;
+        };
+        let name = spec.name.clone();
+        let task = handle.spawn(reload_watcher(weak, spec));
+        if let Some(prev) = self.watchers.lock().unwrap().insert(name, task) {
+            prev.abort();
+        }
     }
 
     #[tracing::instrument(skip(self))]
     pub fn unload_model(&self, name: &str) -> anyhow::Result<()> {
+        self.cancel_watcher(name);
         let removed = self
             .models
             .write()
@@ -402,13 +539,7 @@ impl ModelManager {
         encryption_key: Option<&[u8; 32]>,
         mut on_token: impl FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
-        tracing::info!(
-            model = model_name,
-            prompt_chars = prompt.len(),
-            max_tokens = params.max_tokens,
-            "generate request received"
-        );
-
+        let _active = ActiveGuard::new(&self.active_requests);
         let batch_tx = {
             let models = self.models.read().unwrap();
             models.get(model_name).and_then(|m| {
@@ -416,6 +547,7 @@ impl ModelManager {
                 m.batch_tx.clone()
             })
         };
+        *self.last_activity.write().unwrap() = Instant::now();
 
         let start = Instant::now();
         let result = if let Some(tx) = batch_tx {
@@ -574,6 +706,69 @@ impl ModelManager {
     }
 }
 
+/// Lowest priority first, oldest `last_used` as tiebreak.
+fn pick_evict_victim<'a, I>(candidates: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = (&'a str, EvictionPriority, Instant)>,
+{
+    candidates
+        .into_iter()
+        .min_by_key(|(_, p, t)| (p.evict_order(), *t))
+        .map(|(name, _, _)| name)
+}
+
+/// Sleep idle_reload, recheck idle + active_requests + headroom, reload if safe.
+async fn reload_watcher(weak: Weak<ModelManager>, spec: PendingReload) {
+    loop {
+        tokio::time::sleep(spec.idle_reload).await;
+        let Some(mgr) = weak.upgrade() else { return };
+        if mgr.is_loaded(&spec.name) {
+            return;
+        }
+        let idle_for = mgr.last_activity.read().unwrap().elapsed();
+        if idle_for < spec.idle_reload {
+            continue;
+        }
+        if mgr.active_requests.load(Ordering::SeqCst) > 0 {
+            continue;
+        }
+        if mgr.memory_budget != 0 {
+            let needed = match std::fs::metadata(&spec.path) {
+                Ok(m) => m.len(),
+                Err(e) => {
+                    tracing::warn!(model = %spec.name, error = %e, "idle-reload abort: stat failed");
+                    return;
+                }
+            };
+            let used = mgr.total_loaded_bytes();
+            let margin = mgr.memory_budget / 10;
+            if used.saturating_add(needed).saturating_add(margin) > mgr.memory_budget {
+                tracing::debug!(model = %spec.name, "idle-reload skipped: insufficient headroom");
+                return;
+            }
+        }
+        let opts = LoadOptions {
+            gpu_layers: spec.gpu_layers,
+            digest: spec.digest.clone(),
+            priority: spec.priority,
+            idle_reload: Some(spec.idle_reload),
+        };
+        let mgr_blocking = mgr.clone();
+        let path = spec.path.clone();
+        let name = spec.name.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            mgr_blocking.load_model_with_options(&name, &path, opts)
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => tracing::info!(model = %spec.name, "idle-reloaded"),
+            Ok(Err(e)) => tracing::warn!(model = %spec.name, error = %e, "idle-reload failed"),
+            Err(e) => tracing::warn!(model = %spec.name, error = %e, "idle-reload task panicked"),
+        }
+        return;
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 fn mlx_metallib_available() -> bool {
     let exe_dir = std::env::current_exe()
@@ -589,3 +784,52 @@ fn mlx_metallib_available() -> bool {
     false
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(secs: u64) -> Instant {
+        let base = Instant::now();
+        base.checked_sub(Duration::from_secs(1_000)).unwrap_or(base)
+            + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn priority_evicts_low_first_even_when_recent() {
+        let cands = vec![
+            ("low_recent", EvictionPriority::Low, t(999)),
+            ("normal_old", EvictionPriority::Normal, t(900)),
+        ];
+        assert_eq!(pick_evict_victim(cands), Some("low_recent"));
+    }
+
+    #[test]
+    fn priority_lru_tiebreak_within_tier() {
+        let cands = vec![
+            ("a", EvictionPriority::Normal, t(950)),
+            ("b", EvictionPriority::Normal, t(900)),
+        ];
+        assert_eq!(pick_evict_victim(cands), Some("b"));
+    }
+
+    #[test]
+    fn high_priority_evicted_last() {
+        let cands = vec![
+            ("high_old", EvictionPriority::High, t(900)),
+            ("normal_recent", EvictionPriority::Normal, t(999)),
+        ];
+        assert_eq!(pick_evict_victim(cands), Some("normal_recent"));
+    }
+
+    #[test]
+    fn evict_order_total_ordering() {
+        assert!(EvictionPriority::Low.evict_order() < EvictionPriority::Normal.evict_order());
+        assert!(EvictionPriority::Normal.evict_order() < EvictionPriority::High.evict_order());
+    }
+
+    #[test]
+    fn empty_candidates_returns_none() {
+        let empty: Vec<(&str, EvictionPriority, Instant)> = vec![];
+        assert_eq!(pick_evict_victim(empty), None);
+    }
+}
