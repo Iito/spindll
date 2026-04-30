@@ -69,7 +69,13 @@ impl ModelManager {
         ];
 
         #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
-        backends.push(Box::new(crate::backend::mlx_swift::MlxBackend));
+        {
+            if mlx_metallib_available() {
+                backends.push(Box::new(crate::backend::mlx_swift::MlxBackend));
+            } else {
+                tracing::warn!("mlx.metallib not found next to binary; MLX backend disabled");
+            }
+        }
 
         let default_gpu_layers = gpu_layers.unwrap_or_else(|| {
             if cfg!(target_os = "macos")
@@ -567,5 +573,20 @@ impl ModelManager {
         *loaded.last_used.write().unwrap() = Instant::now();
         loaded.model.apply_chat_template(messages)
     }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+fn mlx_metallib_available() -> bool {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let Some(dir) = exe_dir else { return false };
+    if dir.join("mlx.metallib").exists() {
+        return true;
+    }
+    if dir.join("Resources/mlx.metallib").exists() {
+        return true;
+    }
+    false
 }
 
