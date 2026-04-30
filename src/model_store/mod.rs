@@ -192,7 +192,12 @@ impl ModelStore {
                             "'{model}' contains MLX safetensors, not GGUF — drop --gguf or pass --mlx"
                         );
                     }
-                    // Registry key is just the repo ID — no filename suffix.
+                    if !platform_prefers_mlx() {
+                        anyhow::bail!(
+                            "'{model}' contains only MLX safetensors, which this build cannot run — \
+                             look for a GGUF version instead"
+                        );
+                    }
                     let key = model.to_string();
                     (dir, size, key, digest, registry::ModelFormat::Mlx)
                 }
