@@ -104,14 +104,26 @@ impl ModelStore {
             }
         }
 
-        self.pull_gguf(model, quant)
+        let strict_gguf = format_pref == FormatPreference::Gguf;
+        self.pull_gguf(model, quant, strict_gguf)
     }
 
     /// Resolve an MLX equivalent for `model` and download it. Errors if no
     /// matching `mlx-community/...` repo is found on HuggingFace.
     fn try_pull_mlx(&self, model: &str, mlx_quant: &str) -> anyhow::Result<PathBuf> {
-        let candidate = mlx_resolve::find_mlx_repo(model, mlx_quant)?
-            .ok_or_else(|| anyhow::anyhow!("no MLX equivalent found for '{model}'"))?;
+        // Direct probe first when input is a full HF repo path -- lets
+        // `--mlx other-org/foo` pull from other-org, not just mlx-community.
+        let candidate = if model.contains('/') {
+            mlx_resolve::probe_repo(model)?
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    mlx_resolve::find_mlx_repo(model, mlx_quant)?
+                        .ok_or_else(|| anyhow::anyhow!("no MLX equivalent found for '{model}'"))
+                })?
+        } else {
+            mlx_resolve::find_mlx_repo(model, mlx_quant)?
+                .ok_or_else(|| anyhow::anyhow!("no MLX equivalent found for '{model}'"))?
+        };
 
         tracing::info!(repo = %candidate.repo_id, "resolved MLX model");
 
@@ -127,7 +139,13 @@ impl ModelStore {
         };
 
         let (architecture, model_name) = download::read_mlx_metadata(&path);
-        let base_model = derive_base_model(&model_name, model);
+        // Stamp normalized alias ("llama3.1:8b" -> "llama3.1-8b") as base_model
+        // so resolve_key step 5 matches. Otherwise alias unresolvable post-pull.
+        let base_model = if !model.contains('/') && model.contains(':') {
+            model.replace(':', "-")
+        } else {
+            derive_base_model(&model_name, model)
+        };
         let key = candidate.repo_id.clone();
 
         let mut reg = registry::Registry::load(&self.registry_path())?;
@@ -154,8 +172,9 @@ impl ModelStore {
         Ok(path)
     }
 
-    /// Pull a GGUF model (the original path).
-    fn pull_gguf(&self, model: &str, quant: Option<&str>) -> anyhow::Result<PathBuf> {
+    /// Pull a GGUF model. `strict_gguf=true` rejects MLX-only repos so
+    /// `--gguf` does not silently land MLX safetensors.
+    fn pull_gguf(&self, model: &str, quant: Option<&str>, strict_gguf: bool) -> anyhow::Result<PathBuf> {
         let is_hf = model.contains('/');
 
         // --- Download & detect format ---
@@ -168,6 +187,11 @@ impl ModelStore {
                     (path, size, key, digest, registry::ModelFormat::Gguf)
                 }
                 download::HfDownload::Mlx { dir, size, digest } => {
+                    if strict_gguf {
+                        anyhow::bail!(
+                            "'{model}' contains MLX safetensors, not GGUF — drop --gguf or pass --mlx"
+                        );
+                    }
                     // Registry key is just the repo ID — no filename suffix.
                     let key = model.to_string();
                     (dir, size, key, digest, registry::ModelFormat::Mlx)
@@ -442,14 +466,18 @@ impl ModelStore {
         Ok(imported)
     }
 
-    /// Remove a model from the registry and delete its file on disk.
+    /// Remove a model from the registry and delete its file or directory on disk.
     pub fn remove(&self, model: &str) -> anyhow::Result<()> {
         let mut reg = registry::Registry::load(&self.registry_path())?;
         let entry = reg.remove(model)
             .ok_or_else(|| anyhow::anyhow!("model '{}' not found", model))?;
 
         if entry.path.exists() {
-            std::fs::remove_file(&entry.path)?;
+            // MLX = dir, GGUF = file.
+            match entry.format {
+                registry::ModelFormat::Mlx => std::fs::remove_dir_all(&entry.path)?,
+                registry::ModelFormat::Gguf => std::fs::remove_file(&entry.path)?,
+            }
         }
 
         reg.save(&self.registry_path())?;
@@ -531,5 +559,79 @@ fn format_size(bytes: u64) -> String {
         format!("{:.1} MB", bytes as f64 / 1_048_576.0)
     } else {
         format!("{} KB", bytes / 1024)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model_store::registry::{ModelEntry, ModelFormat, Registry};
+
+    fn write_entry(path: &std::path::Path, key: &str, entry: ModelEntry) {
+        let mut reg = Registry::load(path).unwrap();
+        reg.add(key.to_string(), entry);
+        reg.save(path).unwrap();
+    }
+
+    fn mlx_entry(repo: &str, base_model: &str) -> ModelEntry {
+        ModelEntry {
+            repo: repo.to_string(),
+            filename: String::new(),
+            path: std::path::PathBuf::from("/tmp/nonexistent"),
+            size_bytes: 0,
+            downloaded_at: 0,
+            digest: String::new(),
+            model_name: String::new(),
+            description: String::new(),
+            architecture: String::new(),
+            context_length: 0,
+            metadata_read: true,
+            format: ModelFormat::Mlx,
+            base_model: base_model.to_string(),
+        }
+    }
+
+    /// Regression: alias must resolve when registry key is mlx-community/...
+    /// Pull stamps normalized alias as base_model; this exercises the read side.
+    #[test]
+    fn resolve_key_finds_mlx_by_ollama_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(store.models_dir()).unwrap();
+        write_entry(
+            &store.registry_path(),
+            "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
+            mlx_entry("mlx-community/Meta-Llama-3.1-8B-Instruct-4bit", "llama3.1-8b"),
+        );
+
+        let resolved = store.resolve_key("llama3.1:8b").unwrap();
+        assert_eq!(resolved, "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit");
+    }
+
+    /// Regression: MLX entry uses remove_dir_all (remove_file errors on dirs).
+    #[test]
+    fn remove_mlx_handles_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(store.models_dir()).unwrap();
+
+        // Real MLX layout: config + safetensors shard.
+        let model_dir = store.models_dir().join("mlx-community/test-4bit");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("config.json"), "{}").unwrap();
+        std::fs::write(model_dir.join("model.safetensors"), b"fake").unwrap();
+
+        let mut entry = mlx_entry("mlx-community/test-4bit", "test-4bit");
+        entry.path = model_dir.clone();
+        write_entry(
+            &store.registry_path(),
+            "mlx-community/test-4bit",
+            entry,
+        );
+
+        store.remove("mlx-community/test-4bit").expect("remove should succeed for MLX dir");
+        assert!(!model_dir.exists(), "MLX dir should be deleted");
+        let reg = Registry::load(&store.registry_path()).unwrap();
+        assert!(!reg.models.contains_key("mlx-community/test-4bit"));
     }
 }

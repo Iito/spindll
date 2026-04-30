@@ -51,7 +51,7 @@ enum Commands {
         #[arg(long)]
         gpu_layers: Option<u32>,
 
-        /// Memory budget for loaded models (e.g. "8G", omit for 80% of available RAM)
+        /// Memory budget for loaded models (e.g. "8G", omit for full live availability)
         #[arg(long)]
         budget: Option<String>,
 
@@ -183,29 +183,14 @@ struct BenchResult {
     mem_peak_mb: f64,
 }
 
-#[cfg(target_os = "macos")]
+/// Resident memory of this process in MB. Uses `memory-stats` which wraps
+/// task_info on macOS, /proc on Linux, GetProcessMemoryInfo on Windows --
+/// ~370 ns/call, no self-pollution. (sysinfo::System::new_all takes ~5 ms
+/// and inflates RSS by ~5 MB per call: see tools/mem_bench/.)
 fn phys_footprint_mb() -> f64 {
-    use std::mem;
-    unsafe {
-        let mut info: libc::mach_task_basic_info = mem::zeroed();
-        let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
-        let ret = libc::task_info(
-            libc::mach_task_self(),
-            libc::MACH_TASK_BASIC_INFO as libc::task_flavor_t,
-            &mut info as *mut libc::mach_task_basic_info as libc::task_info_t,
-            &mut count,
-        );
-        if ret == libc::KERN_SUCCESS {
-            info.resident_size as f64 / (1024.0 * 1024.0)
-        } else {
-            0.0
-        }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn phys_footprint_mb() -> f64 {
-    0.0
+    memory_stats::memory_stats()
+        .map(|s| s.physical_mem as f64 / (1024.0 * 1024.0))
+        .unwrap_or(0.0)
 }
 
 fn bench_by_format(
@@ -289,12 +274,13 @@ fn format_mem(mb: f64) -> String {
 fn print_bench_row(label: &str, r: &BenchResult) {
     let label = if label.len() > 40 { &label[..40] } else { label };
     println!(
-        "{:<40} {:>4} {:>8.0}ms {:>8.1} {:>7.2}s {:>6}",
+        "{:<40} {:>4} {:>8.0}ms {:>8.1} {:>7.2}s {:>5} {:>6}",
         label,
         r.format_name,
         r.ttft_ms,
         r.tokens_per_sec,
         r.total_ms / 1000.0,
+        r.tokens,
         format_mem(r.mem_peak_mb),
     );
 }
@@ -467,12 +453,12 @@ async fn main() -> anyhow::Result<()> {
                 "runs      {} (+ 1 warmup)  max-tokens={}  ctx-size={} (GGUF)",
                 runs, max_tokens, ctx_size
             );
-            println!("{}", "─".repeat(80));
+            println!("{}", "─".repeat(86));
             println!(
-                "{:<40} {:>4} {:>9} {:>9} {:>8} {:>6}",
-                "MODEL", "FMT", "TTFT", "TOK/S", "TOTAL", "MEM"
+                "{:<40} {:>4} {:>9} {:>9} {:>8} {:>5} {:>6}",
+                "MODEL", "FMT", "TTFT", "TOK/S", "TOTAL", "TOKS", "MEM"
             );
-            println!("{}", "─".repeat(80));
+            println!("{}", "─".repeat(86));
 
             let path1 = store.resolve_model_path(&model)?;
             let fmt1 = store.resolve_model_format(&model)?;
@@ -484,7 +470,7 @@ async fn main() -> anyhow::Result<()> {
             let r2 = bench_by_format(&path2, fmt2, prompt_str, max_tokens, runs, ctx_size)?;
             print_bench_row(&against, &r2);
 
-            println!("{}", "─".repeat(80));
+            println!("{}", "─".repeat(86));
 
             let tps_ratio = r2.tokens_per_sec / r1.tokens_per_sec;
             let ttft_ratio = r1.ttft_ms / r2.ttft_ms;

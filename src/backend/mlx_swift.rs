@@ -69,12 +69,20 @@ impl InferenceBackend for MlxBackend {
     fn load_model(
         &self,
         path: &Path,
-        _params: BackendLoadParams,
+        params: BackendLoadParams,
     ) -> anyhow::Result<Box<dyn BackendModel>> {
-        let engine = MlxSwiftEngine::load(path)?;
+        let mut engine = MlxSwiftEngine::load(path)?;
+
+        // Bookkeeping clamp -- TokenIterator handles ctx dynamically, but
+        // n_ctx() drives KV-aware eviction in total_loaded_bytes.
+        if params.n_ctx > 0 && params.n_ctx < engine.model_n_ctx {
+            engine.model_n_ctx = params.n_ctx;
+        }
+
         tracing::info!(
             n_ctx = engine.model_n_ctx,
             size_bytes = engine.model_size_bytes,
+            kv_bytes_per_token = engine.kv_bytes_per_token,
             "MLX model loaded"
         );
         Ok(Box::new(engine))
@@ -98,6 +106,8 @@ pub struct MlxSwiftEngine {
     handle: *mut MlxModelHandle,
     pub model_n_ctx: u32,
     pub model_size_bytes: u64,
+    /// Per-token KV bytes from config.json. 0 if config incomplete.
+    pub kv_bytes_per_token: u64,
 }
 
 // The handle is an opaque pointer managed by Swift ARC; it is never aliased.
@@ -117,11 +127,19 @@ impl MlxSwiftEngine {
             anyhow::bail!("mlx_model_load returned NULL for {:?}", model_path);
         }
 
-        let model_n_ctx = std::fs::read_to_string(model_path.join("config.json"))
+        let config: Option<serde_json::Value> = std::fs::read_to_string(model_path.join("config.json"))
             .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|s| serde_json::from_str(&s).ok());
+
+        let model_n_ctx = config
+            .as_ref()
             .and_then(|v| v.get("max_position_embeddings")?.as_u64())
             .unwrap_or(4096) as u32;
+
+        let kv_bytes_per_token = config
+            .as_ref()
+            .map(crate::model_store::download::kv_bpt_from_mlx_config)
+            .unwrap_or(0);
 
         let model_size_bytes: u64 = std::fs::read_dir(model_path)
             .ok()
@@ -143,6 +161,7 @@ impl MlxSwiftEngine {
             handle,
             model_n_ctx,
             model_size_bytes,
+            kv_bytes_per_token,
         })
     }
 
@@ -165,6 +184,16 @@ impl MlxSwiftEngine {
         params: &GenerateParams,
         on_token: &mut dyn FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
+        // No disk KV cache on MLX -- prefill would burn full decode then drop
+        // the result. Return zeros so gRPC Prefill is a cheap no-op.
+        if params.prefill_only {
+            return Ok(GenerateResult {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                cache_hit: false,
+            });
+        }
+
         let c_prompt = CString::new(prompt)?;
 
         // Bounded channel: Swift callback thread → this thread.
@@ -283,6 +312,10 @@ impl BackendModel for MlxSwiftEngine {
 
     fn size_bytes(&self) -> u64 {
         self.model_size_bytes
+    }
+
+    fn kv_bytes_per_token(&self) -> u64 {
+        self.kv_bytes_per_token
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
