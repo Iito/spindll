@@ -366,7 +366,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("batch scheduling: {batch_slots} concurrent slots per model");
             }
 
-            let manager = std::sync::Arc::new(manager);
+            let manager = manager.into_arc();
             let store = std::sync::Arc::new(spindll::model_store::ModelStore::new(None));
 
             #[cfg(feature = "http")]
