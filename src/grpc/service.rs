@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use crate::engine::{GenerateParams, ModelManager};
+use crate::engine::{EvictionPriority, GenerateParams, LoadOptions, ModelManager};
 use crate::model_store::ModelStore;
 use crate::proto::spindll_server::Spindll;
 use crate::proto::*;
@@ -294,8 +294,23 @@ impl Spindll for SpindllService {
 
         let gpu_layers = if req.gpu_layers < 0 { None } else { Some(req.gpu_layers as u32) };
 
+        let priority = match crate::proto::EvictionPriority::try_from(req.priority) {
+            Ok(crate::proto::EvictionPriority::PriorityLow) => EvictionPriority::Low,
+            Ok(crate::proto::EvictionPriority::PriorityHigh) => EvictionPriority::High,
+            _ => EvictionPriority::Normal,
+        };
+        let idle_reload = if req.idle_reload_secs == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(req.idle_reload_secs as u64))
+        };
+
         self.manager
-            .load_model_with_digest(&req.model, &model_path, gpu_layers, digest)
+            .load_model_with_options(
+                &req.model,
+                &model_path,
+                LoadOptions { gpu_layers, digest, priority, idle_reload },
+            )
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(LoadResponse {
