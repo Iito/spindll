@@ -139,6 +139,15 @@ message ModelInfo {
 message LoadRequest {
   string model = 1;
   int32 gpu_layers = 2;  // -1 = auto
+  EvictionPriority priority = 3;
+  uint32 idle_reload_secs = 4;  // 0 = disabled
+}
+
+// Low evicts first, LRU tiebreak within tier.
+enum EvictionPriority {
+  PRIORITY_NORMAL = 0;
+  PRIORITY_LOW = 1;
+  PRIORITY_HIGH = 2;
 }
 
 message LoadResponse {
