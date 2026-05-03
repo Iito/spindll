@@ -15,9 +15,60 @@ private final class Box<T>: @unchecked Sendable {
     var value: T?
 }
 
-// Retains the ModelContainer across FFI calls.
+// ---------------------------------------------------------------------------
+// PromptCache — in-memory LRU cache of KV state keyed by token sequence.
+//
+// On a cache hit for an
+// identical prompt the expensive prefill is skipped: only the last prompt token
+// is re-processed (one decode step), so TTFT ≈ single-token forward pass.
+//
+// Access is serialised by ModelContainer's SerialAccessContainer actor, so no
+// additional lock is needed.
+// ---------------------------------------------------------------------------
+
+private final class PromptCacheEntry {
+    let tokenIds: [Int32]
+    let lastTokenId: Int32
+    let kvCache: [any KVCache]
+
+    init(tokenIds: [Int32], kvCache: [any KVCache]) {
+        self.tokenIds  = tokenIds
+        self.lastTokenId = tokenIds.last ?? 0
+        self.kvCache   = kvCache
+    }
+}
+
+private final class PromptCache {
+    private var entries: [PromptCacheEntry] = []
+    private let maxSize: Int
+
+    init(maxSize: Int = 4) { self.maxSize = maxSize }
+
+    /// Return the entry whose token sequence exactly matches, and promote it
+    /// to the front of the LRU list.
+    func lookup(tokenIds: [Int32]) -> PromptCacheEntry? {
+        guard !tokenIds.isEmpty,
+              let idx = entries.firstIndex(where: { $0.tokenIds == tokenIds })
+        else { return nil }
+        let entry = entries.remove(at: idx)
+        entries.insert(entry, at: 0)
+        return entry
+    }
+
+    /// Insert (or replace) an entry for the given token sequence, evicting the
+    /// least-recently-used entry if the cache is full.
+    func save(tokenIds: [Int32], kvCache: [any KVCache]) {
+        guard !tokenIds.isEmpty else { return }
+        entries.removeAll { $0.tokenIds == tokenIds }
+        entries.insert(PromptCacheEntry(tokenIds: tokenIds, kvCache: kvCache), at: 0)
+        if entries.count > maxSize { entries.removeLast() }
+    }
+}
+
+// Retains the ModelContainer and prompt KV cache across FFI calls.
 private final class ModelState: @unchecked Sendable {
     let container: ModelContainer
+    let promptCache = PromptCache()
     init(_ container: ModelContainer) { self.container = container }
 }
 
@@ -33,10 +84,6 @@ public func mlxModelLoad(_ path: UnsafePointer<CChar>?) -> UnsafeMutableRawPoint
     guard let path else { return nil }
     let modelPath = String(cString: path)
     let url = URL(fileURLWithPath: modelPath)
-
-    // Tune MLX caches once per load. Setting these per-generate caused
-    // re-acquire churn; doing it here amortises across all requests.
-    Memory.cacheLimit = 64 * 1024 * 1024
 
     let sema = DispatchSemaphore(value: 0)
     let box = Box<ModelState>()
@@ -104,18 +151,17 @@ public func mlxGenerate(
                 topP: topP
             )
 
-            // Prepare input through the model's own processor (handles chat templates etc.)
-            let lmInput = try await state.container.prepare(
-                input: UserInput(prompt: promptStr)
-            )
-
-            // Run the token loop synchronously inside actor isolation. This
-            // avoids the per-token Sendable hop of AsyncStream<Generation>
-            // and matches the perf profile of Apple's `llm-tool` CLI.
+            // Tokenise the already chat-template-formatted prompt directly.
+            // Using UserInput(prompt:) + container.prepare() would re-apply the
+            // chat template (wrapping the formatted string inside another user
+            // turn) and costs an extra actor entry. Instead, encode the string
+            // once and construct LMInput directly inside a single perform call.
             var generated: Int32 = 0
-            try await state.container.perform(nonSendable: lmInput) { context, lmInputLocal in
+            try await state.container.perform(nonSendable: promptStr) { context, prompt in
+                let tokenIds = context.tokenizer.encode(text: prompt, addSpecialTokens: false)
+                let lmInput = LMInput(tokens: MLXArray(tokenIds.map { Int32($0) }))
                 var iterator = try TokenIterator(
-                    input: lmInputLocal,
+                    input: lmInput,
                     model: context.model,
                     parameters: params
                 )
@@ -160,6 +206,135 @@ public func mlxGenerate(
                 // Wait for in-flight async evaluations to finish before the
                 // perform closure tears down — mirrors upstream's sync loop
                 // in `runSynchronousGenerationLoop` (Evaluate.swift:1134).
+                Stream().synchronize()
+            }
+            box.value = generated
+        } catch {
+            box.value = -1
+        }
+        sema.signal()
+    }
+    sema.wait()
+
+    return box.value ?? -1
+}
+
+// ---------------------------------------------------------------------------
+// mlx_chat_generate
+// ---------------------------------------------------------------------------
+
+/// Apply the model's chat template and generate tokens in a single actor entry.
+///
+/// `messagesJson` is a UTF-8 JSON array of `{"role": ..., "content": ...}`
+/// objects. The tokeniser's Jinja chat template is applied to obtain token
+/// IDs which are fed directly to `TokenIterator` — no decode → encode
+/// round-trip. Returns the number of tokens generated on success, -1 on error.
+@_cdecl("mlx_chat_generate")
+public func mlxChatGenerate(
+    _ handle:      UnsafeMutableRawPointer?,
+    _ messagesJson: UnsafePointer<CChar>?,
+    _ maxTokens:   UInt32,
+    _ temperature: Float,
+    _ topP:        Float,
+    _ seed:        UInt32,
+    _ callback:    @convention(c) (UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Int32,
+    _ callbackCtx: UnsafeMutableRawPointer?
+) -> Int32 {
+    guard let handle, let messagesJson else { return -1 }
+    let state = Unmanaged<ModelState>.fromOpaque(handle).takeUnretainedValue()
+    let json = String(cString: messagesJson)
+
+    guard
+        let data = json.data(using: .utf8),
+        let parsed = try? JSONSerialization.jsonObject(with: data),
+        let messages = parsed as? [[String: String]]
+    else { return -1 }
+
+    let sema = DispatchSemaphore(value: 0)
+    let box = Box<Int32>()
+
+    Task {
+        do {
+            let params = GenerateParameters(
+                maxTokens: Int(maxTokens),
+                temperature: temperature,
+                topP: topP
+            )
+
+            var generated: Int32 = 0
+            try await state.container.perform(nonSendable: messages) { context, msgs in
+                // Apply the chat template once → token IDs. No decode → encode round-trip.
+                let rawIds  = try context.tokenizer.applyChatTemplate(messages: msgs)
+                let tokenIds = rawIds.map { Int32($0) }
+
+                // --- Prompt KV cache ---
+                // On a hit we restore the saved KV state (trimmed by 1 token),
+                // then feed only the last prompt token to TokenIterator so that
+                // prefill is a single decode step instead of N steps.
+                // On a miss we run full prefill and snapshot the resulting cache
+                // (before generation) for the next call with the same prompt.
+                var iterator: TokenIterator
+                if let entry = state.promptCache.lookup(tokenIds: tokenIds) {
+                    // HIT: restore cache at offset N-1, run last token only.
+                    let restoredCache = entry.kvCache.map { $0.copy() }
+                    trimPromptCache(restoredCache, numTokens: 1)
+                    let seedInput = LMInput(tokens: MLXArray([entry.lastTokenId]))
+                    iterator = try TokenIterator(
+                        input: seedInput,
+                        model: context.model,
+                        cache: restoredCache,
+                        parameters: params
+                    )
+                } else {
+                    // MISS: full prefill.  We own the cache object so we can
+                    // snapshot it (via copy()) immediately after init — the KVCache
+                    // instances are classes and are mutated in-place by TokenIterator,
+                    // so ownedCache already reflects the post-prefill state.
+                    let ownedCache = makePromptCache(model: context.model, parameters: params)
+                    let lmInput = LMInput(tokens: MLXArray(tokenIds))
+                    iterator = try TokenIterator(
+                        input: lmInput,
+                        model: context.model,
+                        cache: ownedCache,
+                        parameters: params
+                    )
+                    // Snapshot at offset=N (all prompt tokens processed, before decode).
+                    let snapshot = ownedCache.map { $0.copy() }
+                    state.promptCache.save(tokenIds: tokenIds, kvCache: snapshot)
+                }
+
+                var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
+
+                var stopTokenIds: Set<Int> = []
+                if let eos = context.tokenizer.eosTokenId { stopTokenIds.insert(eos) }
+                if let unk = context.tokenizer.unknownTokenId { stopTokenIds.insert(unk) }
+                for id in context.configuration.eosTokenIds { stopTokenIds.insert(id) }
+                for token in context.configuration.extraEOSTokens {
+                    if let id = context.tokenizer.convertTokenToId(token) {
+                        stopTokenIds.insert(id)
+                    }
+                }
+
+                var cancelled = false
+                while let tokenId = iterator.next() {
+                    if stopTokenIds.contains(tokenId) { break }
+                    generated += 1
+                    detokenizer.append(token: tokenId)
+                    if let chunk = detokenizer.next() {
+                        let shouldContinue = chunk.withCString { ptr in
+                            callback(ptr, callbackCtx)
+                        }
+                        if shouldContinue == 0 {
+                            cancelled = true
+                            break
+                        }
+                    }
+                }
+
+                if !cancelled, let chunk = detokenizer.next() {
+                    _ = chunk.withCString { ptr in callback(ptr, callbackCtx) }
+                }
+
                 Stream().synchronize()
             }
             box.value = generated

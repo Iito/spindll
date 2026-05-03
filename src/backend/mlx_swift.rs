@@ -34,6 +34,17 @@ unsafe extern "C" {
         callback_ctx: *mut c_void,
     ) -> i32;
 
+    fn mlx_chat_generate(
+        handle:        *mut MlxModelHandle,
+        messages_json: *const c_char,
+        max_tokens:    u32,
+        temperature:   f32,
+        top_p:         f32,
+        seed:          u32,
+        callback:      unsafe extern "C" fn(*const c_char, *mut c_void) -> c_int,
+        callback_ctx:  *mut c_void,
+    ) -> i32;
+
     fn mlx_apply_chat_template(
         handle:        *mut MlxModelHandle,
         messages_json: *const c_char,
@@ -165,6 +176,71 @@ impl MlxSwiftEngine {
         })
     }
 
+    /// Apply the model's chat template and generate in one FFI call, avoiding
+    /// the decode → encode round-trip that the two-call path incurs.
+    fn chat_generate_dyn(
+        &self,
+        messages: &[(String, String)],
+        params: &GenerateParams,
+        on_token: &mut dyn FnMut(&str) -> bool,
+    ) -> anyhow::Result<GenerateResult> {
+        let json: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|(role, content)| serde_json::json!({ "role": role, "content": content }))
+            .collect();
+        let json_str = serde_json::to_string(&json)
+            .map_err(|e| anyhow::anyhow!("failed to encode chat messages: {e}"))?;
+        let c_json = CString::new(json_str)?;
+
+        let (tx, rx) = mpsc::sync_channel::<String>(64);
+        let sender = Box::new(TokenSender { tx });
+
+        let handle_addr: usize = self.handle as usize;
+        let sender_addr: usize = Box::into_raw(sender) as usize;
+
+        let max_tok = params.max_tokens;
+        let temp    = params.temperature;
+        let top_p   = params.top_p;
+        let seed    = params.seed;
+
+        let join = std::thread::spawn(move || {
+            let h = handle_addr as *mut MlxModelHandle;
+            let s = sender_addr as *mut TokenSender;
+            let result = unsafe {
+                mlx_chat_generate(
+                    h,
+                    c_json.as_ptr(),
+                    max_tok,
+                    temp,
+                    top_p,
+                    seed,
+                    token_callback,
+                    s as *mut c_void,
+                )
+            };
+            drop(unsafe { Box::from_raw(s) });
+            result
+        });
+
+        let mut completion_tokens = 0u32;
+        for token in &rx {
+            if token.is_empty() { continue; }
+            completion_tokens += 1;
+            if !on_token(&token) { break; }
+        }
+        drop(rx);
+
+        let raw_result = join
+            .join()
+            .map_err(|_| anyhow::anyhow!("MLX chat generation thread panicked"))?;
+
+        if raw_result < 0 {
+            anyhow::bail!("mlx_chat_generate returned error ({})", raw_result);
+        }
+
+        Ok(GenerateResult { prompt_tokens: 0, completion_tokens, cache_hit: false })
+    }
+
     /// Generate tokens from `prompt`, calling `on_token` for each text chunk.
     ///
     /// Return `false` from `on_token` to stop early.
@@ -236,6 +312,11 @@ impl MlxSwiftEngine {
 
         let mut completion_tokens = 0u32;
         for token in &rx {
+            // The Swift bridge emits an empty string as the EOS indicator;
+            // skip it so completion_tokens reflects actual content tokens only.
+            if token.is_empty() {
+                continue;
+            }
             completion_tokens += 1;
             if !on_token(&token) {
                 // Dropping rx causes the next send() to fail, making the callback
@@ -269,6 +350,19 @@ impl BackendModel for MlxSwiftEngine {
         on_token: &mut dyn FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
         self.generate_dyn(prompt, params, on_token)
+    }
+
+    fn generate_chat(
+        &self,
+        messages: &[(String, String)],
+        params: &GenerateParams,
+        on_token: &mut dyn FnMut(&str) -> bool,
+    ) -> anyhow::Result<GenerateResult> {
+        // MLX has no disk KV cache; prefill is a cheap no-op.
+        if params.prefill_only {
+            return Ok(GenerateResult { prompt_tokens: 0, completion_tokens: 0, cache_hit: false });
+        }
+        self.chat_generate_dyn(messages, params, on_token)
     }
 
     fn apply_chat_template(

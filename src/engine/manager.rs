@@ -688,6 +688,115 @@ impl ModelManager {
         loaded.model.generate(prompt, params, on_token)
     }
 
+    /// Apply the model's chat template and generate in one step.
+    ///
+    /// Backends that support fused template + generation (e.g. MLX) use a
+    /// single FFI call, eliminating the decode → encode round-trip. All other
+    /// backends fall back to `apply_chat_template` + `generate`.
+    #[tracing::instrument(
+        skip(self, messages, params, on_token, encryption_key),
+        fields(model = model_name)
+    )]
+    pub fn generate_chat(
+        &self,
+        model_name: &str,
+        messages: &[(String, String)],
+        params: &GenerateParams,
+        encryption_key: Option<&[u8; 32]>,
+        mut on_token: impl FnMut(&str) -> bool,
+    ) -> anyhow::Result<GenerateResult> {
+        let _active = ActiveGuard::new(&self.active_requests);
+        let batch_tx = {
+            let models = self.models.read().unwrap();
+            models.get(model_name).and_then(|m| {
+                *m.last_used.write().unwrap() = Instant::now();
+                m.batch_tx.clone()
+            })
+        };
+        *self.last_activity.write().unwrap() = Instant::now();
+
+        let start = Instant::now();
+        let result = if let Some(tx) = batch_tx {
+            // Batch scheduler path is llama.cpp-only and requires a prompt string.
+            let prompt = self.apply_chat_template(model_name, messages)?;
+            Self::generate_via_batch(tx, &prompt, params, &mut on_token)
+        } else {
+            self.generate_chat_direct(model_name, messages, params, encryption_key, &mut on_token)
+        };
+
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        match &result {
+            Ok(stats) => {
+                tracing::info!(
+                    prompt_tokens = stats.prompt_tokens,
+                    completion_tokens = stats.completion_tokens,
+                    elapsed_ms = elapsed_us / 1000,
+                    "generation complete"
+                );
+                if params.prefill_only {
+                    self.metrics
+                        .record_prefill(stats.prompt_tokens as u64, elapsed_us, stats.cache_hit);
+                } else {
+                    self.metrics.record_generate(
+                        stats.prompt_tokens as u64,
+                        stats.completion_tokens as u64,
+                        elapsed_us,
+                        stats.cache_hit,
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, elapsed_ms = elapsed_us / 1000, "generation failed");
+                self.metrics.record_error();
+            }
+        }
+        result
+    }
+
+    /// Per-request context path for `generate_chat`.
+    fn generate_chat_direct(
+        &self,
+        model_name: &str,
+        messages: &[(String, String)],
+        params: &GenerateParams,
+        encryption_key: Option<&[u8; 32]>,
+        on_token: &mut dyn FnMut(&str) -> bool,
+    ) -> anyhow::Result<GenerateResult> {
+        let models = self.models.read().unwrap();
+        let loaded = models
+            .get(model_name)
+            .ok_or_else(|| anyhow::anyhow!("model '{}' not loaded", model_name))?;
+        *loaded.last_used.write().unwrap() = Instant::now();
+
+        // KV cache path: GGUF models need the prompt as a string.
+        if let Some(cache) = &self.kv_cache {
+            if let Some(llama) = loaded.model.as_any().downcast_ref::<LlamaCppModel>() {
+                let prompt = loaded.model.apply_chat_template(messages)?;
+                let ctx_params = LlamaContextParams::default()
+                    .with_n_ctx(NonZeroU32::new(loaded.n_ctx))
+                    .with_n_batch(loaded.n_ctx);
+                let mut ctx = llama
+                    .llama_model()
+                    .new_context(llama.llama_backend(), ctx_params)
+                    .map_err(|e| anyhow::anyhow!("failed to create context: {e}"))?;
+                return generate_streaming_cached(
+                    llama.llama_model(),
+                    &mut ctx,
+                    &prompt,
+                    params,
+                    model_name,
+                    &loaded.digest,
+                    cache,
+                    encryption_key,
+                    on_token,
+                );
+            }
+        }
+
+        // All other backends (MLX): fused template + generation.
+        loaded.model.generate_chat(messages, params, on_token)
+    }
+
     /// Apply the model's built-in chat template to a list of `(role, content)` messages.
     /// Falls back to ChatML if the model has no embedded template.
     ///
