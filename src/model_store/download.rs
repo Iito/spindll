@@ -36,6 +36,25 @@ pub(crate) fn extract_quant(filename: &str) -> Option<&'static str> {
     None
 }
 
+/// If `filename` matches the split-GGUF naming pattern
+/// (e.g. `model-fp16-00001-of-00002.gguf`), returns the common stem
+/// shared by all shards (`model-fp16`).
+fn split_shard_stem(filename: &str) -> Option<&str> {
+    let base = filename.strip_suffix(".gguf")?;
+    let dash_of = base.rfind("-of-")?;
+    let after_of = &base[dash_of + 4..];
+    if after_of.is_empty() || !after_of.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let before_of = &base[..dash_of];
+    let last_dash = before_of.rfind('-')?;
+    let part_num = &before_of[last_dash + 1..];
+    if part_num.is_empty() || !part_num.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(&before_of[..last_dash])
+}
+
 /// Lower rank = more preferred. Files that don't match any known quant
 /// fall between the priority list and full-precision; fp16/bf16/f32 sort
 /// last so we don't accidentally pull a 6 GB research weight when a 2 GB
@@ -120,23 +139,44 @@ pub fn download_hf_auto(
             picked
         };
 
-        tracing::info!(file = %target.rfilename, "downloading GGUF");
-        let cached = repo.get(&target.rfilename)?;
+        // Collect all shards if the target is part of a split GGUF.
+        let targets: Vec<&str> = if let Some(stem) = split_shard_stem(&target.rfilename) {
+            let mut shards: Vec<&str> = gguf_files
+                .iter()
+                .filter(|s| split_shard_stem(&s.rfilename) == Some(stem))
+                .map(|s| s.rfilename.as_str())
+                .collect();
+            shards.sort();
+            shards
+        } else {
+            vec![&target.rfilename]
+        };
 
         std::fs::create_dir_all(dest_dir)?;
-        let dest = dest_dir.join(&target.rfilename);
-        if !dest.exists() {
-            link_or_copy(&cached, &dest)?;
+        let mut total_size: u64 = 0;
+        let mut first_dest = None;
+
+        for filename in &targets {
+            tracing::info!(file = %filename, "downloading GGUF");
+            let cached = repo.get(filename)?;
+            let dest = dest_dir.join(filename);
+            if !dest.exists() {
+                link_or_copy(&cached, &dest)?;
+            }
+            total_size += std::fs::metadata(&cached)?.len();
+            if first_dest.is_none() {
+                first_dest = Some(dest);
+            }
         }
 
-        let size   = std::fs::metadata(&cached)?.len();
-        let digest = sha256_file(&cached)?;
+        let first = first_dest.expect("targets is non-empty");
+        let digest = sha256_file(&first)?;
 
-        tracing::info!(path = %dest.display(), "GGUF download complete");
+        tracing::info!(path = %first.display(), shards = targets.len(), "GGUF download complete");
         return Ok(HfDownload::Gguf {
-            path: dest,
+            path: first,
             filename: target.rfilename.clone(),
-            size,
+            size: total_size,
             digest,
         });
     }
@@ -407,6 +447,24 @@ mod tests {
     #[test]
     fn extract_quant_returns_none_when_no_match() {
         assert_eq!(extract_quant("model.gguf"), None);
+    }
+
+    #[test]
+    fn split_shard_stem_detects_sharded_gguf() {
+        assert_eq!(
+            split_shard_stem("qwen2.5-3b-instruct-fp16-00001-of-00002.gguf"),
+            Some("qwen2.5-3b-instruct-fp16")
+        );
+        assert_eq!(
+            split_shard_stem("qwen2.5-3b-instruct-fp16-00002-of-00002.gguf"),
+            Some("qwen2.5-3b-instruct-fp16")
+        );
+    }
+
+    #[test]
+    fn split_shard_stem_returns_none_for_single_file() {
+        assert_eq!(split_shard_stem("model-q4_k_m.gguf"), None);
+        assert_eq!(split_shard_stem("model-fp16.gguf"), None);
     }
 
     /// Regression: locks KV math. Numbers from Qwen3-0.6B-4bit config.json.
