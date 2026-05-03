@@ -36,6 +36,21 @@ pub trait BackendModel: Send + Sync {
         messages: &[(String, String)],
     ) -> anyhow::Result<String>;
 
+    /// Apply the chat template and generate in one call.
+    ///
+    /// The default implementation calls `apply_chat_template` then `generate`.
+    /// Backends that can fuse the two operations (e.g. MLX, which avoids a
+    /// decode → encode round-trip across the FFI boundary) should override this.
+    fn generate_chat(
+        &self,
+        messages: &[(String, String)],
+        params: &GenerateParams,
+        on_token: &mut dyn FnMut(&str) -> bool,
+    ) -> anyhow::Result<GenerateResult> {
+        let prompt = self.apply_chat_template(messages)?;
+        self.generate(&prompt, params, on_token)
+    }
+
     fn n_ctx(&self) -> u32;
 
     fn n_ctx_train(&self) -> u32 {

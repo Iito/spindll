@@ -13,6 +13,7 @@ name = "spindll"
 path = "src/main.rs"
 required-features = ["cli"]
 
+
 [features]
 # cli adds the standalone binary extras (argument parsing, pretty logging).
 # The gRPC server is part of the default library — parley needs it.

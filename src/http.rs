@@ -211,13 +211,6 @@ async fn chat(
         }
 
         let messages: Vec<_> = req.messages.iter().map(|m| (m.role.clone(), m.content.clone())).collect();
-        let prompt = match mgr.apply_chat_template(&req.model, &messages) {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = tx.blocking_send(Ok(sse_data(&serde_json::json!({"type": "error", "error": format!("chat template error: {e}")}))));
-                return;
-            }
-        };
 
         let params = match req.params {
             Some(p) => GenerateParams {
@@ -231,7 +224,7 @@ async fn chat(
             None => GenerateParams::default(),
         };
 
-        let result = mgr.generate(&req.model, &prompt, &params, None, |token| {
+        let result = mgr.generate_chat(&req.model, &messages, &params, None, |token| {
             let payload = serde_json::json!({"type": "token", "content": token});
             tx.blocking_send(Ok(sse_data(&payload))).is_ok()
         });
@@ -631,14 +624,6 @@ async fn oai_chat_completions(
             }
 
             let messages = prepare_messages_with_tools(&req.messages, &req.tools);
-            let prompt = match mgr.apply_chat_template(&req.model, &messages) {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = tx.blocking_send(Ok(sse_data(&oai_error(&e.to_string()))));
-                    return;
-                }
-            };
-
             let params = GenerateParams {
                 max_tokens: req.max_tokens.unwrap_or(512),
                 temperature: req.temperature.unwrap_or(0.8),
@@ -656,7 +641,7 @@ async fn oai_chat_completions(
             if has_tools {
                 // When tools are active, collect full output to parse tool calls.
                 let mut output = String::new();
-                let result = mgr.generate(&req.model, &prompt, &params, None, |token| {
+                let result = mgr.generate_chat(&req.model, &messages, &params, None, |token| {
                     output.push_str(token);
                     true
                 });
@@ -707,7 +692,7 @@ async fn oai_chat_completions(
                 }
             } else {
                 // No tools — stream tokens directly as before.
-                let result = mgr.generate(&req.model, &prompt, &params, None, |token| {
+                let result = mgr.generate_chat(&req.model, &messages, &params, None, |token| {
                     let chunk = serde_json::json!({
                         "id": &completion_id,
                         "object": "chat.completion.chunk",
@@ -753,7 +738,6 @@ async fn oai_chat_completions(
             auto_load(&mgr, &store, &req.model)?;
 
             let messages = prepare_messages_with_tools(&req.messages, &req.tools);
-            let prompt = mgr.apply_chat_template(&req.model, &messages)?;
 
             let params = GenerateParams {
                 max_tokens: req.max_tokens.unwrap_or(512),
@@ -765,7 +749,7 @@ async fn oai_chat_completions(
             };
 
             let mut output = String::new();
-            let stats = mgr.generate(&req.model, &prompt, &params, None, |token| {
+            let stats = mgr.generate_chat(&req.model, &messages, &params, None, |token| {
                 output.push_str(token);
                 true
             })?;

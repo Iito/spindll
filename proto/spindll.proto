@@ -75,12 +75,12 @@ message Message {
 }
 
 message GenerateParams {
-  float temperature = 1;
-  float top_p = 2;
-  int32 top_k = 3;
-  int32 max_tokens = 4;
-  repeated string stop = 5;
-  uint64 seed = 6;
+  optional float  temperature = 1;  // absent = server default (0.8)
+  optional float  top_p       = 2;  // absent = server default (0.95)
+  optional int32  top_k       = 3;  // absent = server default (40)
+  optional int32  max_tokens  = 4;  // absent = server default (512)
+  repeated string stop        = 5;
+  optional uint64 seed        = 6;  // absent = server default (42); 0 is a valid seed
 }
 
 message UsageStats {
