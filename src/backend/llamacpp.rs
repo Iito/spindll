@@ -38,16 +38,15 @@ pub fn kv_bytes_per_token(model: &LlamaModel) -> u64 {
     KV * n_layer * n_head_kv * head_dim * FP16
 }
 
-/// Pick the largest n_ctx that fits user request, model's trained max, and
-/// remaining memory budget after weights. On `requested == 0` (auto), caps
-/// n_ctx at `(memory_budget - weights) / (kv_bpt + compute_bpt)`. Explicit
-/// `requested > 0` bypasses the budget cap — let llama.cpp/Metal surface
-/// OOM rather than silently undersize what the user asked for. Floors at
-/// 512; refusing to load is the caller's job.
-fn resolve_n_ctx(
-    model: &LlamaModel,
+/// Pure n_ctx sizing logic, separated from model loading for testability.
+///
+/// `kv_bpt` is pre-computed from the model (KV cache bytes per token).
+/// `requested == 0` triggers auto-sizing from budget; `requested > 0` is
+/// user-explicit and bypasses the budget cap.
+fn resolve_n_ctx_pure(
     requested: u32,
     n_ctx_train: u32,
+    kv_bpt: u64,
     weights: u64,
     memory_budget: u64,
 ) -> u32 {
@@ -60,7 +59,6 @@ fn resolve_n_ctx(
     const COMPUTE_BPT: u64 = 8 * 1024;
 
     if !user_explicit && memory_budget > 0 {
-        let kv_bpt = kv_bytes_per_token(model);
         let bpt = kv_bpt + COMPUTE_BPT;
         if bpt > 0 {
             let remaining = memory_budget.saturating_sub(weights);
@@ -70,6 +68,16 @@ fn resolve_n_ctx(
     }
 
     std::cmp::max(n_ctx, 512)
+}
+
+fn resolve_n_ctx(
+    model: &LlamaModel,
+    requested: u32,
+    n_ctx_train: u32,
+    weights: u64,
+    memory_budget: u64,
+) -> u32 {
+    resolve_n_ctx_pure(requested, n_ctx_train, kv_bytes_per_token(model), weights, memory_budget)
 }
 
 pub struct LlamaCppBackend;
@@ -211,5 +219,70 @@ impl BackendModel for LlamaCppModel {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A representative KV-per-token value (Llama-3-8B: 32 layers, 8 kv_heads, 128 head_dim, fp16).
+    const KV_BPT: u64 = 2 * 32 * 8 * 128 * 2; // 131_072 bytes
+
+    #[test]
+    fn explicit_n_ctx_ignores_budget() {
+        // User asked for 4096 — budget can only fit ~800 tokens; honour the request.
+        let budget = KV_BPT * 800 + 8 * 1024 * 800;
+        let n_ctx = resolve_n_ctx_pure(4096, 131_072, KV_BPT, 0, budget);
+        assert_eq!(n_ctx, 4096);
+    }
+
+    #[test]
+    fn auto_n_ctx_capped_by_budget() {
+        // weights = 0, budget fits exactly 2000 tokens worth of KV+compute.
+        let bpt = KV_BPT + 8 * 1024;
+        let budget = bpt * 2000;
+        let n_ctx = resolve_n_ctx_pure(0, 131_072, KV_BPT, 0, budget);
+        assert_eq!(n_ctx, 2000);
+    }
+
+    #[test]
+    fn auto_n_ctx_budget_after_weights() {
+        // weights consume half the budget.
+        let bpt = KV_BPT + 8 * 1024;
+        let budget = bpt * 4000;
+        let weights = bpt * 2000;
+        let n_ctx = resolve_n_ctx_pure(0, 131_072, KV_BPT, weights, budget);
+        assert_eq!(n_ctx, 2000);
+    }
+
+    #[test]
+    fn auto_n_ctx_capped_by_train_length() {
+        // Budget fits 100k tokens but the model was only trained on 8k.
+        let bpt = KV_BPT + 8 * 1024;
+        let budget = bpt * 100_000;
+        let n_ctx = resolve_n_ctx_pure(0, 8192, KV_BPT, 0, budget);
+        assert_eq!(n_ctx, 8192);
+    }
+
+    #[test]
+    fn auto_n_ctx_floors_at_512_when_budget_tiny() {
+        // Budget is 1 byte — impossible to fit any tokens; floor kicks in.
+        let n_ctx = resolve_n_ctx_pure(0, 131_072, KV_BPT, 0, 1);
+        assert_eq!(n_ctx, 512);
+    }
+
+    #[test]
+    fn explicit_n_ctx_floors_at_512() {
+        // Absurdly small explicit request still gets the minimum floor.
+        let n_ctx = resolve_n_ctx_pure(64, 131_072, KV_BPT, 0, 0);
+        assert_eq!(n_ctx, 512);
+    }
+
+    #[test]
+    fn unlimited_budget_zero_no_budget_cap() {
+        // memory_budget == 0 means unlimited — auto n_ctx only capped by n_ctx_train.
+        let n_ctx = resolve_n_ctx_pure(0, 4096, KV_BPT, 0, 0);
+        assert_eq!(n_ctx, 4096);
     }
 }
