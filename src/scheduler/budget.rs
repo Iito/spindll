@@ -154,10 +154,81 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_size() {
+    fn parse_size_units() {
         assert_eq!(parse_size("8G"), Some(8 * 1_073_741_824));
         assert_eq!(parse_size("512M"), Some(512 * 1_048_576));
         assert_eq!(parse_size("1024"), Some(1024));
         assert_eq!(parse_size("bad"), None);
+    }
+
+    #[test]
+    fn parse_size_zero_is_some_zero() {
+        // "0" must parse to Some(0) so detect() maps it to total_ram.
+        assert_eq!(parse_size("0"), Some(0));
+    }
+
+    // Item 10: --budget 0 should set budget = total_ram, not zero.
+    #[test]
+    fn budget_zero_means_total_ram() {
+        let m = MemoryBudget::detect(Some("0"));
+        assert!(m.total_ram > 0, "total_ram must be nonzero");
+        assert_eq!(m.budget, m.total_ram, "--budget 0 must equal total_ram");
+    }
+
+    // Item 10: an explicit value larger than total RAM must be clamped.
+    #[test]
+    fn explicit_budget_clamped_to_total_ram() {
+        let m = MemoryBudget::detect(Some("99999G"));
+        assert_eq!(m.budget, m.total_ram, "oversized budget must clamp to total_ram");
+    }
+
+    // Item 10: explicit budget within total RAM is honoured as-is.
+    #[test]
+    fn explicit_budget_within_total_ram_honoured() {
+        let m8 = MemoryBudget::detect(Some("8G"));
+        let eight_gb = 8u64 * 1_073_741_824;
+        if m8.total_ram >= eight_gb {
+            assert_eq!(m8.budget, eight_gb);
+        } else {
+            assert_eq!(m8.budget, m8.total_ram);
+        }
+    }
+
+    // Item 10: invalid string falls back to available RAM, not zero.
+    #[test]
+    fn invalid_budget_string_falls_back_to_available() {
+        let m = MemoryBudget::detect(Some("not_a_number"));
+        assert_eq!(m.budget, m.available_ram, "unparseable budget must fall back to available_ram");
+    }
+
+    // Item 10: no budget string → full available RAM (no 80% margin).
+    #[test]
+    fn no_budget_equals_full_available_ram() {
+        let m = MemoryBudget::detect(None);
+        assert_eq!(m.budget, m.available_ram, "default budget must equal available_ram (no margin)");
+        assert!(m.available_ram > 0, "available_ram must be nonzero");
+        assert!(m.available_ram <= m.total_ram);
+    }
+
+    // Item 12: smoke test — available_ram is a sane fraction of total on all platforms.
+    #[test]
+    fn available_ram_is_sane() {
+        let m = MemoryBudget::detect(None);
+        assert!(m.available_ram > 0, "available_ram should be nonzero");
+        assert!(m.available_ram <= m.total_ram, "available must not exceed total");
+    }
+
+    // Item 12 (macOS): available_ram includes reclaimable pages so it should
+    // be well above the sysinfo free-only value (typically > 100 MB even under load).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_available_includes_reclaimable_pages() {
+        let m = MemoryBudget::detect(None);
+        const MIN_EXPECTED: u64 = 100 * 1_048_576; // 100 MB
+        assert!(
+            m.available_ram >= MIN_EXPECTED,
+            "macOS available_ram ({} MB) should include inactive+purgeable+speculative pages",
+            m.available_ram / 1_048_576
+        );
     }
 }

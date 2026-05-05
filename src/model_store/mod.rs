@@ -639,4 +639,83 @@ mod tests {
         let reg = Registry::load(&store.registry_path()).unwrap();
         assert!(!reg.models.contains_key("mlx-community/test-4bit"));
     }
+
+    // --- Item 14: display_name() — values surfaced in gRPC ListResponse ---
+
+    fn gguf_entry(repo: &str, filename: &str) -> ModelEntry {
+        ModelEntry {
+            repo: repo.to_string(),
+            filename: filename.to_string(),
+            path: std::path::PathBuf::from("/tmp/nonexistent"),
+            size_bytes: 0,
+            downloaded_at: 0,
+            digest: String::new(),
+            model_name: String::new(),
+            description: String::new(),
+            architecture: String::new(),
+            context_length: 0,
+            metadata_read: true,
+            format: ModelFormat::Gguf,
+            base_model: String::new(),
+        }
+    }
+
+    #[test]
+    fn display_name_hf_gguf_with_detectable_quant() {
+        // Closes #12: picker UIs must see "(q4_k_m)" suffix to disambiguate.
+        let entry = gguf_entry("Qwen/Qwen2.5-3B-Instruct-GGUF", "qwen2.5-3b-q4_k_m.gguf");
+        let name = display_name("Qwen/Qwen2.5-3B-Instruct-GGUF/qwen2.5-3b-q4_k_m.gguf", &entry);
+        assert_eq!(name, "Qwen/Qwen2.5-3B-Instruct-GGUF (q4_k_m)");
+    }
+
+    #[test]
+    fn display_name_hf_gguf_fp16_no_quant_tag() {
+        // fp16 files have no quant tag — display just the repo name.
+        let entry = gguf_entry("Qwen/Qwen2.5-3B-Instruct-GGUF", "qwen2.5-3b-f16.gguf");
+        let name = display_name("Qwen/Qwen2.5-3B-Instruct-GGUF/qwen2.5-3b-f16.gguf", &entry);
+        assert_eq!(name, "Qwen/Qwen2.5-3B-Instruct-GGUF");
+    }
+
+    #[test]
+    fn display_name_two_quants_same_repo_are_distinct() {
+        // Core disambiguation requirement from #12.
+        let e_q4 = gguf_entry("TheBloke/Llama-GGUF", "llama-q4_k_m.gguf");
+        let e_fp16 = gguf_entry("TheBloke/Llama-GGUF", "llama-fp16.gguf");
+        let n_q4 = display_name("TheBloke/Llama-GGUF/llama-q4_k_m.gguf", &e_q4);
+        let n_fp16 = display_name("TheBloke/Llama-GGUF/llama-fp16.gguf", &e_fp16);
+        assert_ne!(n_q4, n_fp16, "two variants of the same repo must produce distinct display names");
+        assert!(n_q4.contains("q4_k_m"));
+    }
+
+    #[test]
+    fn display_name_ollama_entry_uses_name_tag_form() {
+        // Ollama keys look like "ollama/<name>/<tag>.gguf".
+        let entry = gguf_entry("ollama/llama3.1", "8b.gguf");
+        let name = display_name("ollama/llama3.1/8b.gguf", &entry);
+        assert_eq!(name, "llama3.1:8b");
+    }
+
+    #[test]
+    fn display_name_mlx_returns_repo() {
+        // MLX repos already encode quant in their name (e.g. "-4bit").
+        let entry = mlx_entry("mlx-community/Meta-Llama-3.1-8B-Instruct-4bit", "llama3.1-8b");
+        let name = display_name("mlx-community/Meta-Llama-3.1-8B-Instruct-4bit", &entry);
+        assert_eq!(name, "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit");
+    }
+
+    #[test]
+    fn display_name_mlx_empty_repo_falls_back_to_key() {
+        let mut entry = mlx_entry("", "test");
+        entry.format = ModelFormat::Mlx;
+        let name = display_name("some-registry-key", &entry);
+        assert_eq!(name, "some-registry-key");
+    }
+
+    // Item 14: prefer_format field in ListResponse.
+    #[test]
+    fn platform_prefers_mlx_is_false_on_non_apple_silicon() {
+        // On Linux CI and Windows, this must be false so GGUF is the default.
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
+        assert!(!platform_prefers_mlx());
+    }
 }
