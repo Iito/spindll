@@ -82,7 +82,7 @@ While `serve` is running it writes a JSON lockfile (`pid`, `grpc_port`, `http_po
 
 ## API
 
-Full API reference covering HTTP, OpenAI-compatible `/v1`, gRPC, and Rust library usage: **[docs/API.md](docs/API.md)**
+Full API reference covering HTTP, OpenAI-compatible `/v1`, gRPC, and Rust library usage: **[docs/README.md](docs/README.md)**
 
 Quick summary of available interfaces:
 
@@ -116,7 +116,7 @@ manager.generate("llama3.1:8b", "Hello!", &GenerateParams::default(), None, |tok
 })?;
 ```
 
-See [docs/API.md](docs/API.md) for the full library API including batch scheduling, KV cache, and server startup.
+See [docs/api-rust.md](docs/api-rust.md) for the full library API including batch scheduling, KV cache, and server startup.
 
 ## Architecture
 
