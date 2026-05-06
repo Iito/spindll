@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `docs/mlx-bridge.md` documenting the `mlx_bridge/` Swift package: C ABI,
+  prompt KV cache, build pipeline, and Rust FFI integration. Linked from the
+  `docs/` index and from a new `mlx_bridge/README.md` pointer.
+
 ### Fixed
 
 - README links to `docs/API.md` (removed in the v0.5.0 docs split) now point to
