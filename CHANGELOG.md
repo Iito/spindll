@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- README links to `docs/API.md` (removed in the v0.5.0 docs split) now point to
+  `docs/README.md` and `docs/api-rust.md`.
+
 ## [0.5.0] - 2026-04-28
 
 ### Added
