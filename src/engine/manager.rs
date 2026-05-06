@@ -1,29 +1,63 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 use llama_cpp_2::context::params::LlamaContextParams;
-use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
 use std::num::NonZeroU32;
+use tokio::task::JoinHandle;
+
+use crate::backend::llamacpp::LlamaCppModel;
+use crate::backend::{BackendLoadParams, BackendModel, InferenceBackend};
+use crate::model_store::registry::ModelFormat;
 
 use super::batch::{BatchEvent, BatchRequest, BatchScheduler};
 use super::kv_cache::KvCache;
 use super::metrics::Metrics;
 use super::ram_cache::RamCache;
-use super::streaming::{GenerateParams, GenerateResult, generate_streaming, generate_streaming_cached};
+use super::streaming::{GenerateParams, GenerateResult, generate_streaming_cached};
+
+/// Eviction tier. Low evicts first, LRU tiebreak within tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EvictionPriority {
+    Low,
+    #[default]
+    Normal,
+    High,
+}
+
+impl EvictionPriority {
+    fn evict_order(self) -> u8 {
+        match self {
+            Self::Low => 0,
+            Self::Normal => 1,
+            Self::High => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LoadOptions {
+    /// `None` = auto.
+    pub gpu_layers: Option<u32>,
+    pub digest: String,
+    pub priority: EvictionPriority,
+    /// Reload this long after eviction under VRAM pressure. `None` disables.
+    pub idle_reload: Option<Duration>,
+}
 
 /// A model that has been loaded into memory and is ready for inference.
 pub struct LoadedModel {
-    /// The underlying llama.cpp model handle.
-    pub model: LlamaModel,
-    /// Path to the GGUF file on disk.
+    /// The backend model, dispatching to GGUF or MLX as appropriate.
+    pub model: Box<dyn BackendModel>,
+    /// Path to the model file or directory on disk.
     pub file_path: PathBuf,
     /// Context window size (number of tokens).
     pub n_ctx: u32,
-    /// Trained context length from GGUF metadata (0 if unknown).
+    /// Trained context length from metadata (0 if unknown).
     pub n_ctx_train: u32,
     /// Approximate memory footprint in bytes.
     pub size_bytes: u64,
@@ -31,35 +65,83 @@ pub struct LoadedModel {
     pub last_used: RwLock<Instant>,
     /// Number of layers offloaded to GPU.
     pub gpu_layers: u32,
+    /// Original gpu_layers request, reused on idle-reload.
+    pub requested_gpu_layers: Option<u32>,
     /// SHA-256 digest of the model file, used for KV cache keying.
     pub digest: String,
+    /// On-disk format of this model.
+    pub format: ModelFormat,
     /// Channel to submit requests to this model's batch scheduler (if running).
     pub batch_tx: Option<std::sync::mpsc::Sender<BatchRequest>>,
+    pub priority: EvictionPriority,
+    pub idle_reload: Option<Duration>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingReload {
+    name: String,
+    path: PathBuf,
+    digest: String,
+    gpu_layers: Option<u32>,
+    priority: EvictionPriority,
+    idle_reload: Duration,
 }
 
 /// Multi-model manager with LRU eviction and memory budgeting.
 ///
-/// This is the primary entry point for Parley: load models by name, run inference,
+/// Primary entry point for spindll: load models by name, run inference,
 /// and let the manager handle eviction when memory is tight.
 pub struct ModelManager {
-    backend: LlamaBackend,
+    backends: Vec<Box<dyn InferenceBackend>>,
     models: RwLock<HashMap<String, LoadedModel>>,
     default_n_ctx: u32,
     default_gpu_layers: u32,
-    memory_budget: u64, // max bytes for loaded models, 0 = unlimited
+    memory_budget: u64,
     kv_cache: Option<KvCache>,
     ram_cache: Option<RamCache>,
     metrics: Arc<Metrics>,
-    /// Maximum concurrent sequences per model for batch scheduling.
-    /// 0 disables batching (each request gets its own context).
     batch_slots: usize,
+    /// Idle-reload gating: timestamp of last load/generate.
+    last_activity: RwLock<Instant>,
+    /// Idle-reload waits for this to hit zero.
+    active_requests: AtomicUsize,
+    /// Set by [`ModelManager::into_arc`]; required for idle-reload watchers.
+    weak_self: OnceLock<Weak<ModelManager>>,
+    watchers: Mutex<HashMap<String, JoinHandle<()>>>,
+}
+
+/// Bumps `active_requests` for the lifetime of an inference call.
+struct ActiveGuard<'a>(&'a AtomicUsize);
+impl<'a> ActiveGuard<'a> {
+    fn new(c: &'a AtomicUsize) -> Self {
+        c.fetch_add(1, Ordering::SeqCst);
+        Self(c)
+    }
+}
+impl<'a> Drop for ActiveGuard<'a> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl ModelManager {
     /// Create a new manager. Pass `gpu_layers = None` to auto-detect (all layers on macOS Metal,
-    /// CPU-only elsewhere). Set `memory_budget` to 0 for unlimited.
+    /// CPU-only elsewhere). Pass `memory_budget = 0` to use total physical RAM as the cap
+    /// (recommended on Apple Silicon's unified memory).
     pub fn new(n_ctx: u32, gpu_layers: Option<u32>, memory_budget: u64) -> anyhow::Result<Self> {
-        let backend = LlamaBackend::init()?;
+        #[allow(unused_mut)]
+        let mut backends: Vec<Box<dyn InferenceBackend>> = vec![
+            Box::new(crate::backend::llamacpp::LlamaCppBackend::new()?),
+        ];
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+        {
+            if mlx_metallib_available() {
+                backends.push(Box::new(crate::backend::mlx_swift::MlxBackend));
+            } else {
+                tracing::warn!("mlx.metallib not found next to binary; MLX backend disabled");
+            }
+        }
 
         let default_gpu_layers = gpu_layers.unwrap_or_else(|| {
             if cfg!(target_os = "macos")
@@ -73,8 +155,14 @@ impl ModelManager {
             }
         });
 
+        let memory_budget = if memory_budget == 0 {
+            sysinfo::System::new_all().total_memory()
+        } else {
+            memory_budget
+        };
+
         Ok(Self {
-            backend,
+            backends,
             models: RwLock::new(HashMap::new()),
             default_n_ctx: n_ctx,
             default_gpu_layers,
@@ -83,7 +171,19 @@ impl ModelManager {
             ram_cache: None,
             metrics: Arc::new(Metrics::new()),
             batch_slots: 0,
+            last_activity: RwLock::new(Instant::now()),
+            active_requests: AtomicUsize::new(0),
+            weak_self: OnceLock::new(),
+            watchers: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Wrap into `Arc<Self>` with a `Weak` self-ref for idle-reload watchers.
+    /// Required if any load uses `idle_reload`; `Arc::new(mgr)` disables it silently.
+    pub fn into_arc(self) -> Arc<Self> {
+        let arc = Arc::new(self);
+        let _ = arc.weak_self.set(Arc::downgrade(&arc));
+        arc
     }
 
     /// Set the number of concurrent sequence slots for batch scheduling.
@@ -98,44 +198,86 @@ impl ModelManager {
             .read()
             .unwrap()
             .values()
-            .map(|m| m.size_bytes)
+            .map(|m| m.size_bytes + m.model.kv_bytes_per_token() * m.n_ctx as u64)
             .sum()
     }
 
-    /// Evict least-recently-used models until `needed` bytes fit within budget.
-    fn evict_for(&self, needed: u64) -> anyhow::Result<()> {
-        if self.memory_budget == 0 {
-            return Ok(()); // unlimited
+    fn effective_budget(&self) -> u64 {
+        let mem = crate::scheduler::budget::MemoryBudget::detect(None);
+        if self.memory_budget == 0 || self.memory_budget >= mem.total_ram {
+            return self.memory_budget;
+        }
+        std::cmp::min(self.memory_budget, mem.available_ram)
+    }
+
+    /// Evict by (priority, LRU) until `needed` bytes fit. Returns reload specs
+    /// for any evicted model with `idle_reload` set; caller arms watchers.
+    fn evict_for(&self, needed: u64) -> anyhow::Result<Vec<PendingReload>> {
+        let mut pending = Vec::new();
+        let budget = self.effective_budget();
+        if budget == 0 {
+            return Ok(pending);
         }
 
         loop {
             let used = self.total_loaded_bytes();
-            if used + needed <= self.memory_budget {
-                return Ok(());
+            if used + needed <= budget {
+                return Ok(pending);
             }
 
-            // Find LRU model
-            let models = self.models.read().unwrap();
-            if models.is_empty() {
-                anyhow::bail!(
-                    "model needs {:.1} GB but budget is {:.1} GB",
-                    needed as f64 / 1_073_741_824.0,
-                    self.memory_budget as f64 / 1_073_741_824.0
-                );
-            }
+            let victim = {
+                let models = self.models.read().unwrap();
+                if models.is_empty() {
+                    anyhow::bail!(
+                        "model needs {:.1} GB but budget is {:.1} GB",
+                        needed as f64 / 1_073_741_824.0,
+                        budget as f64 / 1_073_741_824.0
+                    );
+                }
+                pick_evict_victim(models.iter().map(|(name, m)| {
+                    (name.as_str(), m.priority, *m.last_used.read().unwrap())
+                }))
+                .map(|s| s.to_string())
+                .unwrap()
+            };
 
-            let lru_name = models
-                .iter()
-                .min_by_key(|(_, m)| *m.last_used.read().unwrap())
-                .map(|(name, _)| name.clone())
-                .unwrap();
-            drop(models);
-
-            tracing::warn!(model = %lru_name, "evicting LRU model");
-            let evicted = self.models.write().unwrap().remove(&lru_name);
-            if let (Some(cache), Some(model)) = (&self.ram_cache, &evicted) {
-                cache.warm(&lru_name, &model.file_path);
+            tracing::warn!(model = %victim, "evicting model under VRAM pressure");
+            let evicted = self.models.write().unwrap().remove(&victim);
+            if let Some(model) = evicted {
+                if let Some(cache) = &self.ram_cache {
+                    cache.warm(&victim, &model.file_path);
+                }
+                if let Some(d) = model.idle_reload {
+                    pending.push(PendingReload {
+                        name: victim.clone(),
+                        path: model.file_path.clone(),
+                        digest: model.digest.clone(),
+                        gpu_layers: model.requested_gpu_layers,
+                        priority: model.priority,
+                        idle_reload: d,
+                    });
+                }
             }
+        }
+    }
+
+    fn backend_for_format(&self, format: &ModelFormat) -> anyhow::Result<&dyn InferenceBackend> {
+        let target = match format {
+            ModelFormat::Gguf => "llamacpp",
+            ModelFormat::Mlx => "mlx",
+        };
+        self.backends
+            .iter()
+            .find(|b| b.name() == target)
+            .map(|b| b.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("no backend available for {target} format"))
+    }
+
+    fn infer_format(path: &Path) -> ModelFormat {
+        if path.is_dir() {
+            ModelFormat::Mlx
+        } else {
+            ModelFormat::Gguf
         }
     }
 
@@ -146,14 +288,14 @@ impl ModelManager {
         path: &Path,
         gpu_layers: Option<u32>,
     ) -> anyhow::Result<()> {
-        self.load_model_with_digest(name, path, gpu_layers, String::new())
+        self.load_model_with_options(
+            name,
+            path,
+            LoadOptions { gpu_layers, ..LoadOptions::default() },
+        )
     }
 
     /// Load a model with an explicit file digest for KV cache keying.
-    ///
-    /// Prefer this over [`load_model`](Self::load_model) when the digest is already known
-    /// (e.g. from the model store registry) to avoid recomputing it.
-    #[tracing::instrument(skip(self, path, digest), fields(file_size))]
     pub fn load_model_with_digest(
         &self,
         name: &str,
@@ -161,22 +303,65 @@ impl ModelManager {
         gpu_layers: Option<u32>,
         digest: String,
     ) -> anyhow::Result<()> {
+        self.load_model_with_options(
+            name,
+            path,
+            LoadOptions { gpu_layers, digest, ..LoadOptions::default() },
+        )
+    }
+
+    #[tracing::instrument(skip(self, path, opts), fields(file_size))]
+    pub fn load_model_with_options(
+        &self,
+        name: &str,
+        path: &Path,
+        opts: LoadOptions,
+    ) -> anyhow::Result<()> {
+        self.cancel_watcher(name);
+        let LoadOptions { gpu_layers, digest, priority, idle_reload } = opts;
+        let format = Self::infer_format(path);
+        let backend = self.backend_for_format(&format)?;
         let from_ram_cache = self
             .ram_cache
             .as_ref()
             .and_then(|c| c.get(name))
             .is_some();
 
-        // Estimate size from file for budget check before loading
-        let file_size = std::fs::metadata(path)?.len();
-        self.evict_for(file_size)?;
+        let file_size = if path.is_dir() {
+            std::fs::read_dir(path)?
+                .filter_map(|e| e.ok())
+                .filter_map(|e| std::fs::metadata(e.path()).ok())
+                .map(|m| m.len())
+                .sum()
+        } else {
+            std::fs::metadata(path)?.len()
+        };
+        let pending_reloads = self.evict_for(file_size)?;
+
+        for spec in pending_reloads {
+            self.arm_reload_watcher(spec);
+        }
+
+        // Snapshot live availability BEFORE the load so the backend can
+        // budget-resolve n_ctx against memory not yet consumed by weights.
+        // Once weights are mmap'd / uploaded to Metal, available memory drops,
+        // so the snapshot has to happen here, not inside the backend.
+        let mem = crate::scheduler::budget::MemoryBudget::detect(None);
+        let load_budget = if self.memory_budget == 0 || self.memory_budget >= mem.total_ram {
+            self.memory_budget
+        } else {
+            std::cmp::min(self.memory_budget, mem.available_ram)
+        };
 
         let layers = gpu_layers.unwrap_or(self.default_gpu_layers);
 
-        let model_params = LlamaModelParams::default()
-            .with_n_gpu_layers(layers);
-        let model = LlamaModel::load_from_file(&self.backend, path, &model_params)
-            .map_err(|e| anyhow::anyhow!("failed to load model: {e}"))?;
+        let load_params = BackendLoadParams {
+            n_ctx: self.default_n_ctx,
+            n_gpu_layers: Some(layers),
+            memory_budget: load_budget,
+        };
+
+        let model = backend.load_model(path, load_params)?;
 
         if from_ram_cache {
             if let Some(cache) = &self.ram_cache {
@@ -184,51 +369,29 @@ impl ModelManager {
             }
         }
 
-        let size_bytes = model.size();
-
-        // Read the trained context length from GGUF metadata and cap with
-        // the global default so we never exceed the user's VRAM budget.
+        let n_ctx = model.n_ctx();
         let n_ctx_train = model.n_ctx_train();
-        let n_ctx = if n_ctx_train > 0 {
-            std::cmp::min(n_ctx_train, self.default_n_ctx)
-        } else {
-            self.default_n_ctx
-        };
+        let size_bytes = model.size_bytes();
 
-        let device = if layers == 0 {
-            "cpu"
-        } else if cfg!(target_os = "macos") || cfg!(feature = "metal") {
-            "metal"
-        } else if cfg!(feature = "cuda") {
-            "cuda"
-        } else if cfg!(feature = "vulkan") {
-            "vulkan"
-        } else {
-            "cpu"
-        };
-        tracing::info!(name, layers = model.n_layer(), device, size_bytes, n_ctx, n_ctx_train, "model loaded");
-
-        // Optionally start a batch scheduler for this model.
-        let batch_tx = if self.batch_slots > 0 {
+        // Batch scheduling: GGUF-only, gated on supports_batching().
+        // n_ctx, device, and size are logged from inside `LlamaCppBackend::load_model`
+        // (which has direct access to `LlamaModel::n_layer` and the GPU detection).
+        let batch_tx = if self.batch_slots > 0 && model.supports_batching() {
             let (tx, rx) = std::sync::mpsc::channel::<BatchRequest>();
-            let n_ctx = n_ctx;
             let max_seq = self.batch_slots;
             let model_name = name.to_string();
 
-            // The batch scheduler needs its own context, which requires a
-            // reference to the model. Since LlamaModel isn't Send, we load
-            // a second handle for the scheduler thread.
+            let sched_backend = crate::backend::llamacpp::shared_backend();
             let sched_params = LlamaModelParams::default().with_n_gpu_layers(layers);
-            let sched_model = LlamaModel::load_from_file(&self.backend, path, &sched_params)
+            let sched_model = LlamaModel::load_from_file(sched_backend, path, &sched_params)
                 .map_err(|e| anyhow::anyhow!("failed to load scheduler model: {e}"))?;
-            let sched_backend = LlamaBackend::init()?;
 
             std::thread::Builder::new()
                 .name(format!("batch-{model_name}"))
                 .spawn(move || {
-                    if let Err(e) = BatchScheduler::run(
-                        &sched_model, &sched_backend, n_ctx, max_seq, rx,
-                    ) {
+                    if let Err(e) =
+                        BatchScheduler::run(&sched_model, sched_backend, n_ctx, max_seq, rx)
+                    {
                         tracing::error!(model = model_name, "batch scheduler exited: {e}");
                     }
                 })?;
@@ -247,16 +410,49 @@ impl ModelManager {
             size_bytes,
             last_used: RwLock::new(Instant::now()),
             gpu_layers: layers,
+            requested_gpu_layers: gpu_layers,
             digest,
+            format,
             batch_tx,
+            priority,
+            idle_reload,
         };
 
         self.models.write().unwrap().insert(name.to_string(), loaded);
+        self.record_activity();
         Ok(())
+    }
+
+    fn record_activity(&self) {
+        *self.last_activity.write().unwrap() = Instant::now();
+    }
+
+    fn cancel_watcher(&self, name: &str) {
+        if let Some(handle) = self.watchers.lock().unwrap().remove(name) {
+            handle.abort();
+        }
+    }
+
+    /// No-ops without `into_arc` or a tokio runtime.
+    fn arm_reload_watcher(&self, spec: PendingReload) {
+        let Some(weak) = self.weak_self.get().cloned() else {
+            tracing::debug!(model = %spec.name, "idle-reload disabled: manager not in Arc");
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!(model = %spec.name, "idle-reload disabled: no tokio runtime");
+            return;
+        };
+        let name = spec.name.clone();
+        let task = handle.spawn(reload_watcher(weak, spec));
+        if let Some(prev) = self.watchers.lock().unwrap().insert(name, task) {
+            prev.abort();
+        }
     }
 
     #[tracing::instrument(skip(self))]
     pub fn unload_model(&self, name: &str) -> anyhow::Result<()> {
+        self.cancel_watcher(name);
         let removed = self
             .models
             .write()
@@ -281,23 +477,17 @@ impl ModelManager {
             .read()
             .unwrap()
             .iter()
-            .map(|(name, m)| (name.clone(), m.size_bytes, m.gpu_layers, m.digest.clone(), m.n_ctx, m.n_ctx_train))
+            .map(|(name, m)| {
+                (
+                    name.clone(),
+                    m.size_bytes,
+                    m.gpu_layers,
+                    m.digest.clone(),
+                    m.n_ctx,
+                    m.n_ctx_train,
+                )
+            })
             .collect()
-    }
-
-    /// Run a closure with a reference to a loaded model.
-    /// Updates last_used timestamp.
-    pub fn with_model<F, R>(&self, name: &str, f: F) -> anyhow::Result<R>
-    where
-        F: FnOnce(&LlamaModel, &LlamaBackend, u32, &str) -> anyhow::Result<R>,
-    {
-        let models = self.models.read().unwrap();
-        let loaded = models
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("model '{name}' not loaded"))?;
-
-        *loaded.last_used.write().unwrap() = Instant::now();
-        f(&loaded.model, &self.backend, loaded.n_ctx, &loaded.digest)
     }
 
     /// Enable the RAM cache for recently-evicted models.
@@ -334,10 +524,13 @@ impl ModelManager {
     ///
     /// When the model has a batch scheduler running, the request is submitted
     /// to the shared decode loop. Otherwise falls back to a per-request context
-    /// (using the disk-backed KV cache if enabled).
+    /// (using the disk-backed KV cache if enabled for GGUF models).
     ///
-    /// Pass `encryption_key` to encrypt cached KV state at rest (non-batched path only).
-    #[tracing::instrument(skip(self, prompt, params, on_token, encryption_key), fields(model = model_name))]
+    /// Pass `encryption_key` to encrypt cached KV state at rest (non-batched GGUF path only).
+    #[tracing::instrument(
+        skip(self, prompt, params, on_token, encryption_key),
+        fields(model = model_name)
+    )]
     pub fn generate(
         &self,
         model_name: &str,
@@ -346,7 +539,7 @@ impl ModelManager {
         encryption_key: Option<&[u8; 32]>,
         mut on_token: impl FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
-        // Check if this model has a batch scheduler.
+        let _active = ActiveGuard::new(&self.active_requests);
         let batch_tx = {
             let models = self.models.read().unwrap();
             models.get(model_name).and_then(|m| {
@@ -354,21 +547,27 @@ impl ModelManager {
                 m.batch_tx.clone()
             })
         };
+        *self.last_activity.write().unwrap() = Instant::now();
 
         let start = Instant::now();
         let result = if let Some(tx) = batch_tx {
             Self::generate_via_batch(tx, prompt, params, &mut on_token)
         } else {
-            self.generate_direct(model_name, prompt, params, encryption_key, on_token)
+            self.generate_direct(model_name, prompt, params, encryption_key, &mut on_token)
         };
 
         let elapsed_us = start.elapsed().as_micros() as u64;
         match &result {
             Ok(stats) => {
+                tracing::info!(
+                    prompt_tokens = stats.prompt_tokens,
+                    completion_tokens = stats.completion_tokens,
+                    elapsed_ms = elapsed_us / 1000,
+                    "generation complete"
+                );
                 if params.prefill_only {
-                    self.metrics.record_prefill(
-                        stats.prompt_tokens as u64, elapsed_us, stats.cache_hit,
-                    );
+                    self.metrics
+                        .record_prefill(stats.prompt_tokens as u64, elapsed_us, stats.cache_hit);
                 } else {
                     self.metrics.record_generate(
                         stats.prompt_tokens as u64,
@@ -378,7 +577,10 @@ impl ModelManager {
                     );
                 }
             }
-            Err(_) => self.metrics.record_error(),
+            Err(e) => {
+                tracing::error!(error = %e, elapsed_ms = elapsed_us / 1000, "generation failed");
+                self.metrics.record_error();
+            }
         }
         result
     }
@@ -405,19 +607,20 @@ impl ModelManager {
             response_tx: resp_tx,
         };
 
-        tx.send(req).map_err(|_| anyhow::anyhow!("batch scheduler is not running"))?;
+        tx.send(req)
+            .map_err(|_| anyhow::anyhow!("batch scheduler is not running"))?;
 
-        // Drain events from the batch scheduler.
         loop {
             match resp_rx.blocking_recv() {
                 Some(BatchEvent::Token(piece)) => {
                     if !on_token(&piece) {
-                        // Client abort — drop the receiver so the scheduler
-                        // detects the closed channel on its next send.
                         break;
                     }
                 }
-                Some(BatchEvent::Done { prompt_tokens, completion_tokens }) => {
+                Some(BatchEvent::Done {
+                    prompt_tokens,
+                    completion_tokens,
+                }) => {
                     return Ok(GenerateResult {
                         prompt_tokens,
                         completion_tokens,
@@ -433,8 +636,6 @@ impl ModelManager {
             }
         }
 
-        // If we broke out of the loop (client abort), wait for Done/Error.
-        // The scheduler will notice the closed channel and finish the sequence.
         Ok(GenerateResult {
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -442,29 +643,158 @@ impl ModelManager {
         })
     }
 
-    /// Per-request context path (original behavior).
+    /// Per-request context path. Uses KV cache for GGUF models when available,
+    /// otherwise delegates to the backend trait.
     fn generate_direct(
         &self,
         model_name: &str,
         prompt: &str,
         params: &GenerateParams,
         encryption_key: Option<&[u8; 32]>,
-        on_token: impl FnMut(&str) -> bool,
+        on_token: &mut dyn FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
-        self.with_model(model_name, |model, backend, n_ctx, digest| {
-            let ctx_params = LlamaContextParams::default()
-                .with_n_ctx(NonZeroU32::new(n_ctx));
-            let mut ctx = model
-                .new_context(backend, ctx_params)
-                .map_err(|e| anyhow::anyhow!("failed to create context: {e}"))?;
+        let models = self.models.read().unwrap();
+        let loaded = models
+            .get(model_name)
+            .ok_or_else(|| anyhow::anyhow!("model '{}' not loaded", model_name))?;
+        *loaded.last_used.write().unwrap() = Instant::now();
 
-            match &self.kv_cache {
-                Some(cache) => generate_streaming_cached(
-                    model, &mut ctx, prompt, params, model_name, digest, cache, encryption_key, on_token,
-                ),
-                None => generate_streaming(model, &mut ctx, prompt, params, on_token),
+        // KV cache path: GGUF models with cache enabled get the cached generate path.
+        if let Some(cache) = &self.kv_cache {
+            if let Some(llama) = loaded.model.as_any().downcast_ref::<LlamaCppModel>() {
+                // n_batch == n_ctx so prefill batches always fit. Default n_batch=512
+                // hits GGML_ASSERT and crashes on prompts longer than 512 tokens.
+                let ctx_params = LlamaContextParams::default()
+                    .with_n_ctx(NonZeroU32::new(loaded.n_ctx))
+                    .with_n_batch(loaded.n_ctx);
+                let mut ctx = llama
+                    .llama_model()
+                    .new_context(llama.llama_backend(), ctx_params)
+                    .map_err(|e| anyhow::anyhow!("failed to create context: {e}"))?;
+                return generate_streaming_cached(
+                    llama.llama_model(),
+                    &mut ctx,
+                    prompt,
+                    params,
+                    model_name,
+                    &loaded.digest,
+                    cache,
+                    encryption_key,
+                    on_token,
+                );
             }
-        })
+        }
+
+        loaded.model.generate(prompt, params, on_token)
+    }
+
+    /// Apply the model's chat template and generate in one step.
+    ///
+    /// Backends that support fused template + generation (e.g. MLX) use a
+    /// single FFI call, eliminating the decode → encode round-trip. All other
+    /// backends fall back to `apply_chat_template` + `generate`.
+    #[tracing::instrument(
+        skip(self, messages, params, on_token, encryption_key),
+        fields(model = model_name)
+    )]
+    pub fn generate_chat(
+        &self,
+        model_name: &str,
+        messages: &[(String, String)],
+        params: &GenerateParams,
+        encryption_key: Option<&[u8; 32]>,
+        mut on_token: impl FnMut(&str) -> bool,
+    ) -> anyhow::Result<GenerateResult> {
+        let _active = ActiveGuard::new(&self.active_requests);
+        let batch_tx = {
+            let models = self.models.read().unwrap();
+            models.get(model_name).and_then(|m| {
+                *m.last_used.write().unwrap() = Instant::now();
+                m.batch_tx.clone()
+            })
+        };
+        *self.last_activity.write().unwrap() = Instant::now();
+
+        let start = Instant::now();
+        let result = if let Some(tx) = batch_tx {
+            // Batch scheduler path is llama.cpp-only and requires a prompt string.
+            let prompt = self.apply_chat_template(model_name, messages)?;
+            Self::generate_via_batch(tx, &prompt, params, &mut on_token)
+        } else {
+            self.generate_chat_direct(model_name, messages, params, encryption_key, &mut on_token)
+        };
+
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        match &result {
+            Ok(stats) => {
+                tracing::info!(
+                    prompt_tokens = stats.prompt_tokens,
+                    completion_tokens = stats.completion_tokens,
+                    elapsed_ms = elapsed_us / 1000,
+                    "generation complete"
+                );
+                if params.prefill_only {
+                    self.metrics
+                        .record_prefill(stats.prompt_tokens as u64, elapsed_us, stats.cache_hit);
+                } else {
+                    self.metrics.record_generate(
+                        stats.prompt_tokens as u64,
+                        stats.completion_tokens as u64,
+                        elapsed_us,
+                        stats.cache_hit,
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, elapsed_ms = elapsed_us / 1000, "generation failed");
+                self.metrics.record_error();
+            }
+        }
+        result
+    }
+
+    /// Per-request context path for `generate_chat`.
+    fn generate_chat_direct(
+        &self,
+        model_name: &str,
+        messages: &[(String, String)],
+        params: &GenerateParams,
+        encryption_key: Option<&[u8; 32]>,
+        on_token: &mut dyn FnMut(&str) -> bool,
+    ) -> anyhow::Result<GenerateResult> {
+        let models = self.models.read().unwrap();
+        let loaded = models
+            .get(model_name)
+            .ok_or_else(|| anyhow::anyhow!("model '{}' not loaded", model_name))?;
+        *loaded.last_used.write().unwrap() = Instant::now();
+
+        // KV cache path: GGUF models need the prompt as a string.
+        if let Some(cache) = &self.kv_cache {
+            if let Some(llama) = loaded.model.as_any().downcast_ref::<LlamaCppModel>() {
+                let prompt = loaded.model.apply_chat_template(messages)?;
+                let ctx_params = LlamaContextParams::default()
+                    .with_n_ctx(NonZeroU32::new(loaded.n_ctx))
+                    .with_n_batch(loaded.n_ctx);
+                let mut ctx = llama
+                    .llama_model()
+                    .new_context(llama.llama_backend(), ctx_params)
+                    .map_err(|e| anyhow::anyhow!("failed to create context: {e}"))?;
+                return generate_streaming_cached(
+                    llama.llama_model(),
+                    &mut ctx,
+                    &prompt,
+                    params,
+                    model_name,
+                    &loaded.digest,
+                    cache,
+                    encryption_key,
+                    on_token,
+                );
+            }
+        }
+
+        // All other backends (MLX): fused template + generation.
+        loaded.model.generate_chat(messages, params, on_token)
     }
 
     /// Apply the model's built-in chat template to a list of `(role, content)` messages.
@@ -476,8 +806,139 @@ impl ModelManager {
         model_name: &str,
         messages: &[(String, String)],
     ) -> anyhow::Result<String> {
-        self.with_model(model_name, |model, _, _, _| {
-            super::apply_chat_template_with_fallback(model, messages)
+        let models = self.models.read().unwrap();
+        let loaded = models
+            .get(model_name)
+            .ok_or_else(|| anyhow::anyhow!("model '{}' not loaded", model_name))?;
+        *loaded.last_used.write().unwrap() = Instant::now();
+        loaded.model.apply_chat_template(messages)
+    }
+}
+
+/// Lowest priority first, oldest `last_used` as tiebreak.
+fn pick_evict_victim<'a, I>(candidates: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = (&'a str, EvictionPriority, Instant)>,
+{
+    candidates
+        .into_iter()
+        .min_by_key(|(_, p, t)| (p.evict_order(), *t))
+        .map(|(name, _, _)| name)
+}
+
+/// Sleep idle_reload, recheck idle + active_requests + headroom, reload if safe.
+async fn reload_watcher(weak: Weak<ModelManager>, spec: PendingReload) {
+    loop {
+        tokio::time::sleep(spec.idle_reload).await;
+        let Some(mgr) = weak.upgrade() else { return };
+        if mgr.is_loaded(&spec.name) {
+            return;
+        }
+        let idle_for = mgr.last_activity.read().unwrap().elapsed();
+        if idle_for < spec.idle_reload {
+            continue;
+        }
+        if mgr.active_requests.load(Ordering::SeqCst) > 0 {
+            continue;
+        }
+        if mgr.memory_budget != 0 {
+            let needed = match std::fs::metadata(&spec.path) {
+                Ok(m) => m.len(),
+                Err(e) => {
+                    tracing::warn!(model = %spec.name, error = %e, "idle-reload abort: stat failed");
+                    return;
+                }
+            };
+            let used = mgr.total_loaded_bytes();
+            let margin = mgr.memory_budget / 10;
+            if used.saturating_add(needed).saturating_add(margin) > mgr.memory_budget {
+                tracing::debug!(model = %spec.name, "idle-reload skipped: insufficient headroom");
+                return;
+            }
+        }
+        let opts = LoadOptions {
+            gpu_layers: spec.gpu_layers,
+            digest: spec.digest.clone(),
+            priority: spec.priority,
+            idle_reload: Some(spec.idle_reload),
+        };
+        let mgr_blocking = mgr.clone();
+        let path = spec.path.clone();
+        let name = spec.name.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            mgr_blocking.load_model_with_options(&name, &path, opts)
         })
+        .await;
+        match res {
+            Ok(Ok(())) => tracing::info!(model = %spec.name, "idle-reloaded"),
+            Ok(Err(e)) => tracing::warn!(model = %spec.name, error = %e, "idle-reload failed"),
+            Err(e) => tracing::warn!(model = %spec.name, error = %e, "idle-reload task panicked"),
+        }
+        return;
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+fn mlx_metallib_available() -> bool {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let Some(dir) = exe_dir else { return false };
+    if dir.join("mlx.metallib").exists() {
+        return true;
+    }
+    if dir.join("Resources/mlx.metallib").exists() {
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(secs: u64) -> Instant {
+        let base = Instant::now();
+        base.checked_sub(Duration::from_secs(1_000)).unwrap_or(base)
+            + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn priority_evicts_low_first_even_when_recent() {
+        let cands = vec![
+            ("low_recent", EvictionPriority::Low, t(999)),
+            ("normal_old", EvictionPriority::Normal, t(900)),
+        ];
+        assert_eq!(pick_evict_victim(cands), Some("low_recent"));
+    }
+
+    #[test]
+    fn priority_lru_tiebreak_within_tier() {
+        let cands = vec![
+            ("a", EvictionPriority::Normal, t(950)),
+            ("b", EvictionPriority::Normal, t(900)),
+        ];
+        assert_eq!(pick_evict_victim(cands), Some("b"));
+    }
+
+    #[test]
+    fn high_priority_evicted_last() {
+        let cands = vec![
+            ("high_old", EvictionPriority::High, t(900)),
+            ("normal_recent", EvictionPriority::Normal, t(999)),
+        ];
+        assert_eq!(pick_evict_victim(cands), Some("normal_recent"));
+    }
+
+    #[test]
+    fn evict_order_total_ordering() {
+        assert!(EvictionPriority::Low.evict_order() < EvictionPriority::Normal.evict_order());
+        assert!(EvictionPriority::Normal.evict_order() < EvictionPriority::High.evict_order());
+    }
+
+    #[test]
+    fn empty_candidates_returns_none() {
+        let empty: Vec<(&str, EvictionPriority, Instant)> = vec![];
+        assert_eq!(pick_evict_victim(empty), None);
     }
 }

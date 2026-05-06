@@ -51,6 +51,7 @@ pub mod lockfile;
 pub mod model_store;
 pub mod scheduler;
 pub mod grpc;
+pub mod backend;
 #[cfg(feature = "http")]
 pub mod http;
 

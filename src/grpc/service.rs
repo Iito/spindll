@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use crate::engine::{GenerateParams, ModelManager};
+use crate::engine::{EvictionPriority, GenerateParams, LoadOptions, ModelManager};
 use crate::model_store::ModelStore;
 use crate::proto::spindll_server::Spindll;
 use crate::proto::*;
@@ -27,11 +27,11 @@ impl SpindllService {
 fn proto_params_to_engine(p: Option<crate::proto::GenerateParams>) -> GenerateParams {
     match p {
         Some(p) => GenerateParams {
-            max_tokens: if p.max_tokens > 0 { p.max_tokens as u32 } else { 512 },
-            temperature: if p.temperature > 0.0 { p.temperature } else { 0.8 },
-            top_p: if p.top_p > 0.0 { p.top_p } else { 0.95 },
-            top_k: if p.top_k > 0 { p.top_k } else { 40 },
-            seed: if p.seed > 0 { p.seed as u32 } else { 42 },
+            max_tokens:  p.max_tokens .map(|v| v as u32).unwrap_or(512),
+            temperature: p.temperature.unwrap_or(0.8),
+            top_p:       p.top_p      .unwrap_or(0.95),
+            top_k:       p.top_k      .unwrap_or(40),
+            seed:        p.seed       .map(|v| v as u32).unwrap_or(42),
             prefill_only: false,
         },
         None => GenerateParams::default(),
@@ -134,15 +134,6 @@ impl Spindll for SpindllService {
             let messages: Vec<_> = req.messages.iter()
                 .map(|m| (m.role.clone(), m.content.clone()))
                 .collect();
-            let prompt = match mgr.apply_chat_template(&req.model, &messages) {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(Status::internal(
-                        format!("chat template error: {e}")
-                    )));
-                    return;
-                }
-            };
             let params = proto_params_to_engine(req.params);
             let enc_key: Option<[u8; 32]> = if req.encryption_key.len() == 32 {
                 let mut arr = [0u8; 32];
@@ -153,7 +144,7 @@ impl Spindll for SpindllService {
             };
             let start = std::time::Instant::now();
 
-            let result = mgr.generate(&req.model, &prompt, &params, enc_key.as_ref(), |token| {
+            let result = mgr.generate_chat(&req.model, &messages, &params, enc_key.as_ref(), |token| {
                 let resp = ChatResponse {
                     token: token.to_string(),
                     done: false,
@@ -198,7 +189,7 @@ impl Spindll for SpindllService {
                 done: false,
             }));
 
-            match store.pull(&req.repo, quant) {
+            match store.pull(&req.repo, quant, crate::model_store::FormatPreference::Auto) {
                 Ok(path) => {
                     let filename = path.file_name()
                         .map(|n| n.to_string_lossy().to_string())
@@ -233,22 +224,40 @@ impl Spindll for SpindllService {
         let models = reg
             .models
             .iter()
-            .map(|(key, entry)| ModelInfo {
-                name: key.clone(),
-                repo: entry.repo.clone(),
-                file: entry.filename.clone(),
-                quantization: String::new(),
-                size_bytes: entry.size_bytes,
-                last_used: String::new(),
-                digest: entry.digest.clone(),
-                model_name: entry.model_name.clone(),
-                description: entry.description.clone(),
-                architecture: entry.architecture.clone(),
-                context_length: entry.context_length,
+            .map(|(key, entry)| {
+                let format = match entry.format {
+                    crate::model_store::registry::ModelFormat::Gguf => "gguf",
+                    crate::model_store::registry::ModelFormat::Mlx => "mlx",
+                };
+                ModelInfo {
+                    name: key.clone(),
+                    repo: entry.repo.clone(),
+                    file: entry.filename.clone(),
+                    quantization: String::new(),
+                    size_bytes: entry.size_bytes,
+                    last_used: String::new(),
+                    digest: entry.digest.clone(),
+                    model_name: entry.model_name.clone(),
+                    description: entry.description.clone(),
+                    architecture: entry.architecture.clone(),
+                    context_length: entry.context_length,
+                    format: format.to_string(),
+                    base_model: entry.base_model.clone(),
+                    display_name: crate::model_store::display_name(key, entry),
+                }
             })
             .collect();
 
-        Ok(Response::new(ListResponse { models }))
+        let prefer_format = if crate::model_store::platform_prefers_mlx() {
+            "mlx"
+        } else {
+            "gguf"
+        };
+
+        Ok(Response::new(ListResponse {
+            models,
+            prefer_format: prefer_format.to_string(),
+        }))
     }
 
     #[tracing::instrument(skip_all, fields(model))]
@@ -276,8 +285,23 @@ impl Spindll for SpindllService {
 
         let gpu_layers = if req.gpu_layers < 0 { None } else { Some(req.gpu_layers as u32) };
 
+        let priority = match crate::proto::EvictionPriority::try_from(req.priority) {
+            Ok(crate::proto::EvictionPriority::PriorityLow) => EvictionPriority::Low,
+            Ok(crate::proto::EvictionPriority::PriorityHigh) => EvictionPriority::High,
+            _ => EvictionPriority::Normal,
+        };
+        let idle_reload = if req.idle_reload_secs == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(req.idle_reload_secs as u64))
+        };
+
         self.manager
-            .load_model_with_digest(&req.model, &model_path, gpu_layers, digest)
+            .load_model_with_options(
+                &req.model,
+                &model_path,
+                LoadOptions { gpu_layers, digest, priority, idle_reload },
+            )
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(LoadResponse {
@@ -325,9 +349,6 @@ impl Spindll for SpindllService {
             let messages: Vec<_> = req.messages.iter()
                 .map(|m| (m.role.clone(), m.content.clone()))
                 .collect();
-            let prompt = mgr.apply_chat_template(&req.model, &messages)
-                .map_err(|e| Status::internal(format!("chat template error: {e}")))?;
-
             let enc_key: Option<[u8; 32]> = if req.encryption_key.len() == 32 {
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&req.encryption_key);
@@ -341,7 +362,7 @@ impl Spindll for SpindllService {
                 ..GenerateParams::default()
             };
 
-            let stats = mgr.generate(&req.model, &prompt, &params, enc_key.as_ref(), |_| true)
+            let stats = mgr.generate_chat(&req.model, &messages, &params, enc_key.as_ref(), |_| true)
                 .map_err(|e| Status::internal(e.to_string()))?;
 
             Ok::<_, Status>(PrefillResponse {

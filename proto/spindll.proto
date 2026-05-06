@@ -75,12 +75,12 @@ message Message {
 }
 
 message GenerateParams {
-  float temperature = 1;
-  float top_p = 2;
-  int32 top_k = 3;
-  int32 max_tokens = 4;
-  repeated string stop = 5;
-  uint64 seed = 6;
+  optional float  temperature = 1;  // absent = server default (0.8)
+  optional float  top_p       = 2;  // absent = server default (0.95)
+  optional int32  top_k       = 3;  // absent = server default (40)
+  optional int32  max_tokens  = 4;  // absent = server default (512)
+  repeated string stop        = 5;
+  optional uint64 seed        = 6;  // absent = server default (42); 0 is a valid seed
 }
 
 message UsageStats {
@@ -107,6 +107,10 @@ message ListRequest {}
 
 message ListResponse {
   repeated ModelInfo models = 1;
+  // Per-host platform hint: "mlx" on Apple Silicon (with mlx feature),
+  // "gguf" elsewhere. Clients can use this to break ties when the same
+  // base_model is available in multiple formats.
+  string prefer_format = 2;
 }
 
 message ModelInfo {
@@ -121,11 +125,29 @@ message ModelInfo {
   string description = 9;
   string architecture = 10;
   uint32 context_length = 11;
+  // On-disk format: "gguf" or "mlx".
+  string format = 12;
+  // Stable cross-format identifier (e.g. "llama-3.1-8b-instruct").
+  // Same base_model in different formats refers to the same logical model.
+  string base_model = 13;
+  // Human-readable display string for UIs. Disambiguates GGUF quant
+  // variants from the same repo (e.g. "Qwen/...-GGUF (q4_k_m)" vs
+  // "Qwen/...-GGUF (fp16)") so picker labels don't collide.
+  string display_name = 14;
 }
 
 message LoadRequest {
   string model = 1;
   int32 gpu_layers = 2;  // -1 = auto
+  EvictionPriority priority = 3;
+  uint32 idle_reload_secs = 4;  // 0 = disabled
+}
+
+// Low evicts first, LRU tiebreak within tier.
+enum EvictionPriority {
+  PRIORITY_NORMAL = 0;
+  PRIORITY_LOW = 1;
+  PRIORITY_HIGH = 2;
 }
 
 message LoadResponse {
