@@ -178,6 +178,25 @@ impl ModelManager {
         })
     }
 
+    #[cfg(test)]
+    pub fn with_backends(backends: Vec<Box<dyn InferenceBackend>>, memory_budget: u64) -> Self {
+        Self {
+            backends,
+            models: RwLock::new(HashMap::new()),
+            default_n_ctx: 2048,
+            default_gpu_layers: 0,
+            memory_budget,
+            kv_cache: None,
+            ram_cache: None,
+            metrics: Arc::new(Metrics::new()),
+            batch_slots: 0,
+            last_activity: RwLock::new(Instant::now()),
+            active_requests: AtomicUsize::new(0),
+            weak_self: OnceLock::new(),
+            watchers: Mutex::new(HashMap::new()),
+        }
+    }
+
     /// Wrap into `Arc<Self>` with a `Weak` self-ref for idle-reload watchers.
     /// Required if any load uses `idle_reload`; `Arc::new(mgr)` disables it silently.
     pub fn into_arc(self) -> Arc<Self> {
@@ -896,6 +915,48 @@ fn mlx_metallib_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::streaming::GenerateResult;
+
+    struct FakeBackend;
+
+    impl InferenceBackend for FakeBackend {
+        fn load_model(
+            &self,
+            _path: &Path,
+            _params: BackendLoadParams,
+        ) -> anyhow::Result<Box<dyn BackendModel>> {
+            Ok(Box::new(FakeModel))
+        }
+        fn name(&self) -> &str { "llamacpp" }
+    }
+
+    struct FakeModel;
+
+    impl BackendModel for FakeModel {
+        fn generate(
+            &self,
+            _prompt: &str,
+            _params: &GenerateParams,
+            _on_token: &mut dyn FnMut(&str) -> bool,
+        ) -> anyhow::Result<GenerateResult> {
+            Ok(GenerateResult::default())
+        }
+        fn apply_chat_template(
+            &self,
+            _messages: &[(String, String)],
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+        fn n_ctx(&self) -> u32 { 2048 }
+        fn n_ctx_train(&self) -> u32 { 4096 }
+        fn size_bytes(&self) -> u64 { 100 }
+        fn kv_bytes_per_token(&self) -> u64 { 1 }
+        fn as_any(&self) -> &dyn std::any::Any { self }
+    }
+
+    fn test_manager(budget: u64) -> ModelManager {
+        ModelManager::with_backends(vec![Box::new(FakeBackend)], budget)
+    }
 
     fn t(secs: u64) -> Instant {
         let base = Instant::now();
@@ -940,5 +1001,251 @@ mod tests {
     fn empty_candidates_returns_none() {
         let empty: Vec<(&str, EvictionPriority, Instant)> = vec![];
         assert_eq!(pick_evict_victim(empty), None);
+    }
+
+    fn fake_model_file(dir: &Path, name: &str, size: u64) -> PathBuf {
+        let p = dir.join(name);
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(size).unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn idle_reload_fires_after_quiet_window() {
+        let dir = tempfile::tempdir().unwrap();
+        // Budget fits 2 models (2*2148=4296) but not 3 (4296+100 > 4300).
+        let mgr = test_manager(4300);
+        let mgr = mgr.into_arc();
+
+        let p_a = fake_model_file(dir.path(), "a.gguf", 100);
+        let p_b = fake_model_file(dir.path(), "b.gguf", 100);
+        let p_c = fake_model_file(dir.path(), "c.gguf", 100);
+
+        mgr.load_model_with_options("a", &p_a, LoadOptions {
+            priority: EvictionPriority::Low,
+            idle_reload: Some(Duration::from_millis(50)),
+            ..Default::default()
+        }).unwrap();
+        mgr.load_model_with_options("b", &p_b, LoadOptions {
+            priority: EvictionPriority::Normal,
+            ..Default::default()
+        }).unwrap();
+        assert!(mgr.is_loaded("a"));
+
+        // Loading "c" triggers eviction of "a" (Low priority), arming the watcher
+        mgr.load_model_with_options("c", &p_c, LoadOptions::default()).unwrap();
+        assert!(!mgr.is_loaded("a"), "a should have been evicted");
+
+        // Unload "c" to free headroom for reload
+        mgr.unload_model("c").unwrap();
+
+        // Push last_activity into the past so the idle check passes
+        *mgr.last_activity.write().unwrap() = Instant::now() - Duration::from_millis(200);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(mgr.is_loaded("a"), "model should be reloaded by idle watcher");
+    }
+
+    #[tokio::test]
+    async fn idle_reload_blocks_on_insufficient_headroom() {
+        let dir = tempfile::tempdir().unwrap();
+        // Budget fits 2 models (4296) but not 3 (4296+100 > 4300).
+        // After evict+reload check: used(4296) + needed(100) + margin(430) > 4300.
+        let mgr = test_manager(4300);
+        let mgr = mgr.into_arc();
+
+        let p_a = fake_model_file(dir.path(), "a.gguf", 100);
+        let p_b = fake_model_file(dir.path(), "b.gguf", 100);
+        let p_c = fake_model_file(dir.path(), "c.gguf", 100);
+
+        mgr.load_model_with_options("a", &p_a, LoadOptions {
+            priority: EvictionPriority::Low,
+            idle_reload: Some(Duration::from_millis(50)),
+            ..Default::default()
+        }).unwrap();
+        mgr.load_model_with_options("b", &p_b, LoadOptions {
+            priority: EvictionPriority::Normal,
+            ..Default::default()
+        }).unwrap();
+
+        // Evict "a" by loading "c"
+        mgr.load_model_with_options("c", &p_c, LoadOptions::default()).unwrap();
+        assert!(!mgr.is_loaded("a"));
+
+        // Don't free "c" — budget stays full. Reload should skip due to headroom.
+        *mgr.last_activity.write().unwrap() = Instant::now() - Duration::from_millis(200);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(!mgr.is_loaded("a"), "reload should not fire when budget is full");
+    }
+
+    #[tokio::test]
+    async fn into_arc_arms_self_weak() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(4300);
+        // Plain Arc::new — no Weak, so idle-reload cannot fire
+        let mgr = Arc::new(mgr);
+
+        let p_a = fake_model_file(dir.path(), "a.gguf", 100);
+        let p_b = fake_model_file(dir.path(), "b.gguf", 100);
+        let p_c = fake_model_file(dir.path(), "c.gguf", 100);
+
+        mgr.load_model_with_options("a", &p_a, LoadOptions {
+            priority: EvictionPriority::Low,
+            idle_reload: Some(Duration::from_millis(50)),
+            ..Default::default()
+        }).unwrap();
+        mgr.load_model_with_options("b", &p_b, LoadOptions::default()).unwrap();
+
+        mgr.load_model_with_options("c", &p_c, LoadOptions::default()).unwrap();
+        assert!(!mgr.is_loaded("a"));
+
+        mgr.unload_model("c").unwrap();
+        *mgr.last_activity.write().unwrap() = Instant::now() - Duration::from_millis(200);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(!mgr.is_loaded("a"), "reload must not fire without into_arc()");
+    }
+
+    fn evict_for_skips_high_when_low_present() {
+        let dir = tempfile::tempdir().unwrap();
+        // Each model costs 100 (file) + 1*2048 (kv) = 2148 in total_loaded_bytes.
+        // Budget fits 3 models (6444) but not 4 (6444 + 100 file > 6500).
+        let mgr = test_manager(6500);
+
+        let p_low = fake_model_file(dir.path(), "low.gguf", 100);
+        let p_norm = fake_model_file(dir.path(), "norm.gguf", 100);
+        let p_high = fake_model_file(dir.path(), "high.gguf", 100);
+
+        mgr.load_model_with_options("low", &p_low, LoadOptions {
+            priority: EvictionPriority::Low, ..Default::default()
+        }).unwrap();
+        mgr.load_model_with_options("norm", &p_norm, LoadOptions {
+            priority: EvictionPriority::Normal, ..Default::default()
+        }).unwrap();
+        mgr.load_model_with_options("high", &p_high, LoadOptions {
+            priority: EvictionPriority::High, ..Default::default()
+        }).unwrap();
+
+        let p_new = fake_model_file(dir.path(), "new.gguf", 100);
+        mgr.load_model_with_options("new", &p_new, LoadOptions::default()).unwrap();
+
+        let models = mgr.models.read().unwrap();
+        assert!(!models.contains_key("low"), "Low-priority model should be evicted");
+        assert!(models.contains_key("norm"));
+        assert!(models.contains_key("high"));
+        assert!(models.contains_key("new"));
+    }
+
+    fn real_gguf_path() -> Option<PathBuf> {
+        let p = PathBuf::from(std::env::var("HOME").ok()?)
+            .join(".spindll/models/Qwen/Qwen2.5-3B-Instruct-GGUF/qwen2.5-3b-instruct-q4_k_m.gguf");
+        p.exists().then_some(p)
+    }
+
+    #[test]
+    #[ignore] // requires downloaded model: cargo test -- --ignored
+    fn gguf_kv_bytes_per_token_is_positive() {
+        let path = real_gguf_path().expect("GGUF model not found");
+        let mgr = ModelManager::new(512, None, 0).unwrap();
+        mgr.load_model("test", &path, None).unwrap();
+        let models = mgr.models.read().unwrap();
+        let loaded = &models["test"];
+        assert!(loaded.model.kv_bytes_per_token() > 0, "kv_bytes_per_token must be positive");
+    }
+
+    #[test]
+    #[ignore]
+    fn gguf_prefill_only_returns_zero_completion_tokens() {
+        let path = real_gguf_path().expect("GGUF model not found");
+        let mgr = ModelManager::new(512, None, 0).unwrap();
+        mgr.load_model("test", &path, None).unwrap();
+        let params = crate::engine::streaming::GenerateParams {
+            prefill_only: true,
+            ..Default::default()
+        };
+        let mut token_count = 0u32;
+        let result = mgr.generate("test", "Hello world", &params, None, |_| {
+            token_count += 1;
+            true
+        }).unwrap();
+        assert_eq!(result.completion_tokens, 0);
+        assert_eq!(token_count, 0);
+    }
+
+    #[test]
+    #[ignore]
+    fn gguf_cancel_callback_stops_generation() {
+        let path = real_gguf_path().expect("GGUF model not found");
+        let mgr = ModelManager::new(512, None, 0).unwrap();
+        mgr.load_model("test", &path, None).unwrap();
+        let params = crate::engine::streaming::GenerateParams {
+            max_tokens: 100,
+            ..Default::default()
+        };
+        let mut token_count = 0u32;
+        let _ = mgr.generate("test", "Count from 1 to 50", &params, None, |_| {
+            token_count += 1;
+            false // cancel immediately
+        });
+        assert!(token_count <= 1, "expected at most 1 token, got {token_count}");
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+    fn real_mlx_path() -> Option<PathBuf> {
+        let p = PathBuf::from(std::env::var("HOME").ok()?)
+            .join(".spindll/models/mlx-community/Qwen2.5-3B-Instruct-4bit");
+        p.exists().then_some(p)
+    }
+
+    #[test]
+    #[ignore]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+    fn mlx_kv_bytes_per_token_is_positive() {
+        let path = real_mlx_path().expect("MLX model not found");
+        let mgr = ModelManager::new(512, None, 0).unwrap();
+        mgr.load_model("test-mlx", &path, None).unwrap();
+        let models = mgr.models.read().unwrap();
+        let loaded = &models["test-mlx"];
+        assert!(loaded.model.kv_bytes_per_token() > 0);
+    }
+
+    #[test]
+    #[ignore]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+    fn mlx_prefill_only_returns_zero_completion_tokens() {
+        let path = real_mlx_path().expect("MLX model not found");
+        let mgr = ModelManager::new(512, None, 0).unwrap();
+        mgr.load_model("test-mlx", &path, None).unwrap();
+        let params = crate::engine::streaming::GenerateParams {
+            prefill_only: true,
+            ..Default::default()
+        };
+        let mut token_count = 0u32;
+        let result = mgr.generate_chat("test-mlx",
+            &[("user".into(), "Hello".into())],
+            &params, None, |_| { token_count += 1; true },
+        ).unwrap();
+        assert_eq!(result.completion_tokens, 0);
+        assert_eq!(token_count, 0);
+    }
+
+    #[test]
+    #[ignore]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+    fn mlx_cancel_callback_stops_generation() {
+        let path = real_mlx_path().expect("MLX model not found");
+        let mgr = ModelManager::new(512, None, 0).unwrap();
+        mgr.load_model("test-mlx", &path, None).unwrap();
+        let params = crate::engine::streaming::GenerateParams {
+            max_tokens: 100,
+            ..Default::default()
+        };
+        let mut token_count = 0u32;
+        let _ = mgr.generate_chat("test-mlx",
+            &[("user".into(), "Count from 1 to 50".into())],
+            &params, None, |_| { token_count += 1; false },
+        );
+        assert!(token_count <= 1, "expected at most 1 token, got {token_count}");
     }
 }

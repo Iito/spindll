@@ -264,6 +264,39 @@ mod tests {
     }
 
     #[test]
+    fn save_refuses_to_overwrite_future_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        std::fs::write(&path, r#"{"version":99,"models":{}}"#).unwrap();
+
+        let mut reg = Registry::load(&path).unwrap();
+        reg.add("test/model.gguf".into(), ModelEntry {
+            repo: "test".into(),
+            filename: "model.gguf".into(),
+            path: PathBuf::from("/tmp/nonexistent"),
+            size_bytes: 100,
+            downloaded_at: 1,
+            digest: String::new(),
+            model_name: String::new(),
+            description: String::new(),
+            architecture: String::new(),
+            context_length: 0,
+            metadata_read: false,
+            format: ModelFormat::Gguf,
+            base_model: String::new(),
+        });
+
+        let result = reg.save(&path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("newer spindll"));
+
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["version"], 99);
+        assert_eq!(on_disk["models"], serde_json::json!({}));
+    }
+
+    #[test]
     fn roundtrip_save_load() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("registry.json");

@@ -439,3 +439,86 @@ impl Spindll for SpindllService {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{BackendLoadParams, BackendModel, InferenceBackend};
+    use crate::engine::streaming::{GenerateParams as EngineParams, GenerateResult};
+    use crate::model_store::registry::{ModelEntry, ModelFormat, Registry};
+    use crate::proto::spindll_server::Spindll as _; // trait needed for .list()
+
+    struct FakeBackend;
+    impl InferenceBackend for FakeBackend {
+        fn load_model(&self, _: &std::path::Path, _: BackendLoadParams) -> anyhow::Result<Box<dyn BackendModel>> {
+            Ok(Box::new(FakeModel))
+        }
+        fn name(&self) -> &str { "llamacpp" }
+    }
+    struct FakeModel;
+    impl BackendModel for FakeModel {
+        fn generate(&self, _: &str, _: &EngineParams, _: &mut dyn FnMut(&str) -> bool) -> anyhow::Result<GenerateResult> { Ok(GenerateResult::default()) }
+        fn apply_chat_template(&self, _: &[(String, String)]) -> anyhow::Result<String> { Ok(String::new()) }
+        fn n_ctx(&self) -> u32 { 2048 }
+        fn size_bytes(&self) -> u64 { 100 }
+        fn kv_bytes_per_token(&self) -> u64 { 1 }
+        fn as_any(&self) -> &dyn std::any::Any { self }
+    }
+
+    #[tokio::test]
+    async fn list_response_populates_format_base_model_display_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(store.models_dir()).unwrap();
+
+        let mut reg = Registry::load(&store.registry_path()).unwrap();
+        reg.add("TheBloke/Llama-GGUF/llama-q4_k_m.gguf".into(), ModelEntry {
+            repo: "TheBloke/Llama-GGUF".into(),
+            filename: "llama-q4_k_m.gguf".into(),
+            path: "/tmp/nonexistent".into(),
+            size_bytes: 4_000_000,
+            downloaded_at: 1,
+            digest: "sha256:abc".into(),
+            model_name: "Llama".into(),
+            description: String::new(),
+            architecture: "llama".into(),
+            context_length: 4096,
+            metadata_read: true,
+            format: ModelFormat::Gguf,
+            base_model: String::new(),
+        });
+        reg.add("mlx-community/Llama-3.1-8B-4bit".into(), ModelEntry {
+            repo: "mlx-community/Llama-3.1-8B-4bit".into(),
+            filename: String::new(),
+            path: "/tmp/nonexistent".into(),
+            size_bytes: 4_200_000,
+            downloaded_at: 2,
+            digest: "sha256:def".into(),
+            model_name: String::new(),
+            description: String::new(),
+            architecture: String::new(),
+            context_length: 0,
+            metadata_read: true,
+            format: ModelFormat::Mlx,
+            base_model: "llama3.1-8b".into(),
+        });
+        reg.save(&store.registry_path()).unwrap();
+
+        let mgr = Arc::new(ModelManager::with_backends(vec![Box::new(FakeBackend)], 0));
+        let svc = SpindllService::new(mgr, Arc::new(store));
+
+        let resp = svc.list(Request::new(ListRequest {})).await.unwrap().into_inner();
+
+        assert_eq!(resp.models.len(), 2);
+
+        let gguf = resp.models.iter().find(|m| m.format == "gguf").unwrap();
+        assert_eq!(gguf.display_name, "TheBloke/Llama-GGUF (q4_k_m)");
+        assert!(gguf.base_model.is_empty());
+
+        let mlx = resp.models.iter().find(|m| m.format == "mlx").unwrap();
+        assert_eq!(mlx.display_name, "mlx-community/Llama-3.1-8B-4bit");
+        assert_eq!(mlx.base_model, "llama3.1-8b");
+
+        assert!(!resp.prefer_format.is_empty());
+    }
+}
