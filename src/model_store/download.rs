@@ -467,6 +467,29 @@ mod tests {
         assert_eq!(split_shard_stem("model-fp16.gguf"), None);
     }
 
+    #[test]
+    fn shard_collection_filters_and_sorts() {
+        let files = [
+            "model-fp16-00003-of-00003.gguf",
+            "model-fp16-00001-of-00003.gguf",
+            "README.md",
+            "model-q4_k_m.gguf",
+            "model-fp16-00002-of-00003.gguf",
+        ];
+        let stem = split_shard_stem("model-fp16-00001-of-00003.gguf").unwrap();
+        let mut shards: Vec<&str> = files
+            .iter()
+            .filter(|f| split_shard_stem(f) == Some(stem))
+            .copied()
+            .collect();
+        shards.sort();
+        assert_eq!(shards, vec![
+            "model-fp16-00001-of-00003.gguf",
+            "model-fp16-00002-of-00003.gguf",
+            "model-fp16-00003-of-00003.gguf",
+        ]);
+    }
+
     /// Regression: locks KV math. Numbers from Qwen3-0.6B-4bit config.json.
     #[test]
     fn kv_bpt_matches_qwen3_0_6b_shape() {

@@ -985,3 +985,125 @@ fn auto_load(
     mgr.load_model_with_digest(model, &path, None, digest)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{BackendLoadParams, BackendModel, InferenceBackend};
+    use crate::engine::streaming::{GenerateParams as EngineParams, GenerateResult};
+    use crate::model_store::registry::{ModelEntry, ModelFormat};
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    struct FakeBackend;
+    impl InferenceBackend for FakeBackend {
+        fn load_model(&self, _: &std::path::Path, _: BackendLoadParams) -> anyhow::Result<Box<dyn BackendModel>> {
+            Ok(Box::new(FakeModel))
+        }
+        fn name(&self) -> &str { "llamacpp" }
+    }
+    struct FakeModel;
+    impl BackendModel for FakeModel {
+        fn generate(&self, _: &str, _params: &EngineParams, on_token: &mut dyn FnMut(&str) -> bool) -> anyhow::Result<GenerateResult> {
+            for tok in &["Hello", " world"] {
+                if !on_token(tok) { break; }
+            }
+            Ok(GenerateResult { prompt_tokens: 5, completion_tokens: 2, cache_hit: false })
+        }
+        fn apply_chat_template(&self, _: &[(String, String)]) -> anyhow::Result<String> { Ok("prompt".into()) }
+        fn n_ctx(&self) -> u32 { 2048 }
+        fn size_bytes(&self) -> u64 { 100 }
+        fn kv_bytes_per_token(&self) -> u64 { 1 }
+        fn as_any(&self) -> &dyn std::any::Any { self }
+    }
+
+    fn setup_store_and_manager(dir: &std::path::Path) -> (Arc<ModelStore>, Arc<ModelManager>) {
+        let store = ModelStore::new(Some(dir.to_path_buf()));
+        std::fs::create_dir_all(store.models_dir()).unwrap();
+
+        let model_dir = store.models_dir().join("test-org/test-model");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let model_file = model_dir.join("model.gguf");
+        std::fs::write(&model_file, b"fake-gguf").unwrap();
+
+        let mut reg = Registry::load(&store.registry_path()).unwrap();
+        reg.add("test-org/test-model/model.gguf".into(), ModelEntry {
+            repo: "test-org/test-model".into(),
+            filename: "model.gguf".into(),
+            path: model_file,
+            size_bytes: 9,
+            downloaded_at: 1,
+            digest: String::new(),
+            model_name: String::new(),
+            description: String::new(),
+            architecture: String::new(),
+            context_length: 0,
+            metadata_read: true,
+            format: ModelFormat::Gguf,
+            base_model: String::new(),
+        });
+        reg.save(&store.registry_path()).unwrap();
+
+        let mgr = ModelManager::with_backends(vec![Box::new(FakeBackend)], 0);
+        (Arc::new(store), Arc::new(mgr))
+    }
+
+    #[tokio::test]
+    async fn oai_chat_completions_streams_sse_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        let app = router(mgr, store);
+
+        let body = serde_json::json!({
+            "model": "test-org/test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "max_tokens": 10
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("data: "), "should contain SSE data lines");
+        assert!(text.contains("[DONE]"), "should end with [DONE] sentinel");
+    }
+
+    #[tokio::test]
+    async fn oai_chat_completions_non_stream_returns_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        let app = router(mgr, store);
+
+        let body = serde_json::json!({
+            "model": "test-org/test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false,
+            "max_tokens": 10
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["object"], "chat.completion");
+        assert!(json["choices"][0]["message"]["content"].as_str().unwrap().contains("Hello"));
+    }
+}
