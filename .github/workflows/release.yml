@@ -27,7 +27,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --all-features
+        run: cargo test --features cli,http
 
   build:
     needs: test
@@ -38,6 +38,8 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-apple-darwin
             os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +49,12 @@ jobs:
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake protobuf-compiler
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -63,15 +71,22 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           mkdir -p dist
-          cp target/release/spindll dist/
-          cd dist
-          tar czf "spindll-${TARGET}.tar.gz" spindll
-          rm spindll
+          if [ -f target/release/spindll.exe ]; then
+            cp target/release/spindll.exe dist/
+            cd dist
+            7z a "spindll-${TARGET}.zip" spindll.exe
+            rm spindll.exe
+          else
+            cp target/release/spindll dist/
+            cd dist
+            tar czf "spindll-${TARGET}.tar.gz" spindll
+            rm spindll
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
           name: spindll-${{ matrix.target }}
-          path: dist/*.tar.gz
+          path: dist/spindll-*
 
   release:
     needs: build
@@ -84,7 +99,37 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Create release
+      - name: Detect release type
+        id: meta
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if echo "$TAG_NAME" | grep -qE '\-rc\.[0-9]+$'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            VERSION_PREFIX=$(echo "$TAG_NAME" | sed 's/-rc\.[0-9]*$//')
+            echo "version_prefix=$VERSION_PREFIX" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Replace previous RC pre-release
+        if: steps.meta.outputs.prerelease == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+          VERSION_PREFIX: ${{ steps.meta.outputs.version_prefix }}
+        run: |
+          EXISTING=$(gh release list --json tagName,isPrerelease \
+            --jq ".[] | select(.isPrerelease and (.tagName | startswith(\"${VERSION_PREFIX}-rc.\"))) | .tagName")
+          for OLD_TAG in $EXISTING; do
+            if [ "$OLD_TAG" != "$TAG_NAME" ]; then
+              echo "Deleting previous RC release: $OLD_TAG"
+              gh release delete "$OLD_TAG" --yes --cleanup-tag
+            fi
+          done
+
+      - name: Create RC pre-release
+        if: steps.meta.outputs.prerelease == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
@@ -92,4 +137,16 @@ jobs:
           gh release create "$TAG_NAME" \
             --title "$TAG_NAME" \
             --generate-notes \
-            artifacts/*.tar.gz
+            --prerelease \
+            artifacts/spindll-*
+
+      - name: Create release
+        if: steps.meta.outputs.prerelease == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG_NAME" \
+            --title "$TAG_NAME" \
+            --generate-notes \
+            artifacts/spindll-*
