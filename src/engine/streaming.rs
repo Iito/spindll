@@ -66,6 +66,7 @@ pub(crate) fn truncate_to_fit(
 }
 
 /// Statistics returned after a generation request completes.
+#[derive(Default)]
 pub struct GenerateResult {
     /// Number of tokens in the encoded prompt.
     pub prompt_tokens: u32,

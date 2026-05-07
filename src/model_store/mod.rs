@@ -640,6 +640,38 @@ mod tests {
         assert!(!reg.models.contains_key("mlx-community/test-4bit"));
     }
 
+    #[test]
+    fn resolve_key_returns_err_when_alias_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(store.models_dir()).unwrap();
+        write_entry(
+            &store.registry_path(),
+            "TheBloke/Llama-3-8B-GGUF/llama-3-8b-q4_k_m.gguf",
+            gguf_entry("TheBloke/Llama-3-8B-GGUF", "llama-3-8b-q4_k_m.gguf"),
+        );
+
+        let result = store.resolve_key("llama3.1:8b");
+        assert!(result.is_err(), "unrelated GGUF entry must not match an Ollama alias");
+    }
+
+    #[test]
+    fn resolve_key_prefers_exact_match_over_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(store.models_dir()).unwrap();
+
+        let gguf_key = "meta-llama/Meta-Llama-3.1-8B-Instruct/llama-q4_k_m.gguf";
+        write_entry(&store.registry_path(), gguf_key, gguf_entry("meta-llama/Meta-Llama-3.1-8B-Instruct", "llama-q4_k_m.gguf"));
+
+        let mut mlx = mlx_entry("mlx-community/Meta-Llama-3.1-8B-Instruct-4bit", "llama3.1-8b");
+        mlx.base_model = "meta-llama/Meta-Llama-3.1-8B-Instruct/llama-q4_k_m.gguf".to_string();
+        write_entry(&store.registry_path(), "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit", mlx);
+
+        let resolved = store.resolve_key(gguf_key).unwrap();
+        assert_eq!(resolved, gguf_key, "exact key match (step 1) must beat base_model alias (step 5)");
+    }
+
     // --- Item 14: display_name() — values surfaced in gRPC ListResponse ---
 
     fn gguf_entry(repo: &str, filename: &str) -> ModelEntry {
