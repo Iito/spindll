@@ -42,7 +42,7 @@ private final class PromptCache {
     private var entries: [PromptCacheEntry] = []
     private let maxSize: Int
 
-    init(maxSize: Int = 4) { self.maxSize = maxSize }
+    init(maxSize: Int = 2) { self.maxSize = maxSize }
 
     /// Return the entry whose token sequence exactly matches, and promote it
     /// to the front of the LRU list.
@@ -330,7 +330,15 @@ public func mlxChatGenerate(
                         parameters: params
                     )
                     // Snapshot at offset=N (all prompt tokens processed, before decode).
-                    let snapshot = ownedCache.map { $0.copy() }
+                    // Use toQuantized() to create independent data — .copy() uses
+                    // MLXArray views that share the underlying buffer, so mutations
+                    // during generation corrupt the "snapshot".
+                    let snapshot: [any KVCache] = ownedCache.map { layer in
+                        if let simple = layer as? KVCacheSimple {
+                            return simple.toQuantized(groupSize: 64, bits: 4)
+                        }
+                        return layer.copy()
+                    }
                     state.promptCache.save(tokenIds: tokenIds, kvCache: snapshot)
                 }
 
