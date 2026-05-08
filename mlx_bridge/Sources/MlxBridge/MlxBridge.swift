@@ -514,21 +514,33 @@ public func mlxEmbed(
                 guard !tokenIds.isEmpty else { return }
 
                 let tokens = MLXArray(tokenIds.map { Int32($0) })
-                let input = LMInput(tokens: tokens).text
+                let input = LMInput.Text(tokens: tokens.expandedDimensions(axis: 0))
                 let output = context.model(input, cache: nil, state: nil)
 
-                // Find embedding weight: covers Llama/Qwen/Gemma (embed_tokens),
-                // GPT-2 (wte), and BERT-style (word_embeddings).
                 let allParams = context.model.parameters().flattened()
-                guard let embedWeight = allParams.first(where: {
-                    $0.0.contains("embed_tokens") && $0.0.hasSuffix(".weight")
-                })?.1 ?? allParams.first(where: {
-                    ($0.0.contains("wte") || $0.0.contains("word_embeddings"))
-                        && $0.0.hasSuffix(".weight")
-                })?.1 else { return }
 
-                // logits @ embed_weight: [*, seq, vocab] @ [vocab, hidden] → [*, seq, hidden]
-                let hidden = matmul(output.logits, embedWeight)
+                let embedKeys = ["embed_tokens", "wte", "word_embeddings"]
+                guard let prefix = embedKeys.lazy.compactMap({ name -> String? in
+                    allParams.first(where: { $0.0.contains(name) && $0.0.hasSuffix(".weight") })
+                        .map { String($0.0.dropLast(".weight".count)) }
+                }).first else { return }
+
+                guard let embedWeight = allParams.first(where: { $0.0 == prefix + ".weight" })?.1
+                else { return }
+                let embedScales = allParams.first(where: { $0.0 == prefix + ".scales" })?.1
+                let embedBiases = allParams.first(where: { $0.0 == prefix + ".biases" })?.1
+
+                let fullWeight: MLXArray
+                if let embedScales {
+                    fullWeight = dequantized(
+                        embedWeight, scales: embedScales, biases: embedBiases)
+                } else {
+                    fullWeight = embedWeight
+                }
+
+                let hidden = matmul(
+                    output.logits.asType(.float32),
+                    fullWeight.asType(.float32))
                 let seqAxis = hidden.ndim - 2
                 let pooled = hidden.mean(axis: seqAxis).reshaped(-1)
 
