@@ -47,6 +47,21 @@ const char* mlx_apply_chat_template(
 // Safe to call with NULL.
 void mlx_free_string(const char* s);
 
+// Compute an embedding vector for a text string.
+// On success, *out_data points to a newly allocated float array of length
+// *out_len. Caller MUST release with mlx_free_floats.
+// Returns the number of prompt tokens on success, or -1 on error.
+int32_t mlx_embed(
+    MlxModelHandle* handle,
+    const char*     text,
+    float**         out_data,
+    int32_t*        out_len
+);
+
+// Release a float array returned by mlx_embed.
+// Safe to call with NULL.
+void mlx_free_floats(float* data);
+
 #ifdef __cplusplus
 }
 #endif
