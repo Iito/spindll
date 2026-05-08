@@ -235,7 +235,11 @@ impl MlxSwiftEngine {
             .map_err(|_| anyhow::anyhow!("MLX chat generation thread panicked"))?;
 
         if raw_result < 0 {
-            anyhow::bail!("mlx_chat_generate returned error ({})", raw_result);
+            anyhow::bail!(
+                "mlx_chat_generate returned error ({}) — check server \
+                 logs for [mlx-bridge] diagnostics",
+                raw_result,
+            );
         }
 
         Ok(GenerateResult { prompt_tokens: 0, completion_tokens, cache_hit: false })

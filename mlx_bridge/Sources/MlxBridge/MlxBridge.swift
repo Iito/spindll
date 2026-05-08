@@ -210,6 +210,7 @@ public func mlxGenerate(
             }
             box.value = generated
         } catch {
+            fputs("[mlx-bridge] mlx_generate error: \(error)\n", stderr)
             box.value = -1
         }
         sema.signal()
@@ -217,6 +218,35 @@ public func mlxGenerate(
     sema.wait()
 
     return box.value ?? -1
+}
+
+// ---------------------------------------------------------------------------
+// ChatML fallback
+// ---------------------------------------------------------------------------
+
+/// Apply the chat template, falling back to ChatML if the tokenizer has
+/// no built-in template.  Returns token IDs.
+///
+/// Models whose `tokenizer_config.json` omits the `chat_template` field
+/// (common with multimodal models like Qwen-VL) will hit the fallback
+/// path: messages are formatted in ChatML and encoded directly.
+private func applyChatTemplateWithFallback(
+    tokenizer: any MLXLMCommon.Tokenizer,
+    messages: [[String: String]]
+) throws -> [Int] {
+    do {
+        return try tokenizer.applyChatTemplate(messages: messages)
+    } catch is MLXLMCommon.TokenizerError {
+        fputs("[mlx-bridge] model has no chat template, using ChatML fallback\n", stderr)
+        var chatML = ""
+        for msg in messages {
+            if let role = msg["role"], let content = msg["content"] {
+                chatML += "<|im_start|>\(role)\n\(content)<|im_end|>\n"
+            }
+        }
+        chatML += "<|im_start|>assistant\n"
+        return tokenizer.encode(text: chatML, addSpecialTokens: false)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -264,7 +294,8 @@ public func mlxChatGenerate(
             var generated: Int32 = 0
             try await state.container.perform(nonSendable: messages) { context, msgs in
                 // Apply the chat template once → token IDs. No decode → encode round-trip.
-                let rawIds  = try context.tokenizer.applyChatTemplate(messages: msgs)
+                let rawIds  = try applyChatTemplateWithFallback(
+                    tokenizer: context.tokenizer, messages: msgs)
                 let tokenIds = rawIds.map { Int32($0) }
 
                 // --- Prompt KV cache ---
@@ -339,6 +370,7 @@ public func mlxChatGenerate(
             }
             box.value = generated
         } catch {
+            fputs("[mlx-bridge] mlx_chat_generate error: \(error)\n", stderr)
             box.value = -1
         }
         sema.signal()
@@ -386,10 +418,12 @@ public func mlxApplyChatTemplate(
                 // to a string so we can hand a rendered prompt to llama.cpp's
                 // tokenizer (the MLX path then re-tokenizes via UserInput).
                 // add_generation_prompt is on by default in swift-transformers.
-                let ids = try context.tokenizer.applyChatTemplate(messages: messages)
+                let ids = try applyChatTemplateWithFallback(
+                    tokenizer: context.tokenizer, messages: messages)
                 box.value = context.tokenizer.decode(tokenIds: ids)
             }
         } catch {
+            fputs("[mlx-bridge] mlx_apply_chat_template error: \(error)\n", stderr)
             // box.value stays nil → NULL returned
         }
         sema.signal()
