@@ -54,6 +54,8 @@ Requires the `lms` CLI (installed with LM Studio).
 | `--warmup N` | 3 | Warmup runs discarded per engine |
 | `--max-tokens N` | 200 | Max completion tokens |
 | `--temperature F` | 0.0 | Sampling temperature (0.0 = greedy) |
+| `--top-p F` | 0.95 | Nucleus sampling threshold |
+| `--top-k N` | 40 | Must remain `40`; HTTP benchmark paths cannot override `top_k` |
 | `--seed N` | 42 | RNG seed |
 | `--prompts P,P,...` | built-in pool | Comma-separated prompts to cycle across runs |
 | `--cooldown N` | 5 | Seconds between phases (thermal/memory settle) |
@@ -61,6 +63,10 @@ Requires the `lms` CLI (installed with LM Studio).
 When neither `--prompts` is given, the bench binary cycles through four
 built-in prompts. With 10 runs, the first 3 are cold cache misses and runs
 4-10 are warm cache hits — which is why mean and median diverge in TTFT results.
+
+`top_p` is applied across the HTTP and gRPC benchmark paths. `top_k` is fixed
+at `40`, because the OpenAI-compatible HTTP endpoints used by the benchmark do
+not expose a `top_k` override.
 
 ---
 
@@ -80,7 +86,10 @@ built-in prompts. With 10 runs, the first 3 are cold cache misses and runs
 the prompt KV cache enabled, repeated prompts skip full prefill; only the
 first occurrence of each prompt in a run is a cold miss.
 
-**Tok/s** — completion throughput. Unaffected by the cache.
+**Tok/s** — decode-only throughput, computed as `(completion_tokens - 1) /
+(total - TTFT)`. The first token is generated during the TTFT/prefill window,
+so it is excluded from both the numerator and the time interval. This isolates
+decode speed from prefill effects.
 
 **Total** — wall time for the full streamed response.
 
