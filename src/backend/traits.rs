@@ -68,4 +68,13 @@ pub trait BackendModel: Send + Sync {
     fn kv_bytes_per_token(&self) -> u64;
 
     fn as_any(&self) -> &dyn std::any::Any;
+
+    fn embed(&self, _text: &str) -> anyhow::Result<EmbedResult> {
+        anyhow::bail!("embeddings not supported by this backend")
+    }
+}
+
+pub struct EmbedResult {
+    pub embedding: Vec<f32>,
+    pub prompt_tokens: u32,
 }
