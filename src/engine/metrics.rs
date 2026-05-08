@@ -11,6 +11,8 @@ pub struct Metrics {
     pub total_prefill_time_us: AtomicU64,
     pub generate_requests: AtomicU64,
     pub generate_errors: AtomicU64,
+    pub embed_requests: AtomicU64,
+    pub total_embed_time_us: AtomicU64,
 }
 
 /// Point-in-time snapshot of all metrics counters.
@@ -23,6 +25,8 @@ pub struct MetricsSnapshot {
     pub total_prefill_time_us: u64,
     pub generate_requests: u64,
     pub generate_errors: u64,
+    pub embed_requests: u64,
+    pub total_embed_time_us: u64,
 }
 
 impl Metrics {
@@ -37,6 +41,8 @@ impl Metrics {
             total_prefill_time_us: AtomicU64::new(0),
             generate_requests: AtomicU64::new(0),
             generate_errors: AtomicU64::new(0),
+            embed_requests: AtomicU64::new(0),
+            total_embed_time_us: AtomicU64::new(0),
         }
     }
 
@@ -51,6 +57,8 @@ impl Metrics {
             total_prefill_time_us: self.total_prefill_time_us.load(Relaxed),
             generate_requests: self.generate_requests.load(Relaxed),
             generate_errors: self.generate_errors.load(Relaxed),
+            embed_requests: self.embed_requests.load(Relaxed),
+            total_embed_time_us: self.total_embed_time_us.load(Relaxed),
         }
     }
 
@@ -77,6 +85,13 @@ impl Metrics {
         } else {
             self.cache_misses.fetch_add(1, Relaxed);
         }
+    }
+
+    /// Record a completed embedding request.
+    pub fn record_embed(&self, prompt_tokens: u64, elapsed_us: u64) {
+        self.embed_requests.fetch_add(1, Relaxed);
+        self.total_prompt_tokens.fetch_add(prompt_tokens, Relaxed);
+        self.total_embed_time_us.fetch_add(elapsed_us, Relaxed);
     }
 
     /// Increment the error counter.
