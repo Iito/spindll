@@ -496,6 +496,7 @@ main() {
 
     command -v jq   >/dev/null || die "jq required: brew install jq"
     command -v curl >/dev/null || die "curl required"
+    [[ "$TOP_K" == "40" ]] || die "--top-k must remain 40: the HTTP benchmark path cannot override top_k, so non-default values would invalidate comparisons"
 
     WORK="$(mktemp -d)"
     ensure_bench
