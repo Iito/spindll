@@ -42,6 +42,7 @@ pub fn router(manager: Arc<ModelManager>, store: Arc<ModelStore>) -> Router {
         .route("/v1/models", get(oai_models))
         .route("/v1/chat/completions", post(oai_chat_completions))
         .route("/v1/completions", post(oai_completions))
+        .route("/v1/embeddings", post(oai_embeddings))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -1001,6 +1002,100 @@ async fn oai_completions(
     }
 }
 
+// -- POST /v1/embeddings ----------------------------------------------------
+
+#[derive(Deserialize)]
+struct OaiEmbeddingRequest {
+    model: String,
+    input: EmbeddingInput,
+    #[serde(default)]
+    encoding_format: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EmbeddingInput {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+async fn oai_embeddings(
+    State(state): State<AppState>,
+    Json(req): Json<OaiEmbeddingRequest>,
+) -> impl IntoResponse {
+    if let Some(ref fmt) = req.encoding_format {
+        if fmt != "float" {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(oai_error("only float encoding_format is supported")),
+            )
+                .into_response();
+        }
+    }
+
+    let texts: Vec<String> = match req.input {
+        EmbeddingInput::Single(s) => vec![s],
+        EmbeddingInput::Batch(v) => v,
+    };
+
+    if texts.is_empty() || texts.iter().any(|t| t.is_empty()) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(oai_error("input must be a non-empty string or array of non-empty strings")),
+        )
+            .into_response();
+    }
+
+    let model_id = req.model.clone();
+    let mgr = state.manager.clone();
+    let store = state.store.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        auto_load(&mgr, &store, &req.model)?;
+
+        let mut data = Vec::with_capacity(texts.len());
+        let mut total_tokens = 0u32;
+
+        for (i, text) in texts.iter().enumerate() {
+            let r = mgr.embed(&req.model, text)?;
+            total_tokens += r.prompt_tokens;
+            data.push(serde_json::json!({
+                "object": "embedding",
+                "index": i,
+                "embedding": r.embedding,
+            }));
+        }
+
+        Ok::<_, anyhow::Error>((data, total_tokens))
+    })
+    .await;
+
+    match result {
+        Ok(Ok((data, total_tokens))) => {
+            Json(serde_json::json!({
+                "object": "list",
+                "data": data,
+                "model": model_id,
+                "usage": {
+                    "prompt_tokens": total_tokens,
+                    "total_tokens": total_tokens,
+                }
+            }))
+            .into_response()
+        }
+        Ok(Err(e)) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(oai_error(&e.to_string())),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(oai_error(&e.to_string())),
+        )
+            .into_response(),
+    }
+}
+
 fn oai_error(msg: &str) -> serde_json::Value {
     serde_json::json!({
         "error": {
@@ -1028,7 +1123,7 @@ fn auto_load(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackendLoadParams, BackendModel, InferenceBackend};
+    use crate::backend::{BackendLoadParams, BackendModel, EmbedResult, InferenceBackend};
     use crate::engine::streaming::{GenerateParams as EngineParams, GenerateResult};
     use crate::model_store::registry::{ModelEntry, ModelFormat};
     use axum::body::Body;
@@ -1055,6 +1150,12 @@ mod tests {
         fn size_bytes(&self) -> u64 { 100 }
         fn kv_bytes_per_token(&self) -> u64 { 1 }
         fn as_any(&self) -> &dyn std::any::Any { self }
+        fn embed(&self, _text: &str) -> anyhow::Result<EmbedResult> {
+            Ok(EmbedResult {
+                embedding: vec![0.6, 0.8],
+                prompt_tokens: 3,
+            })
+        }
     }
 
     fn setup_store_and_manager(dir: &std::path::Path) -> (Arc<ModelStore>, Arc<ModelManager>) {
@@ -1144,5 +1245,109 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["object"], "chat.completion");
         assert!(json["choices"][0]["message"]["content"].as_str().unwrap().contains("Hello"));
+    }
+
+    #[tokio::test]
+    async fn oai_embeddings_single_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        let app = router(mgr, store);
+
+        let body = serde_json::json!({
+            "model": "test-org/test-model",
+            "input": "hello world"
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["object"], "list");
+        assert_eq!(json["data"][0]["object"], "embedding");
+        assert_eq!(json["data"][0]["index"], 0);
+        let emb = json["data"][0]["embedding"].as_array().unwrap();
+        assert_eq!(emb.len(), 2);
+        assert_eq!(json["usage"]["prompt_tokens"], 3);
+    }
+
+    #[tokio::test]
+    async fn oai_embeddings_batch_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        let app = router(mgr, store);
+
+        let body = serde_json::json!({
+            "model": "test-org/test-model",
+            "input": ["hello", "world"]
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["data"].as_array().unwrap().len(), 2);
+        assert_eq!(json["data"][1]["index"], 1);
+        assert_eq!(json["usage"]["prompt_tokens"], 6);
+    }
+
+    #[tokio::test]
+    async fn oai_embeddings_rejects_empty_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        let app = router(mgr, store);
+
+        let body = serde_json::json!({
+            "model": "test-org/test-model",
+            "input": ""
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn oai_embeddings_rejects_base64_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        let app = router(mgr, store);
+
+        let body = serde_json::json!({
+            "model": "test-org/test-model",
+            "input": "hello",
+            "encoding_format": "base64"
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 400);
     }
 }
