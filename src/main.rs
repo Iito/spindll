@@ -86,6 +86,7 @@ enum Commands {
     },
 
     /// Benchmark two models side-by-side (any format: GGUF, MLX, or mixed)
+    #[cfg(debug_assertions)]
     Bench {
         /// First model
         model: String,
@@ -171,9 +172,10 @@ fn backend_for_format(
 }
 
 // ---------------------------------------------------------------------------
-// Benchmark helpers
+// Benchmark helpers (debug only — excluded from release builds)
 // ---------------------------------------------------------------------------
 
+#[cfg(debug_assertions)]
 struct BenchResult {
     format_name: &'static str,
     ttft_ms: f64,
@@ -187,12 +189,14 @@ struct BenchResult {
 /// task_info on macOS, /proc on Linux, GetProcessMemoryInfo on Windows --
 /// ~370 ns/call, no self-pollution. (sysinfo::System::new_all takes ~5 ms
 /// and inflates RSS by ~5 MB per call: see tools/mem_bench/.)
+#[cfg(debug_assertions)]
 fn phys_footprint_mb() -> f64 {
     memory_stats::memory_stats()
         .map(|s| s.physical_mem as f64 / (1024.0 * 1024.0))
         .unwrap_or(0.0)
 }
 
+#[cfg(debug_assertions)]
 fn bench_by_format(
     path: &std::path::Path,
     format: spindll::model_store::registry::ModelFormat,
@@ -260,6 +264,7 @@ fn bench_by_format(
     })
 }
 
+#[cfg(debug_assertions)]
 fn format_mem(mb: f64) -> String {
     if mb <= 0.0 {
         return "  —".to_string();
@@ -271,6 +276,7 @@ fn format_mem(mb: f64) -> String {
     }
 }
 
+#[cfg(debug_assertions)]
 fn print_bench_row(label: &str, r: &BenchResult) {
     let label = if label.len() > 40 { &label[..40] } else { label };
     println!(
@@ -435,6 +441,7 @@ async fn main() -> anyhow::Result<()> {
             }
             println!();
         }
+        #[cfg(debug_assertions)]
         Commands::Bench {
             model,
             against,
@@ -448,6 +455,20 @@ async fn main() -> anyhow::Result<()> {
                 "Explain how transformers work in machine learning, step by step.";
             let prompt_str = prompt.as_deref().unwrap_or(default_prompt);
 
+            // Run both benchmarks first — tracing logs go to stderr during this phase.
+            let path1 = store.resolve_model_path(&model)?;
+            let fmt1 = store.resolve_model_format(&model)?;
+            let r1 = bench_by_format(&path1, fmt1, prompt_str, max_tokens, runs, ctx_size)?;
+
+            let path2 = store.resolve_model_path(&against)?;
+            let fmt2 = store.resolve_model_format(&against)?;
+            let r2 = bench_by_format(&path2, fmt2, prompt_str, max_tokens, runs, ctx_size)?;
+
+            // Flush stderr so logs don't bleed into the table.
+            use std::io::Write;
+            std::io::stderr().flush().ok();
+
+            // Print the summary table.
             println!("prompt    {:?}", prompt_str);
             println!(
                 "runs      {} (+ 1 warmup)  max-tokens={}  ctx-size={} (GGUF)",
@@ -459,17 +480,8 @@ async fn main() -> anyhow::Result<()> {
                 "MODEL", "FMT", "TTFT", "TOK/S", "TOTAL", "TOKS", "MEM"
             );
             println!("{}", "─".repeat(86));
-
-            let path1 = store.resolve_model_path(&model)?;
-            let fmt1 = store.resolve_model_format(&model)?;
-            let r1 = bench_by_format(&path1, fmt1, prompt_str, max_tokens, runs, ctx_size)?;
             print_bench_row(&model, &r1);
-
-            let path2 = store.resolve_model_path(&against)?;
-            let fmt2 = store.resolve_model_format(&against)?;
-            let r2 = bench_by_format(&path2, fmt2, prompt_str, max_tokens, runs, ctx_size)?;
             print_bench_row(&against, &r2);
-
             println!("{}", "─".repeat(86));
 
             let tps_ratio = r2.tokens_per_sec / r1.tokens_per_sec;
