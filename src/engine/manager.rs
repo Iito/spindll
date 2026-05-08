@@ -859,6 +859,43 @@ impl ModelManager {
         *loaded.last_used.write().unwrap() = Instant::now();
         loaded.model.apply_chat_template(messages)
     }
+
+    /// Compute an embedding vector for a text string.
+    #[tracing::instrument(skip(self, text), fields(model = model_name))]
+    pub fn embed(
+        &self,
+        model_name: &str,
+        text: &str,
+    ) -> anyhow::Result<crate::backend::EmbedResult> {
+        let _active = ActiveGuard::new(&self.active_requests);
+        let models = self.models.read().unwrap();
+        let loaded = models
+            .get(model_name)
+            .ok_or_else(|| anyhow::anyhow!("model '{}' not loaded", model_name))?;
+        *loaded.last_used.write().unwrap() = Instant::now();
+        self.record_activity();
+
+        let start = Instant::now();
+        let result = loaded.model.embed(text);
+        let elapsed_us = start.elapsed().as_micros() as u64;
+
+        match &result {
+            Ok(r) => {
+                tracing::info!(
+                    prompt_tokens = r.prompt_tokens,
+                    embedding_dim = r.embedding.len(),
+                    elapsed_ms = elapsed_us / 1000,
+                    "embedding complete"
+                );
+                self.metrics.record_embed(r.prompt_tokens as u64, elapsed_us);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, elapsed_ms = elapsed_us / 1000, "embedding failed");
+                self.metrics.record_error();
+            }
+        }
+        result
+    }
 }
 
 /// Lowest priority first, oldest `last_used` as tiebreak.
@@ -1217,6 +1254,19 @@ mod tests {
             false // cancel immediately
         });
         assert!(token_count <= 1, "expected at most 1 token, got {token_count}");
+    }
+
+    #[test]
+    #[ignore]
+    fn gguf_embed_produces_normalized_vector() {
+        let path = real_gguf_path().expect("GGUF model not found");
+        let mgr = ModelManager::new(512, None, 0).unwrap();
+        mgr.load_model("test", &path, None).unwrap();
+        let result = mgr.embed("test", "Hello world").unwrap();
+        assert!(!result.embedding.is_empty(), "embedding should not be empty");
+        assert!(result.prompt_tokens > 0);
+        let norm: f32 = result.embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 0.01, "embedding should be L2-normalized, got norm={norm}");
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
