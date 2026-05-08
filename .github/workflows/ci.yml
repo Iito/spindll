@@ -3,6 +3,13 @@ name: CI
 on:
   pull_request:
     branches: [main, next]
+    paths:
+      - "src/**"
+      - "proto/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci.yml"
   workflow_dispatch:
 
 env:

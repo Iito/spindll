@@ -12,7 +12,25 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Cargo.toml version matches tag
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          TAG_VERSION=$(echo "$TAG_NAME" | sed 's/^v//; s/-rc\.[0-9]*$//')
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
+            exit 1
+          fi
+          echo "Version match: v$CARGO_VERSION"
+
   test:
+    needs: check-version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
