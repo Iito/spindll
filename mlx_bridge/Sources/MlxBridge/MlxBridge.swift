@@ -488,3 +488,78 @@ public func mlxFreeString(_ s: UnsafePointer<CChar>?) {
     mutable.deinitialize(count: len)
     mutable.deallocate()
 }
+
+// ---------------------------------------------------------------------------
+// mlx_embed
+// ---------------------------------------------------------------------------
+
+@_cdecl("mlx_embed")
+public func mlxEmbed(
+    _ handle:  UnsafeMutableRawPointer?,
+    _ text:    UnsafePointer<CChar>?,
+    _ outData: UnsafeMutablePointer<UnsafeMutablePointer<Float>?>?,
+    _ outLen:  UnsafeMutablePointer<Int32>?
+) -> Int32 {
+    guard let handle, let text, let outData, let outLen else { return -1 }
+    let state = Unmanaged<ModelState>.fromOpaque(handle).takeUnretainedValue()
+    let inputText = String(cString: text)
+
+    let sema = DispatchSemaphore(value: 0)
+    let box = Box<(UnsafeMutablePointer<Float>, Int32, Int32)>()
+
+    Task {
+        do {
+            try await state.container.perform(nonSendable: inputText) { context, txt in
+                let tokenIds = context.tokenizer.encode(text: txt)
+                guard !tokenIds.isEmpty else { return }
+
+                let tokens = MLXArray(tokenIds.map { Int32($0) })
+                let input = LMInput(tokens: tokens).text
+                let output = context.model(input, cache: nil, state: nil)
+
+                // Find embedding weight: covers Llama/Qwen/Gemma (embed_tokens),
+                // GPT-2 (wte), and BERT-style (word_embeddings).
+                let allParams = context.model.parameters().flattened()
+                guard let embedWeight = allParams.first(where: {
+                    $0.0.contains("embed_tokens") && $0.0.hasSuffix(".weight")
+                })?.1 ?? allParams.first(where: {
+                    ($0.0.contains("wte") || $0.0.contains("word_embeddings"))
+                        && $0.0.hasSuffix(".weight")
+                })?.1 else { return }
+
+                // logits @ embed_weight: [*, seq, vocab] @ [vocab, hidden] → [*, seq, hidden]
+                let hidden = matmul(output.logits, embedWeight)
+                let seqAxis = hidden.ndim - 2
+                let pooled = hidden.mean(axis: seqAxis).reshaped(-1)
+
+                let norm = MLX.sqrt((pooled * pooled).sum())
+                let normalized = norm.item(Float.self) > 0 ? pooled / norm : pooled
+                MLX.eval(normalized)
+                Stream().synchronize()
+
+                let floats = normalized.asArray(Float.self)
+                let buf = UnsafeMutablePointer<Float>.allocate(capacity: floats.count)
+                buf.initialize(from: floats, count: floats.count)
+                box.value = (buf, Int32(floats.count), Int32(tokenIds.count))
+            }
+        } catch {
+            // box stays nil → returns -1
+        }
+        sema.signal()
+    }
+    sema.wait()
+
+    guard let (buf, len, promptTokens) = box.value else { return -1 }
+    outData.pointee = buf
+    outLen.pointee = len
+    return promptTokens
+}
+
+// ---------------------------------------------------------------------------
+// mlx_free_floats
+// ---------------------------------------------------------------------------
+
+@_cdecl("mlx_free_floats")
+public func mlxFreeFloats(_ data: UnsafeMutablePointer<Float>?) {
+    data?.deallocate()
+}
