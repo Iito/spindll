@@ -61,7 +61,7 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     runs: u32,
 
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 3)]
     warmup: u32,
 
     #[arg(long, default_value_t = 200)]
@@ -116,6 +116,19 @@ fn resolve_prompts(args: &Args) -> Vec<&str> {
     }
 }
 
+fn decode_tok_per_sec(completion_tokens: u32, ttft_ms: f64, total_ms: f64) -> f64 {
+    // The first token is generated during the TTFT window, so only
+    // completion_tokens - 1 tokens fall inside the decode interval.
+    if completion_tokens < 2 {
+        return 0.0;
+    }
+    let decode_ms = total_ms - ttft_ms;
+    if decode_ms <= 0.0 {
+        return 0.0;
+    }
+    (completion_tokens - 1) as f64 / (decode_ms / 1000.0)
+}
+
 // ── Result types ──────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -156,6 +169,7 @@ async fn run_once_http(
         "stream": true,
         "max_tokens": max_tokens,
         "temperature": args.temperature,
+        "top_p": args.top_p,
         "seed": args.seed,
         "stream_options": {"include_usage": true},
     });
@@ -211,7 +225,7 @@ async fn run_once_http(
     let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
     let ttft_ms = ttft.unwrap_or(total_ms);
     let completion_tokens = tokens_from_usage.unwrap_or(delta_chunks);
-    let tok_per_sec = completion_tokens as f64 / (total_ms / 1000.0);
+    let tok_per_sec = decode_tok_per_sec(completion_tokens, ttft_ms, total_ms);
 
     Ok(RunResult { ttft_ms, completion_tokens, total_ms, tok_per_sec, prompt: prompt.to_string(), text })
 }
@@ -269,7 +283,7 @@ async fn run_once_grpc(
     let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
     let ttft_ms = ttft.unwrap_or(total_ms);
     let completion_tokens = tokens_from_usage.unwrap_or(delta_count);
-    let tok_per_sec = completion_tokens as f64 / (total_ms / 1000.0);
+    let tok_per_sec = decode_tok_per_sec(completion_tokens, ttft_ms, total_ms);
 
     Ok(RunResult { ttft_ms, completion_tokens, total_ms, tok_per_sec, prompt: prompt.to_string(), text })
 }
@@ -307,7 +321,7 @@ async fn bench_http(
     prompts: &[&str],
     max_tokens: i32,
     args: &Args,
-) -> Vec<RunResult> {
+) -> anyhow::Result<Vec<RunResult>> {
     let mut results = Vec::new();
     for i in 0..(args.warmup + args.runs) {
         let is_warmup = i < args.warmup;
@@ -321,10 +335,13 @@ async fn bench_http(
                 eprintln!(" {:.1} tok/s  TTFT {:.0} ms", r.tok_per_sec, r.ttft_ms);
                 if !is_warmup { results.push(r); }
             }
-            Err(e) => eprintln!(" ERROR: {e}"),
+            Err(e) => {
+                eprintln!(" ERROR: {e}");
+                return Err(e.context(format!("{label} {tag} failed")));
+            }
         }
     }
-    results
+    Ok(results)
 }
 
 async fn bench_grpc(
@@ -332,7 +349,7 @@ async fn bench_grpc(
     prompts: &[&str],
     max_tokens: i32,
     args: &Args,
-) -> Vec<RunResult> {
+) -> anyhow::Result<Vec<RunResult>> {
     let mut results = Vec::new();
     for i in 0..(args.warmup + args.runs) {
         let is_warmup = i < args.warmup;
@@ -346,10 +363,13 @@ async fn bench_grpc(
                 eprintln!(" {:.1} tok/s  TTFT {:.0} ms", r.tok_per_sec, r.ttft_ms);
                 if !is_warmup { results.push(r); }
             }
-            Err(e) => eprintln!(" ERROR: {e}"),
+            Err(e) => {
+                eprintln!(" ERROR: {e}");
+                return Err(e.context(format!("spindll-grpc {tag} failed")));
+            }
         }
     }
-    results
+    Ok(results)
 }
 
 // ── Stats + table ─────────────────────────────────────────────────────────────
@@ -420,12 +440,16 @@ fn print_table(engines: &[PhaseOutput]) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    anyhow::ensure!(
+        args.top_k == 40,
+        "bench requires --top-k=40: the HTTP benchmark path cannot override top_k, so non-default values would make protocol comparisons invalid"
+    );
     let http = Client::new();
     let mut output = BenchOutput { engines: vec![] };
     let prompts = resolve_prompts(&args);
 
     if args.phase == Phase::Mlx || args.phase == Phase::All {
-        let results = bench_http("mlx-engine", &http, &args.url_mlx, &args.model, &prompts, args.max_tokens, &args).await;
+        let results = bench_http("mlx-engine", &http, &args.url_mlx, &args.model, &prompts, args.max_tokens, &args).await?;
         output.engines.push(PhaseOutput { engine: "mlx-engine".to_string(), runs: results });
     }
 
@@ -433,7 +457,7 @@ async fn main() -> anyhow::Result<()> {
         if let Err(e) = preload_model(&http, &args.url_spin, &args.model).await {
             eprintln!("  [spindll] preload warning: {e} — continuing anyway");
         }
-        let http_results = bench_http("spindll-http", &http, &args.url_spin, &args.model, &prompts, args.max_tokens, &args).await;
+        let http_results = bench_http("spindll-http", &http, &args.url_spin, &args.model, &prompts, args.max_tokens, &args).await?;
         output.engines.push(PhaseOutput { engine: "spindll-http".to_string(), runs: http_results });
     }
 
@@ -444,7 +468,7 @@ async fn main() -> anyhow::Result<()> {
         let grpc_endpoint = format!("http://{}:{}", args.grpc_host, args.grpc_port);
         let mut grpc = SpindllClient::connect(grpc_endpoint).await
             .map_err(|e| anyhow::anyhow!("gRPC connect failed: {e}"))?;
-        let grpc_results = bench_grpc(&mut grpc, &prompts, args.max_tokens, &args).await;
+        let grpc_results = bench_grpc(&mut grpc, &prompts, args.max_tokens, &args).await?;
         output.engines.push(PhaseOutput { engine: "spindll-grpc".to_string(), runs: grpc_results });
     }
 
