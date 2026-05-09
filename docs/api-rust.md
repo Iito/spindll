@@ -22,12 +22,17 @@ use spindll::model_store::ModelStore;
 // for "no eviction".
 let mut manager = ModelManager::new(4096, None, 0)?;
 
-// Enable KV cache (2GB)
+// Enable KV cache (2GB). Use enable_kv_cache_with_dir() for a custom path.
 manager.enable_kv_cache(2_000_000_000);
 
 // Enable continuous batching (8 concurrent sequences per GGUF model;
 // MLX models are gated out via supports_batching()).
 manager.set_batch_slots(8);
+
+// Enable RAM cache to keep recently-evicted model weights in memory (4GB).
+// On reload the manager restores from RAM instead of reading from disk.
+// No-op on macOS where the OS unified memory cache handles this.
+manager.enable_ram_cache(4_000_000_000);
 
 // Load a model — the manager picks the backend automatically based on
 // the format detected from the path (file → GGUF, directory → MLX).
@@ -42,6 +47,25 @@ manager.generate("llama3.1:8b", "Hello!", &GenerateParams::default(), None, |tok
     true // return false to stop early
 })?;
 ```
+
+### LoadOptions and eviction priority
+
+For fine-grained control over model lifecycle, use `load_model_with_options` instead of `load_model_with_digest`:
+
+```rust
+use spindll::engine::{LoadOptions, EvictionPriority};
+use std::time::Duration;
+
+let opts = LoadOptions {
+    gpu_layers: None,                           // auto-detect
+    digest: digest.clone(),
+    priority: EvictionPriority::High,           // evict last
+    idle_reload: Some(Duration::from_secs(60)), // reload 60s after eviction
+};
+manager.load_model_with_options("llama3.1:8b", &path, opts)?;
+```
+
+`EvictionPriority` has three tiers — `Low`, `Normal` (default), `High`. Low-priority models are evicted first regardless of recency; within the same tier, LRU order applies. `idle_reload` tells the manager to automatically reload the model after eviction once memory frees up.
 
 ### Backend traits (advanced)
 
@@ -83,7 +107,8 @@ let path = store.pull("Qwen/Qwen2.5-3B-Instruct-GGUF", Some("q5_k_m"), FormatPre
 ```rust
 use std::sync::Arc;
 
-let manager = Arc::new(manager);
+// into_arc() sets up internal weak references needed by the idle-reload watcher.
+let manager = manager.into_arc();
 let store = Arc::new(ModelStore::new(None));
 
 // gRPC server (always available)
