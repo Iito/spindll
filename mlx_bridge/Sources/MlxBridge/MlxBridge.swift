@@ -250,6 +250,30 @@ private func applyChatTemplateWithFallback(
 }
 
 // ---------------------------------------------------------------------------
+// Deep-copy cache layer
+// ---------------------------------------------------------------------------
+
+/// Create an independent deep copy of a KV/SSM cache layer.
+///
+/// `.copy()` in mlx-swift-lm uses `array[.ellipsis]` which is a slice view —
+/// the new arrays share the underlying buffer and get corrupted when the
+/// original is mutated during generation.
+///
+/// For KVCacheSimple we use `toQuantized()` (handled at call-site).
+/// For Mamba/SSM caches and anything else, we force an independent allocation
+/// via an arithmetic identity (`* 1`) + `eval()`.
+private func deepCopyCache(_ layer: any KVCache) -> any KVCache {
+    var copied = layer.copy()
+    if copied is KVCacheSimple { return copied }
+    // .copy() uses array[.ellipsis] which is a view sharing the underlying
+    // buffer. Force independent allocations via an arithmetic identity.
+    let detached = copied.state.map { $0 * 1 }
+    MLX.eval(detached)
+    copied.state = detached
+    return copied
+}
+
+// ---------------------------------------------------------------------------
 // mlx_chat_generate
 // ---------------------------------------------------------------------------
 
@@ -307,7 +331,7 @@ public func mlxChatGenerate(
                 var iterator: TokenIterator
                 if let entry = state.promptCache.lookup(tokenIds: tokenIds) {
                     // HIT: restore cache at offset N-1, run last token only.
-                    let restoredCache = entry.kvCache.map { $0.copy() }
+                    let restoredCache = entry.kvCache.map { deepCopyCache($0) }
                     trimPromptCache(restoredCache, numTokens: 1)
                     let seedInput = LMInput(tokens: MLXArray([entry.lastTokenId]))
                     iterator = try TokenIterator(
@@ -337,7 +361,7 @@ public func mlxChatGenerate(
                         if let simple = layer as? KVCacheSimple {
                             return simple.toQuantized(groupSize: 64, bits: 4)
                         }
-                        return layer.copy()
+                        return deepCopyCache(layer)
                     }
                     state.promptCache.save(tokenIds: tokenIds, kvCache: snapshot)
                 }
