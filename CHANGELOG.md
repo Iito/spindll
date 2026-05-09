@@ -13,6 +13,9 @@ All notable changes to this project will be documented in this file.
   matching the GGUF backend's disk-backed cache.
 - **MLX chat template support** — reads Jinja chat templates via the Swift bridge,
   falling back to ChatML when the model ships without one.
+- **`spindll search`** — search for models across HuggingFace and Ollama registries,
+  ranked by host hardware compatibility (preferred format first, models that fit
+  in available RAM before those that don't, then by download count).
 - `docs/mlx-bridge.md` documenting the `mlx_bridge/` Swift package: C ABI,
   prompt KV cache, build pipeline, and Rust FFI integration. Linked from the
   `docs/` index and from a new `mlx_bridge/README.md` pointer.

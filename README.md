@@ -41,6 +41,7 @@ Models are loaded automatically on first request, or explicitly via the `Load` R
 ## CLI
 
 ```
+spindll search <query> [--limit N]     # search HuggingFace + Ollama, ranked by hardware
 spindll pull <model> [flags]          # pull from Ollama registry or HuggingFace
 spindll list                          # show local models with metadata
 spindll rm <model>                    # delete a local model
