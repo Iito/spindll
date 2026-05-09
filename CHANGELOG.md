@@ -8,6 +8,60 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Per-model eviction priority + idle-reload watcher** — models can be pinned or
+  deprioritised for eviction; idle-reload watches previously-loaded models and
+  brings them back when memory permits.
+- **MLX prompt KV cache** — prefix caching for MLX models with fused chat generate,
+  matching the GGUF backend's disk-backed cache.
+- **MLX chat template support** — reads Jinja chat templates via the Swift bridge,
+  falling back to ChatML when the model ships without one.
+- **`spindll search`** — search for models across HuggingFace and Ollama registries,
+  ranked by host hardware compatibility (preferred format first, models that fit
+  in available RAM before those that don't, then by download count).
+- `docs/mlx-bridge.md` documenting the `mlx_bridge/` Swift package: C ABI,
+  prompt KV cache, build pipeline, and Rust FFI integration. Linked from the
+  `docs/` index and from a new `mlx_bridge/README.md` pointer.
+
+### Changed
+
+- `bench` command gated from release builds (`#[cfg(debug_assertions)]`).
+- Bench throughput reporting now separates decode tok/s from total tok/s;
+  comparison model is optional for single-model profiling.
+- `run` command routes through `ModelManager` instead of dispatching to backends
+  directly; gains `--ctx-size` and `--budget` flags.
+- Bench memory footprint measurement switched from raw `phys_footprint_mb` FFI to
+  the `memory-stats` crate.
+
+### Fixed
+
+- **MLX KV cache corruption** — quantize cache snapshots before storing to prevent
+  stale float buffers on cache hits; deep-copy `MambaCache` state to prevent
+  shared-buffer corruption across generations.
+- **MLX ChatML fallback** — models without a chat template no longer panic; the
+  bridge falls back to ChatML formatting.
+- MLX pull/run/rm bugs: import path resolution, model removal, incorrect format
+  detection.
+- MLX backend skipped gracefully when metallib not found next to binary.
+- `platform_prefers_mlx` gated on the `mlx` feature flag — no longer suggests MLX
+  format on builds compiled without the feature.
+- Reject MLX pull on unsupported platforms instead of downloading unusable weights.
+- Split GGUF models: download all shards instead of only the first file.
+- Suppress llama.cpp C-level log messages from leaking into terminal output;
+  restore log suppression with correct `ggml` level mapping.
+- Xcode toolchain rpath for Swift concurrency dylib on macOS.
+- Honor `--budget 0` flag and guard registry save against empty model stores.
+- **Linux budget-aware loading** — account for batch scheduler weight in memory
+  budget calculations, add `clamp_budget_to_live` to prevent over-allocation on
+  explicit budgets, use `checked_div` in `resolve_n_ctx` to avoid division by zero
+  on very small budgets.
+- README links to `docs/API.md` (removed in the v0.5.0 docs split) now point to
+  `docs/README.md` and `docs/api-rust.md`.
+
+## [0.5.0] - 2026-04-28
+>>>>>>> fb494ff (docs: add search command to README and changelog)
+
+### Added
+
 - **Multi-backend trait system** — pluggable `InferenceBackend` and `BackendModel` traits replace
   hardcoded llama.cpp calls, enabling new backends without touching the manager or CLI.
 - **MLX Swift backend** — native Apple Silicon inference via MLX Swift, auto-selected on
