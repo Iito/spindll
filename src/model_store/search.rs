@@ -57,7 +57,8 @@ pub fn search_models(query: &str, limit: usize) -> anyhow::Result<Vec<SearchResu
 
     let prefers_mlx = super::platform_prefers_mlx();
     let mem = crate::scheduler::budget::MemoryBudget::detect(None);
-    rank_results(&mut results, prefers_mlx, mem.total_ram);
+    let inference_mem = detect_inference_memory(mem.total_ram);
+    rank_results(&mut results, prefers_mlx, inference_mem);
 
     results.truncate(limit);
     Ok(results)
@@ -142,6 +143,29 @@ fn probe_ollama(
         })),
         _ => Ok(None),
     }
+}
+
+/// Returns the memory that constrains inference: VRAM on machines with a
+/// dedicated GPU, total system RAM on unified-memory platforms (Apple Silicon).
+pub fn detect_inference_memory(total_ram: u64) -> u64 {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return total_ram;
+    }
+    detect_vram_nvidia().unwrap_or(total_ram)
+}
+
+fn detect_vram_nvidia() -> Option<u64> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first_line = stdout.lines().next()?.trim();
+    let mib: u64 = first_line.parse().ok()?;
+    Some(mib * 1_048_576)
 }
 
 fn rank_results(results: &mut Vec<SearchResult>, prefers_mlx: bool, available_mem: u64) {
@@ -298,6 +322,35 @@ mod tests {
 
         rank_results(&mut results, false, 16_000_000_000);
         assert_eq!(results[0].format, ModelFormat::Gguf);
+    }
+
+    #[test]
+    fn rank_by_vram_on_dedicated_gpu() {
+        // Simulate a machine with 64 GB system RAM but only 8 GB VRAM.
+        // A 12 GB model won't fit in VRAM, so a smaller 4 GB model with
+        // fewer downloads should rank higher.
+        let vram: u64 = 8_000_000_000;
+        let mut results = vec![
+            SearchResult {
+                name: "Popular-14B-GGUF".into(),
+                source: SearchSource::HuggingFace,
+                format: ModelFormat::Gguf,
+                downloads: 500_000,
+                estimated_bytes: Some(12_000_000_000),
+            },
+            SearchResult {
+                name: "Niche-7B-GGUF".into(),
+                source: SearchSource::HuggingFace,
+                format: ModelFormat::Gguf,
+                downloads: 5_000,
+                estimated_bytes: Some(4_000_000_000),
+            },
+        ];
+        rank_results(&mut results, false, vram);
+        assert_eq!(
+            results[0].name, "Niche-7B-GGUF",
+            "model that fits in VRAM should rank above one that doesn't, regardless of downloads",
+        );
     }
 
     #[test]
