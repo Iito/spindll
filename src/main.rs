@@ -126,6 +126,16 @@ enum Commands {
         from_ollama: bool,
     },
 
+    /// Search for models across HuggingFace and Ollama
+    Search {
+        /// Search query (e.g. "qwen2.5", "llama 8b", "codestral")
+        query: String,
+
+        /// Maximum results to show
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+
     /// Show server status
     Status {
         /// Port of the running server (auto-detected from lockfile if omitted)
@@ -572,6 +582,78 @@ async fn main() -> anyhow::Result<()> {
                 "{} is {:.0}% faster total throughput, {:.0}% faster TTFT vs {}",
                 fl, tps_pct, ttft_pct, sl,
             );
+        }
+        Commands::Search { query, limit } => {
+            use spindll::model_store::search;
+            use spindll::model_store::registry::ModelFormat;
+
+            println!("Searching for \"{query}\"...\n");
+
+            let q = query.clone();
+            let results = tokio::task::spawn_blocking(move || {
+                search::search_models(&q, limit)
+            })
+            .await??;
+
+            if results.is_empty() {
+                println!("  No models found.");
+                return Ok(());
+            }
+
+            let max_name = 50;
+            let name_w = results
+                .iter()
+                .map(|r| r.name.len())
+                .max()
+                .unwrap_or(5)
+                .max(5)
+                .min(max_name);
+
+            println!(
+                "  {:<nw$}  {:<6}  {:<4}  {:>10}  {:>10}",
+                "MODEL", "SOURCE", "FMT", "EST. SIZE", "DOWNLOADS",
+                nw = name_w,
+            );
+            println!("  {}", "-".repeat(name_w + 38));
+
+            for r in &results {
+                let size = match r.estimated_bytes {
+                    Some(b) => format!("~{}", search::format_size(b)),
+                    None => "-".into(),
+                };
+                let dl = if r.downloads > 0 {
+                    search::format_downloads(r.downloads)
+                } else {
+                    "-".into()
+                };
+                let fmt = match r.format {
+                    ModelFormat::Gguf => "gguf",
+                    ModelFormat::Mlx => "mlx",
+                };
+                let display_name = if r.name.len() > max_name {
+                    format!("{}...", &r.name[..max_name - 3])
+                } else {
+                    r.name.clone()
+                };
+                println!(
+                    "  {:<nw$}  {:<6}  {:<4}  {:>10}  {:>10}",
+                    display_name, r.source, fmt, size, dl,
+                    nw = name_w,
+                );
+            }
+
+            let prefers = if spindll::model_store::platform_prefers_mlx() {
+                "mlx (Apple Silicon)"
+            } else {
+                "gguf"
+            };
+            let mem = spindll::scheduler::budget::MemoryBudget::detect(None);
+            println!(
+                "\n  Available RAM: ~{}  Preferred format: {}",
+                search::format_size(mem.available_ram),
+                prefers,
+            );
+            println!("  Pull: spindll pull <model>");
         }
         Commands::Import { from_ollama } => {
             if from_ollama {
