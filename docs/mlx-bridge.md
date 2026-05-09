@@ -34,7 +34,7 @@ The headers in `include/mlx_bridge.h` define the exported surface. All entry poi
 
 ## Prompt KV cache
 
-`mlx_chat_generate` keeps an in-memory LRU of the last 4 prompt token sequences and their post-prefill `KVCache` snapshots. On a hit, the cache is restored, trimmed by one token, and `TokenIterator` is seeded with the final prompt token only — TTFT collapses to a single decode step instead of full prefill. Access is serialised by `ModelContainer`'s actor, so no extra locking is needed.
+`mlx_chat_generate` keeps an in-memory LRU of the last 2 prompt token sequences and their post-prefill `KVCache` snapshots. On a hit, the cache is restored, trimmed by one token, and `TokenIterator` is seeded with the final prompt token only — TTFT collapses to a single decode step instead of full prefill. Access is serialised by `ModelContainer`'s actor, so no extra locking is needed.
 
 The cache lives on the `ModelState` retained by `mlx_model_load` and is released by `mlx_model_free`.
 
