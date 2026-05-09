@@ -648,10 +648,15 @@ async fn main() -> anyhow::Result<()> {
                 "gguf"
             };
             let mem = spindll::scheduler::budget::MemoryBudget::detect(None);
+            let inference_mem = search::detect_inference_memory(mem.total_ram);
+            let mem_label = if inference_mem < mem.total_ram {
+                format!("VRAM: ~{}", search::format_size(inference_mem))
+            } else {
+                format!("System RAM: ~{}", search::format_size(mem.total_ram))
+            };
             println!(
-                "\n  System RAM: ~{}  Preferred format: {}",
-                search::format_size(mem.total_ram),
-                prefers,
+                "\n  {}  Preferred format: {}",
+                mem_label, prefers,
             );
             println!("  Pull: spindll pull <model>");
         }
