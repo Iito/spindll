@@ -57,7 +57,7 @@ pub fn search_models(query: &str, limit: usize) -> anyhow::Result<Vec<SearchResu
 
     let prefers_mlx = super::platform_prefers_mlx();
     let mem = crate::scheduler::budget::MemoryBudget::detect(None);
-    rank_results(&mut results, prefers_mlx, mem.available_ram);
+    rank_results(&mut results, prefers_mlx, mem.total_ram);
 
     results.truncate(limit);
     Ok(results)
