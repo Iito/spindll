@@ -649,8 +649,8 @@ async fn main() -> anyhow::Result<()> {
             };
             let mem = spindll::scheduler::budget::MemoryBudget::detect(None);
             println!(
-                "\n  Available RAM: ~{}  Preferred format: {}",
-                search::format_size(mem.available_ram),
+                "\n  System RAM: ~{}  Preferred format: {}",
+                search::format_size(mem.total_ram),
                 prefers,
             );
             println!("  Pull: spindll pull <model>");
