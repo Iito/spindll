@@ -539,13 +539,22 @@ impl ModelManager {
     }
 
     /// Enable the disk-backed KV cache with the given max size in bytes.
+    /// Also enables the in-memory RAM tier (512 MB) unless already configured.
     pub fn enable_kv_cache(&mut self, max_bytes: u64) {
         self.kv_cache = Some(KvCache::new(max_bytes));
+        if self.kv_ram_cache.is_none() {
+            self.kv_ram_cache = Some(KvRamCache::new(512 * 1_048_576));
+        }
     }
 
     /// Enable the in-memory KV state cache with the given max size in bytes.
     pub fn enable_kv_ram_cache(&mut self, max_bytes: u64) {
         self.kv_ram_cache = Some(KvRamCache::new(max_bytes));
+    }
+
+    /// Disable the in-memory KV state cache.
+    pub fn disable_kv_ram_cache(&mut self) {
+        self.kv_ram_cache = None;
     }
 
     /// Returns a reference to the KV RAM cache, if enabled.

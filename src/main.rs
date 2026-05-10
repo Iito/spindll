@@ -55,13 +55,21 @@ enum Commands {
         #[arg(long)]
         budget: Option<String>,
 
-        /// Enable KV cache for prompt prefixes (e.g. "2G", default 2G when enabled)
+        /// Disk KV cache size for prompt prefixes (e.g. "2G", default 2G)
         #[arg(long)]
-        kv_cache: Option<Option<String>>,
+        kv_cache: Option<String>,
 
-        /// In-memory KV state cache (e.g. "512M", default 512M when enabled)
+        /// Disable disk KV cache
         #[arg(long)]
-        kv_ram_cache: Option<Option<String>>,
+        no_kv_cache: bool,
+
+        /// In-memory KV state cache size (e.g. "512M", default 512M)
+        #[arg(long)]
+        kv_ram_cache: Option<String>,
+
+        /// Disable the in-memory KV state cache
+        #[arg(long)]
+        no_kv_ram_cache: bool,
 
         /// Concurrent sequence slots per model for batch scheduling (0 = disabled)
         #[arg(long, default_value = "0")]
@@ -407,7 +415,9 @@ async fn main() -> anyhow::Result<()> {
             gpu_layers,
             budget,
             kv_cache,
+            no_kv_cache,
             kv_ram_cache,
+            no_kv_ram_cache,
             batch_slots,
             ram_cache,
             http_port,
@@ -423,22 +433,22 @@ async fn main() -> anyhow::Result<()> {
             let mut manager =
                 spindll::engine::ModelManager::new(ctx_size, gpu_layers, mem.budget)?;
 
-            if let Some(cache_size) = kv_cache {
-                let bytes = parse_size_bytes(cache_size.as_deref());
+            if !no_kv_cache {
+                let bytes = kv_cache
+                    .as_deref()
+                    .map(|s| parse_size_bytes(Some(s)))
+                    .unwrap_or(2 * 1_073_741_824);
                 manager.enable_kv_cache(bytes);
                 println!("kv cache: {:.1} GB max", bytes as f64 / 1_073_741_824.0);
-            }
 
-            if let Some(cache_size) = kv_ram_cache {
-                let bytes = match cache_size.as_deref() {
-                    Some(s) => parse_size_bytes(Some(s)),
-                    None => 512 * 1_048_576, // 512 MB default
-                };
-                manager.enable_kv_ram_cache(bytes);
-                println!(
-                    "kv ram cache: {:.0} MB max",
-                    bytes as f64 / 1_048_576.0
-                );
+                if !no_kv_ram_cache {
+                    let ram_bytes = kv_ram_cache
+                        .as_deref()
+                        .map(|s| parse_size_bytes(Some(s)))
+                        .unwrap_or(512 * 1_048_576);
+                    manager.enable_kv_ram_cache(ram_bytes);
+                    println!("kv ram cache: {:.0} MB max", ram_bytes as f64 / 1_048_576.0);
+                }
             }
 
             if let Some(cache_size) = ram_cache {
