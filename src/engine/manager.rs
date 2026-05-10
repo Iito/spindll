@@ -1152,6 +1152,7 @@ mod tests {
         assert!(!mgr.is_loaded("a"), "reload must not fire without into_arc()");
     }
 
+    #[test]
     fn evict_for_skips_high_when_low_present() {
         let dir = tempfile::tempdir().unwrap();
         // Each model costs 100 (file) + 1*2048 (kv) = 2148 in total_loaded_bytes.
