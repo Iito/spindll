@@ -92,11 +92,17 @@ fn compile_mlx_metallib(manifest_dir: &str) -> Result<(), Box<dyn std::error::Er
         .to_path_buf();
 
     let metallib_dest = bin_dir.join("mlx.metallib");
+    let metallib_out = Path::new(&out_dir).join("mlx.metallib");
 
     // Skip recompilation if the metallib is already in the binary dir.
     // The build script re-runs whenever mlx_bridge/Sources changes (rerun-if-changed above),
     // so the metallib will be refreshed when shaders change.
     if metallib_dest.exists() {
+        // Ensure OUT_DIR has a copy for include_bytes!() even when the
+        // build-script hash changes across rebuilds.
+        if !metallib_out.exists() {
+            std::fs::copy(&metallib_dest, &metallib_out)?;
+        }
         return Ok(());
     }
 
@@ -143,11 +149,10 @@ fn compile_mlx_metallib(manifest_dir: &str) -> Result<(), Box<dyn std::error::Er
     }
 
     // Link all .air files into mlx.metallib in OUT_DIR, then copy to the binary dir.
-    let metallib_tmp = Path::new(&out_dir).join("mlx.metallib");
     let mut args = vec![
         "-sdk".to_string(), "macosx".to_string(),
         "metallib".to_string(),
-        "-o".to_string(), metallib_tmp.to_str().unwrap().to_string(),
+        "-o".to_string(), metallib_out.to_str().unwrap().to_string(),
     ];
     args.extend(air_files.iter().map(|p| p.to_str().unwrap().to_string()));
 
@@ -156,7 +161,7 @@ fn compile_mlx_metallib(manifest_dir: &str) -> Result<(), Box<dyn std::error::Er
         return Err("metallib link failed".into());
     }
 
-    std::fs::copy(&metallib_tmp, &metallib_dest)?;
+    std::fs::copy(&metallib_out, &metallib_dest)?;
     println!("cargo:warning=compiled mlx.metallib → {}", metallib_dest.display());
 
     Ok(())
