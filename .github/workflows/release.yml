@@ -17,6 +17,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Skip superseded RC tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if echo "$TAG_NAME" | grep -qE '\-rc\.[0-9]+$'; then
+            RC_NUM=$(echo "$TAG_NAME" | grep -oE '[0-9]+$')
+            PREFIX=$(echo "$TAG_NAME" | sed 's/-rc\.[0-9]*$//')
+            LATEST=$(git tag -l "${PREFIX}-rc.*" | grep -oE '[0-9]+$' | sort -n | tail -1)
+            if [ "$RC_NUM" -lt "$LATEST" ]; then
+              echo "::notice::Skipping $TAG_NAME — newer RC ${PREFIX}-rc.${LATEST} exists"
+              exit 1
+            fi
+          fi
+
       - name: Verify Cargo.toml version matches tag
         env:
           TAG_NAME: ${{ github.ref_name }}
