@@ -70,7 +70,11 @@ pub struct SearchOptions {
     pub sort: SortOrder,
 }
 
-pub fn search_models(query: &str, opts: &SearchOptions) -> anyhow::Result<(Vec<SearchResult>, u64)> {
+pub fn search_models(
+    query: &str,
+    opts: &SearchOptions,
+    inference_mem: u64,
+) -> anyhow::Result<Vec<SearchResult>> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
@@ -100,18 +104,18 @@ pub fn search_models(query: &str, opts: &SearchOptions) -> anyhow::Result<(Vec<S
     backfill_sizes(&client, &mut results);
 
     let prefers_mlx = super::platform_prefers_mlx();
-    let mem = crate::scheduler::budget::MemoryBudget::detect(None);
-    let inference_mem = detect_inference_memory(mem.total_ram);
 
     match opts.sort {
         SortOrder::Default => rank_results(&mut results, prefers_mlx, inference_mem),
         SortOrder::Downloads => results.sort_by(|a, b| b.downloads.cmp(&a.downloads)),
-        SortOrder::Size => results.sort_by(|a, b| a.estimated_bytes.cmp(&b.estimated_bytes)),
+        SortOrder::Size => results.sort_by_key(|r| {
+            r.estimated_bytes.map(|b| b as i64).unwrap_or(i64::MAX)
+        }),
         SortOrder::Name => results.sort_by(|a, b| a.name.cmp(&b.name)),
     }
 
     results.truncate(opts.limit);
-    Ok((results, inference_mem))
+    Ok(results)
 }
 
 fn search_hf_gguf(
@@ -545,6 +549,37 @@ mod tests {
         let unknown = quant_to_bpp("Model-GGUF");
         assert!(q8 > q4 && q4 > q2);
         assert_eq!(unknown, DEFAULT_BPP_QUANTIZED);
+    }
+
+    #[test]
+    fn size_sort_puts_none_last() {
+        let mut results = vec![
+            SearchResult {
+                name: "unknown".into(),
+                source: SearchSource::HuggingFace,
+                format: ModelFormat::Gguf,
+                downloads: 0,
+                estimated_bytes: None,
+            },
+            SearchResult {
+                name: "big".into(),
+                source: SearchSource::HuggingFace,
+                format: ModelFormat::Gguf,
+                downloads: 0,
+                estimated_bytes: Some(10_000_000_000),
+            },
+            SearchResult {
+                name: "small".into(),
+                source: SearchSource::HuggingFace,
+                format: ModelFormat::Gguf,
+                downloads: 0,
+                estimated_bytes: Some(1_000_000_000),
+            },
+        ];
+        results.sort_by_key(|r| r.estimated_bytes.map(|b| b as i64).unwrap_or(i64::MAX));
+        assert_eq!(results[0].name, "small");
+        assert_eq!(results[1].name, "big");
+        assert_eq!(results[2].name, "unknown");
     }
 
     #[test]
