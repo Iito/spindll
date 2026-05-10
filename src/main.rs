@@ -93,13 +93,13 @@ enum Commands {
         kv_cache: Option<Option<String>>,
     },
 
-    /// Benchmark one or two models (any format: GGUF, MLX, or mixed)
-    #[cfg(debug_assertions)]
+    /// Benchmark one or two models (GGUF vs GGUF, MLX vs MLX, or mixed)
+    #[cfg(feature = "bench")]
     Bench {
-        /// First model
+        /// Model to benchmark
         model: String,
 
-        /// Optional second model to compare against
+        /// Optional second model to compare against (any format)
         against: Option<String>,
 
         /// Number of measured runs (plus 1 warmup)
@@ -117,6 +117,10 @@ enum Commands {
         /// Prompt to use for all runs
         #[arg(long)]
         prompt: Option<String>,
+
+        /// Output JSON instead of a table
+        #[arg(long)]
+        json: bool,
     },
 
     /// Import models from Ollama
@@ -212,15 +216,15 @@ fn backend_for_format(
 // Benchmark helpers (debug only — excluded from release builds)
 // ---------------------------------------------------------------------------
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "bench")]
+#[derive(serde::Serialize)]
 struct BenchResult {
     format_name: &'static str,
-    prompt_tokens: u32,
-    completion_tokens: u32,
     ttft_ms: f64,
-    decode_tokens_per_sec: f64,
-    total_tokens_per_sec: f64,
+    /// Decode-only throughput: (completion_tokens - 1) / (total - ttft).
+    tok_per_sec: f64,
     total_ms: f64,
+    completion_tokens: u32,
     mem_peak_mb: f64,
 }
 
@@ -228,14 +232,28 @@ struct BenchResult {
 /// task_info on macOS, /proc on Linux, GetProcessMemoryInfo on Windows --
 /// ~370 ns/call, no self-pollution. (sysinfo::System::new_all takes ~5 ms
 /// and inflates RSS by ~5 MB per call: see tools/mem_bench/.)
-#[cfg(debug_assertions)]
+#[cfg(feature = "bench")]
 fn phys_footprint_mb() -> f64 {
     memory_stats::memory_stats()
         .map(|s| s.physical_mem as f64 / (1024.0 * 1024.0))
         .unwrap_or(0.0)
 }
 
-#[cfg(debug_assertions)]
+/// Decode-only tok/s: the first token is produced during the TTFT window,
+/// so only (tokens - 1) fall in the decode interval (total - ttft).
+#[cfg(feature = "bench")]
+fn decode_tok_per_sec(completion_tokens: u32, ttft_ms: f64, total_ms: f64) -> f64 {
+    if completion_tokens < 2 {
+        return 0.0;
+    }
+    let decode_ms = total_ms - ttft_ms;
+    if decode_ms <= 0.0 {
+        return 0.0;
+    }
+    (completion_tokens - 1) as f64 / (decode_ms / 1000.0)
+}
+
+#[cfg(feature = "bench")]
 fn bench_by_format(
     path: &std::path::Path,
     format: spindll::model_store::registry::ModelFormat,
@@ -271,11 +289,9 @@ fn bench_by_format(
     model.generate(prompt, &params, &mut |_| true)?;
 
     let mut ttft_sum = 0.0f64;
-    let mut decode_tps_sum = 0.0f64;
-    let mut total_tps_sum = 0.0f64;
+    let mut tps_sum = 0.0f64;
     let mut total_ms_sum = 0.0f64;
-    let mut prompt_token_sum = 0u64;
-    let mut completion_token_sum = 0u64;
+    let mut last_tokens = 0u32;
     let mut mem_peak = 0.0f64;
 
     for _ in 0..runs {
@@ -289,14 +305,11 @@ fn bench_by_format(
             }
             true
         })?;
-        let elapsed = start.elapsed().as_secs_f64();
-        let (decode_tps, total_tps) = bench_sample_rates(result.completion_tokens, elapsed, ttft);
+        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
         ttft_sum += ttft;
-        decode_tps_sum += decode_tps;
-        total_tps_sum += total_tps;
-        total_ms_sum += elapsed * 1000.0;
-        prompt_token_sum += u64::from(result.prompt_tokens);
-        completion_token_sum += u64::from(result.completion_tokens);
+        tps_sum += decode_tok_per_sec(result.completion_tokens, ttft, total_ms);
+        total_ms_sum += total_ms;
+        last_tokens = result.completion_tokens;
         let sample = phys_footprint_mb();
         if sample > mem_peak {
             mem_peak = sample;
@@ -305,39 +318,15 @@ fn bench_by_format(
 
     Ok(BenchResult {
         format_name,
-        prompt_tokens: average_tokens(prompt_token_sum, runs),
-        completion_tokens: average_tokens(completion_token_sum, runs),
         ttft_ms: ttft_sum / runs as f64,
-        decode_tokens_per_sec: decode_tps_sum / runs as f64,
-        total_tokens_per_sec: total_tps_sum / runs as f64,
+        tok_per_sec: tps_sum / runs as f64,
         total_ms: total_ms_sum / runs as f64,
+        completion_tokens: last_tokens,
         mem_peak_mb: mem_peak,
     })
 }
 
-#[cfg(debug_assertions)]
-fn bench_sample_rates(completion_tokens: u32, total_seconds: f64, ttft_ms: f64) -> (f64, f64) {
-    if completion_tokens == 0 || total_seconds <= 0.0 {
-        return (0.0, 0.0);
-    }
-
-    let tokens = completion_tokens as f64;
-    let total_tps = tokens / total_seconds;
-    let decode_seconds = total_seconds - ttft_ms / 1000.0;
-    let decode_tps = if decode_seconds > 0.0 {
-        tokens / decode_seconds
-    } else {
-        0.0
-    };
-    (decode_tps, total_tps)
-}
-
-#[cfg(debug_assertions)]
-fn average_tokens(sum: u64, runs: u32) -> u32 {
-    ((sum as f64 / runs as f64).round()).min(u32::MAX as f64) as u32
-}
-
-#[cfg(debug_assertions)]
+#[cfg(feature = "bench")]
 fn format_mem(mb: f64) -> String {
     if mb <= 0.0 {
         return "  —".to_string();
@@ -349,19 +338,17 @@ fn format_mem(mb: f64) -> String {
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "bench")]
 fn print_bench_row(label: &str, r: &BenchResult) {
-    let label = if label.len() > 36 { &label[..36] } else { label };
-    let tokens = format!("{}/{}", r.prompt_tokens, r.completion_tokens);
+    let label = if label.len() > 40 { &label[..40] } else { label };
     println!(
-        "{:<36} {:>4} {:>9} {:>7.0}ms {:>9.1} {:>9.1} {:>7.2}s {:>6}",
+        "{:<40} {:>4} {:>8.0}ms {:>8.1} {:>7.2}s {:>5} {:>6}",
         label,
         r.format_name,
-        tokens,
         r.ttft_ms,
-        r.decode_tokens_per_sec,
-        r.total_tokens_per_sec,
+        r.tok_per_sec,
         r.total_ms / 1000.0,
+        r.completion_tokens,
         format_mem(r.mem_peak_mb),
     );
 }
@@ -503,7 +490,7 @@ async fn main() -> anyhow::Result<()> {
             })?;
             println!();
         }
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "bench")]
         Commands::Bench {
             model,
             against,
@@ -511,6 +498,7 @@ async fn main() -> anyhow::Result<()> {
             max_tokens,
             ctx_size,
             prompt,
+            json,
         } => {
             let store = spindll::model_store::ModelStore::new(None);
             let default_prompt =
@@ -521,67 +509,94 @@ async fn main() -> anyhow::Result<()> {
             let fmt1 = store.resolve_model_format(&model)?;
             let r1 = bench_by_format(&path1, fmt1, prompt_str, max_tokens, runs, ctx_size)?;
 
+            let r2 = if let Some(ref against) = against {
+                let path2 = store.resolve_model_path(against)?;
+                let fmt2 = store.resolve_model_format(against)?;
+                Some(bench_by_format(&path2, fmt2, prompt_str, max_tokens, runs, ctx_size)?)
+            } else {
+                None
+            };
+
             use std::io::Write;
             std::io::stderr().flush().ok();
-            println!("prompt    {:?}", prompt_str);
-            println!(
-                "runs      {} (+ 1 warmup)  max-tokens={}  ctx-size={} (GGUF)",
-                runs, max_tokens, ctx_size
-            );
-            println!("{}", "─".repeat(80));
-            println!(
-                "{:<36} {:>4} {:>9} {:>8} {:>9} {:>9} {:>8} {:>6}",
-                "MODEL", "FMT", "P/C TOK", "TTFT", "DEC/S", "TOTAL/S", "TOTAL", "MEM"
-            );
-            println!("{}", "─".repeat(80));
 
-            print_bench_row(&model, &r1);
-
-            let Some(against) = against else {
-                println!("{}", "─".repeat(80));
-                return Ok(());
-            };
-
-            let path2 = store.resolve_model_path(&against)?;
-            let fmt2 = store.resolve_model_format(&against)?;
-            let r2 = bench_by_format(&path2, fmt2, prompt_str, max_tokens, runs, ctx_size)?;
-            print_bench_row(&against, &r2);
-
-            println!("{}", "─".repeat(80));
-
-            let tps_ratio = r2.total_tokens_per_sec / r1.total_tokens_per_sec;
-            let ttft_ratio = r1.ttft_ms / r2.ttft_ms;
-
-            let (faster_label, slower_label, tps_pct, ttft_pct) = if tps_ratio >= 1.0 {
-                (
-                    against.as_str(),
-                    model.as_str(),
-                    (tps_ratio - 1.0) * 100.0,
-                    (ttft_ratio - 1.0) * 100.0,
-                )
+            if json {
+                let mut results = serde_json::json!([{
+                    "model": &model,
+                    "format": r1.format_name,
+                    "ttft_ms": r1.ttft_ms,
+                    "tok_per_sec": r1.tok_per_sec,
+                    "total_ms": r1.total_ms,
+                    "completion_tokens": r1.completion_tokens,
+                    "mem_peak_mb": r1.mem_peak_mb,
+                }]);
+                if let Some(ref r2) = r2 {
+                    results.as_array_mut().unwrap().push(serde_json::json!({
+                        "model": against.as_ref().unwrap(),
+                        "format": r2.format_name,
+                        "ttft_ms": r2.ttft_ms,
+                        "tok_per_sec": r2.tok_per_sec,
+                        "total_ms": r2.total_ms,
+                        "completion_tokens": r2.completion_tokens,
+                        "mem_peak_mb": r2.mem_peak_mb,
+                    }));
+                }
+                println!("{}", serde_json::to_string_pretty(&results)?);
             } else {
-                (
-                    model.as_str(),
-                    against.as_str(),
-                    (1.0 / tps_ratio - 1.0) * 100.0,
-                    (1.0 / ttft_ratio - 1.0) * 100.0,
-                )
-            };
+                println!("prompt    {:?}", prompt_str);
+                println!(
+                    "runs      {} (+ 1 warmup)  max-tokens={}  ctx-size={} (GGUF)",
+                    runs, max_tokens, ctx_size
+                );
+                println!("{}", "─".repeat(86));
+                println!(
+                    "{:<40} {:>4} {:>9} {:>9} {:>8} {:>5} {:>6}",
+                    "MODEL", "FMT", "TTFT", "TOK/S", "TOTAL", "TOKS", "MEM"
+                );
+                println!("{}", "─".repeat(86));
+                print_bench_row(&model, &r1);
+                if let Some(ref r2) = r2 {
+                    print_bench_row(against.as_ref().unwrap(), r2);
+                }
+                println!("{}", "─".repeat(86));
 
-            let fl = if faster_label.len() > 30 {
-                &faster_label[..30]
-            } else {
-                faster_label
-            };
-            let sl = if slower_label.len() > 30 {
-                &slower_label[..30]
-            } else {
-                slower_label
-            };
-            println!(
-                "{} is {:.0}% faster total throughput, {:.0}% faster TTFT vs {}",
-                fl, tps_pct, ttft_pct, sl,
-            );
+                if let Some(ref r2) = r2 {
+                    let against = against.as_ref().unwrap();
+                    let tps_ratio = r2.tok_per_sec / r1.tok_per_sec;
+                    let ttft_ratio = r1.ttft_ms / r2.ttft_ms;
+
+                    let (faster_label, slower_label, tps_pct, ttft_pct) = if tps_ratio >= 1.0 {
+                        (
+                            against.as_str(),
+                            model.as_str(),
+                            (tps_ratio - 1.0) * 100.0,
+                            (ttft_ratio - 1.0) * 100.0,
+                        )
+                    } else {
+                        (
+                            model.as_str(),
+                            against.as_str(),
+                            (1.0 / tps_ratio - 1.0) * 100.0,
+                            (1.0 / ttft_ratio - 1.0) * 100.0,
+                        )
+                    };
+
+                    let fl = if faster_label.len() > 30 {
+                        &faster_label[..30]
+                    } else {
+                        faster_label
+                    };
+                    let sl = if slower_label.len() > 30 {
+                        &slower_label[..30]
+                    } else {
+                        slower_label
+                    };
+                    println!(
+                        "{} is {:.0}% faster throughput, {:.0}% faster TTFT vs {}",
+                        fl, tps_pct, ttft_pct, sl,
+                    );
+                }
+            }
         }
         Commands::Search { query, limit } => {
             use spindll::model_store::search;
@@ -768,17 +783,5 @@ mod tests {
     #[test]
     fn manager_memory_budget_uses_detected_cap_for_explicit_size() {
         assert_eq!(manager_memory_budget(Some("8G"), 123), 123);
-    }
-
-    #[test]
-    fn bench_sample_rates_split_decode_from_total_elapsed() {
-        let (decode_tps, total_tps) = bench_sample_rates(128, 5.859_230_309, 42.624_710);
-        assert!((total_tps - 21.85).abs() < 0.01);
-        assert!((decode_tps - 22.01).abs() < 0.01);
-    }
-
-    #[test]
-    fn average_tokens_rounds_across_runs() {
-        assert_eq!(average_tokens(385, 3), 128);
     }
 }
