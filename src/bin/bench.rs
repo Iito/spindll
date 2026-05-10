@@ -2,6 +2,7 @@
 //! without Python client overhead.
 //!
 //! Build:  cargo build --release --bin bench --features cli
+//! Note:   the spindll binary needs `--features cli,http` (+ `mlx` on Apple Silicon)
 //!
 //! Standalone:
 //!   ./target/release/bench --model mlx-community/Llama-3.2-1B-Instruct-4bit --runs 5
@@ -375,6 +376,9 @@ async fn bench_grpc(
 // ── Stats + table ─────────────────────────────────────────────────────────────
 
 fn stats(values: &[f64]) -> (f64, f64, f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
     let mut v = values.to_vec();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = v.len();

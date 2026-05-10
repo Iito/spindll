@@ -5,10 +5,11 @@ native Rust benchmark client (`src/bin/bench.rs`).
 
 ## Quick start
 
-### 1. Build the Rust benchmark client
+### 1. Build binaries
 
 ```bash
 cargo build --release --bin bench --features cli
+cargo build --release --bin spindll --features cli,http      # + mlx on Apple Silicon
 ```
 
 ### 2. Install dependencies

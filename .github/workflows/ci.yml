@@ -6,6 +6,7 @@ on:
     paths:
       - "src/**"
       - "proto/**"
+      - "bench/**"
       - "build.rs"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -44,7 +45,7 @@ jobs:
           key: ${{ matrix.os }}
 
       - name: Run tests
-        run: cargo test --features cli,http
+        run: cargo test --features cli,http,bench
 
   clippy:
     runs-on: ubuntu-latest
