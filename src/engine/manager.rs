@@ -1148,8 +1148,12 @@ mod tests {
 
         // Push last_activity into the past so the idle check passes
         *mgr.last_activity.write().unwrap() = Instant::now() - Duration::from_millis(200);
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
+        // Poll until the idle watcher reloads "a" (generous timeout for slow CI)
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !mgr.is_loaded("a") && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(mgr.is_loaded("a"), "model should be reloaded by idle watcher");
     }
 
