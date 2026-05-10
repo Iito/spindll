@@ -16,6 +16,7 @@
 #
 # Prerequisites:
 #   cargo build --release --bin bench --features cli
+#   cargo build --release --bin spindll --features cli,http  (+ mlx on Apple Silicon)
 #   brew install jq
 
 set -euo pipefail
@@ -291,6 +292,10 @@ ensure_bench() {
         info "building bench binary ..."
         (cd "$ROOT" && cargo build --release --bin bench --features cli)
     fi
+}
+
+ensure_spindll() {
+    [[ -x "$SPINDLL_BIN" ]] || die "spindll not found: $SPINDLL_BIN (build with: cargo build --release --bin spindll --features cli,http  — add mlx on Apple Silicon)"
 }
 
 run_bench() {
@@ -744,6 +749,7 @@ main() {
 
     WORK="$(mktemp -d)"
     ensure_bench
+    ensure_spindll
 
     echo
     echo "  model:    $MODEL"

@@ -820,4 +820,19 @@ mod tests {
     fn manager_memory_budget_uses_detected_cap_for_explicit_size() {
         assert_eq!(manager_memory_budget(Some("8G"), 123), 123);
     }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn decode_tok_per_sec_excludes_first_token() {
+        let tps = super::decode_tok_per_sec(128, 50.0, 5050.0);
+        assert!((tps - 25.4).abs() < 0.1); // 127 tokens / 5.0s
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn decode_tok_per_sec_edge_cases() {
+        assert_eq!(super::decode_tok_per_sec(0, 10.0, 100.0), 0.0);
+        assert_eq!(super::decode_tok_per_sec(1, 10.0, 100.0), 0.0);
+        assert_eq!(super::decode_tok_per_sec(10, 100.0, 50.0), 0.0);
+    }
 }
