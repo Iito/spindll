@@ -8,8 +8,7 @@
 # Modes:
 #   compare        mlx-engine (lm-studio) vs spindll HTTP + gRPC  [default]
 #   spindll        spindll HTTP + gRPC only
-#
-# For before/after comparisons between two spindll builds, see internal_bench.sh.
+#   before-after   compare two spindll builds (merge gate)
 #
 # Examples:
 #   bench/run.sh --model mlx-community/Llama-3.2-3B-Instruct-4bit
