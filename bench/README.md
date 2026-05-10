@@ -44,6 +44,55 @@ bench/run.sh \
 
 Requires the `lms` CLI (installed with LM Studio).
 
+### Before / after (merge gate)
+
+Compare two spindll builds to detect regressions. Exits with code 1 if
+tok/s drops beyond the threshold (default 5%).
+
+```bash
+# Compare next branch vs current branch (builds both from git refs)
+bench/run.sh \
+    --model "mlx-community/Llama-3.2-1B-Instruct-4bit" \
+    --mode before-after \
+    --base-ref next \
+    --head-ref HEAD
+
+# Compare two pre-built binaries
+bench/run.sh \
+    --model "mlx-community/Llama-3.2-1B-Instruct-4bit" \
+    --mode before-after \
+    --base-bin ./spindll-old \
+    --head-bin ./spindll-new
+
+# Tighter threshold, gRPC protocol
+bench/run.sh \
+    --model "mlx-community/Llama-3.2-1B-Instruct-4bit" \
+    --mode before-after \
+    --base-ref next \
+    --protocol grpc \
+    --threshold 3
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--base-ref REF` | — | Git ref for baseline (branch, tag, SHA) |
+| `--head-ref REF` | — | Git ref for candidate (default: current release build) |
+| `--base-bin PATH` | — | Pre-built baseline binary (overrides `--base-ref`) |
+| `--head-bin PATH` | — | Pre-built candidate binary (overrides `--head-ref`) |
+| `--protocol PROTO` | http | `http` or `grpc` |
+| `--threshold N` | 5 | tok/s regression % that triggers exit 1 |
+
+### In-process bench (`spindll bench`)
+
+Compare any two models directly without a running server — GGUF vs GGUF,
+MLX vs MLX, or mixed. Requires the `bench` feature:
+
+```bash
+cargo build --release --features cli,bench
+./target/release/spindll bench MODEL_A MODEL_B --runs 5
+./target/release/spindll bench MODEL_A --json
+```
+
 ---
 
 ## Workload options

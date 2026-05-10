@@ -48,6 +48,14 @@ SPIN_PORT=50051
 
 SPINDLL_BIN="$ROOT/target/release/spindll"
 
+# before-after mode
+BASE_REF=""
+HEAD_REF=""
+BASE_BIN=""
+HEAD_BIN=""
+PROTOCOL=http           # http or grpc (before-after only)
+REGRESSION_THRESHOLD=5  # % tok/s drop that triggers exit 1
+
 OUTPUT=""
 PROMPTS=""
 
@@ -419,6 +427,111 @@ mode_spindll() {
     write_text_file "$WORK/spin.json" "${out%.md}"
 }
 
+# ── Before/after mode ─────────────────────────────────────────────────────────
+
+build_ref() {
+    local ref="$1" label="$2" out_dir="$3"
+    info "building $label ($ref) ..."
+    local worktree="$WORK/wt-$label"
+    git worktree add -q "$worktree" "$ref"
+    (cd "$worktree" && cargo build --release --bin spindll --features cli 2>"$WORK/build-$label.log") \
+        || die "build failed for $ref (see $WORK/build-$label.log)"
+    cp "$worktree/target/release/spindll" "$out_dir/spindll-$label"
+    git worktree remove -f "$worktree" 2>/dev/null || true
+    info "built $out_dir/spindll-$label"
+}
+
+bench_one_binary() {
+    local bin="$1" label="$2" phase="$3"
+    info "benchmarking $label via $phase ..."
+    start_spindll "$bin"
+    run_bench "$phase" > "$WORK/$label.json"
+    stop_spindll
+}
+
+mode_before_after() {
+    local bin_base="" bin_head=""
+    local phase="spin-$PROTOCOL"
+
+    # Resolve binaries: explicit paths take priority over git refs
+    if [[ -n "$BASE_BIN" ]]; then
+        [[ -x "$BASE_BIN" ]] || die "base binary not found: $BASE_BIN"
+        bin_base="$BASE_BIN"
+    elif [[ -n "$BASE_REF" ]]; then
+        mkdir -p "$WORK/bins"
+        build_ref "$BASE_REF" "base" "$WORK/bins"
+        bin_base="$WORK/bins/spindll-base"
+    else
+        die "before-after mode requires --base-ref or --base-bin"
+    fi
+
+    if [[ -n "$HEAD_BIN" ]]; then
+        [[ -x "$HEAD_BIN" ]] || die "head binary not found: $HEAD_BIN"
+        bin_head="$HEAD_BIN"
+    elif [[ -n "$HEAD_REF" ]]; then
+        mkdir -p "$WORK/bins"
+        build_ref "$HEAD_REF" "head" "$WORK/bins"
+        bin_head="$WORK/bins/spindll-head"
+    else
+        # Default: use the already-built release binary
+        bin_head="$SPINDLL_BIN"
+        [[ -x "$bin_head" ]] || die "head binary not found: $bin_head (build with cargo build --release)"
+    fi
+
+    sep
+    info "Phase 1/2 -- base"
+    bench_one_binary "$bin_base" "base" "$phase"
+    cooldown
+
+    sep
+    info "Phase 2/2 -- head"
+    bench_one_binary "$bin_head" "head" "$phase"
+
+    # Rename engine labels to base/head for the report
+    jq --arg bl "base ($phase)" '.engines[0].engine = $bl' "$WORK/base.json" > "$WORK/base-labeled.json"
+    jq --arg hl "head ($phase)" '.engines[0].engine = $hl' "$WORK/head.json" > "$WORK/head-labeled.json"
+    jq -s '{engines: [.[].engines[]]}' \
+        "$WORK/base-labeled.json" "$WORK/head-labeled.json" > "$WORK/merged.json"
+
+    local base_label="base ($phase)"
+    local head_label="head ($phase)"
+    local pairs
+    pairs="$(printf '[["head (%s)","base (%s)"]]' "$phase" "$phase")"
+
+    local extra=""
+    [[ -n "$BASE_REF" ]] && extra="**Base:** \`$BASE_REF\`  "
+    [[ -n "$HEAD_REF" ]] && extra="${extra}**Head:** \`$HEAD_REF\`  "
+    [[ -n "$BASE_BIN" ]] && extra="**Base bin:** \`$BASE_BIN\`  "
+    [[ -n "$HEAD_BIN" ]] && extra="${extra}**Head bin:** \`$HEAD_BIN\`  "
+
+    local out="${OUTPUT:-$RESULTS_DIR/$(date +%Y-%m-%d)_before-after_$(slug "$MODEL").md}"
+    generate_report "$WORK/merged.json" "$out" "Before / After Benchmark" "$pairs" "$extra"
+    write_text_file "$WORK/merged.json" "${out%.md}"
+
+    # Regression check
+    local tps_base tps_head delta
+    tps_base="$(jq '[.engines[0].runs[].tok_per_sec] | add / length' "$WORK/merged.json")"
+    tps_head="$(jq '[.engines[1].runs[].tok_per_sec] | add / length' "$WORK/merged.json")"
+    delta="$(echo "$tps_head $tps_base" | awk '{if($2>0) printf "%.1f", ($1-$2)/$2*100; else print "0"}')"
+
+    echo
+    sep
+    info "base tok/s mean: $tps_base"
+    info "head tok/s mean: $tps_head"
+    info "delta: ${delta}%"
+
+    # Check for regression beyond threshold
+    local regressed
+    regressed="$(echo "$delta $REGRESSION_THRESHOLD" | awk '{print ($1 < -$2) ? "yes" : "no"}')"
+    if [[ "$regressed" == "yes" ]]; then
+        echo
+        info "REGRESSION: tok/s dropped ${delta}% (threshold: -${REGRESSION_THRESHOLD}%)"
+        exit 1
+    else
+        info "PASS: no regression detected"
+    fi
+}
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 usage() {
@@ -428,11 +541,18 @@ Usage: bench/run.sh --model MODEL [options]
 Modes:
   --mode compare        mlx-engine vs spindll (default)
   --mode spindll        spindll HTTP + gRPC only
-
-For before/after comparisons, use bench/internal_bench.sh instead.
+  --mode before-after   compare two spindll builds (merge gate)
 
 Required:
   --model MODEL         model name sent to all engines
+
+Before/after options (--mode before-after):
+  --base-ref REF        git ref for baseline (e.g. next, main, commit SHA)
+  --head-ref REF        git ref for candidate (default: current release build)
+  --base-bin PATH       pre-built baseline binary (skips build, overrides --base-ref)
+  --head-bin PATH       pre-built candidate binary (skips build, overrides --head-ref)
+  --protocol PROTO      http or grpc (default: http)
+  --threshold N         tok/s regression % that triggers exit 1 (default: 5)
 
 Engine:
   --spindll-bin PATH    spindll binary (default: target/release/spindll)
@@ -456,6 +576,16 @@ Workload:
 
 Output:
   --output PATH         markdown output path (default: bench/results/...)
+
+Examples:
+  # Compare next branch vs current branch (builds both)
+  bench/run.sh --model MODEL --mode before-after --base-ref next --head-ref HEAD
+
+  # Compare two pre-built binaries
+  bench/run.sh --model MODEL --mode before-after --base-bin ./old --head-bin ./new
+
+  # Use as merge gate with 3% threshold
+  bench/run.sh --model MODEL --mode before-after --base-ref next --threshold 3
 EOF
     exit 0
 }
@@ -481,6 +611,12 @@ parse_args() {
             --http-port)   HTTP_PORT="$2";   shift 2;;
             --spin-port)   SPIN_PORT="$2";   shift 2;;
             --spindll-bin) SPINDLL_BIN="$2"; shift 2;;
+            --base-ref)    BASE_REF="$2";    shift 2;;
+            --head-ref)    HEAD_REF="$2";    shift 2;;
+            --base-bin)    BASE_BIN="$2";    shift 2;;
+            --head-bin)    HEAD_BIN="$2";    shift 2;;
+            --protocol)    PROTOCOL="$2";    shift 2;;
+            --threshold)   REGRESSION_THRESHOLD="$2"; shift 2;;
             --output)      OUTPUT="$2";      shift 2;;
             -h|--help)     usage;;
             *)             die "unknown option: $1";;
@@ -511,7 +647,8 @@ main() {
     case "$MODE" in
         compare)      mode_compare;;
         spindll)      mode_spindll;;
-        *)            die "unknown mode: $MODE (use compare or spindll)";;
+        before-after) mode_before_after;;
+        *)            die "unknown mode: $MODE (use compare, spindll, or before-after)";;
     esac
 }
 
