@@ -59,7 +59,7 @@ fn split_shard_stem(filename: &str) -> Option<&str> {
 /// fall between the priority list and full-precision; fp16/bf16/f32 sort
 /// last so we don't accidentally pull a 6 GB research weight when a 2 GB
 /// inference quant exists alongside it.
-fn rank_quant(filename: &str) -> usize {
+pub(crate) fn rank_quant(filename: &str) -> usize {
     let lower = filename.to_lowercase();
     for (i, q) in QUANT_PRIORITY.iter().enumerate() {
         if lower.contains(q) {

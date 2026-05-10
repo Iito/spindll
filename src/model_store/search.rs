@@ -32,6 +32,27 @@ struct HfModel {
     id: String,
     #[serde(default)]
     downloads: u64,
+    #[serde(default)]
+    safetensors: Option<SafetensorsInfo>,
+}
+
+#[derive(Deserialize)]
+struct SafetensorsInfo {
+    #[serde(default)]
+    total: u64,
+}
+
+#[derive(Deserialize)]
+struct HfRepoSibling {
+    rfilename: String,
+    #[serde(default)]
+    size: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct HfRepoInfo {
+    #[serde(default)]
+    siblings: Vec<HfRepoSibling>,
 }
 
 pub fn search_models(query: &str, limit: usize) -> anyhow::Result<Vec<SearchResult>> {
@@ -54,6 +75,8 @@ pub fn search_models(query: &str, limit: usize) -> anyhow::Result<Vec<SearchResu
         Ok(None) => {}
         Err(e) => tracing::warn!("Ollama probe failed: {e:#}"),
     }
+
+    backfill_sizes(&client, &mut results);
 
     let prefers_mlx = super::platform_prefers_mlx();
     let mem = crate::scheduler::budget::MemoryBudget::detect(None);
@@ -95,7 +118,7 @@ fn search_hf_gguf(
             if m.id.starts_with("mlx-community/") || !seen.insert(m.id.clone()) {
                 continue;
             }
-            let estimated = estimate_model_bytes(&m.id, &ModelFormat::Gguf);
+            let estimated = estimate_from_api(&m, &ModelFormat::Gguf);
             results.push(SearchResult {
                 name: m.id,
                 source: SearchSource::HuggingFace,
@@ -126,7 +149,7 @@ fn search_hf_mlx(
     Ok(models
         .into_iter()
         .map(|m| {
-            let estimated = estimate_model_bytes(&m.id, &ModelFormat::Mlx);
+            let estimated = estimate_from_api(&m, &ModelFormat::Mlx);
             SearchResult {
                 name: m.id,
                 source: SearchSource::HuggingFace,
@@ -182,6 +205,88 @@ fn detect_vram_nvidia() -> Option<u64> {
     let first_line = stdout.lines().next()?.trim();
     let mib: u64 = first_line.parse().ok()?;
     Some(mib * 1_048_576)
+}
+
+fn estimate_from_api(m: &HfModel, format: &ModelFormat) -> Option<u64> {
+    if let Some(ref st) = m.safetensors {
+        if st.total > 0 {
+            let params_b = st.total as f64 / 1e9;
+            let bpp = match format {
+                ModelFormat::Gguf => 0.55,
+                ModelFormat::Mlx => {
+                    let lower = m.id.to_lowercase();
+                    if lower.contains("8bit") || lower.contains("8-bit") {
+                        1.1
+                    } else if lower.contains("bf16") || lower.contains("fp16") {
+                        2.0
+                    } else {
+                        0.55
+                    }
+                }
+            };
+            return Some((params_b * bpp * 1e9) as u64);
+        }
+    }
+    estimate_model_bytes(&m.id, format)
+}
+
+fn backfill_sizes(client: &reqwest::blocking::Client, results: &mut [SearchResult]) {
+    for r in results.iter_mut() {
+        if r.estimated_bytes.is_some() || r.source != SearchSource::HuggingFace {
+            continue;
+        }
+        if let Some(size) = fetch_repo_size(client, &r.name, &r.format) {
+            r.estimated_bytes = Some(size);
+        }
+    }
+}
+
+fn fetch_repo_size(
+    client: &reqwest::blocking::Client,
+    repo_id: &str,
+    format: &ModelFormat,
+) -> Option<u64> {
+    let url = format!("https://huggingface.co/api/models/{repo_id}?blobs=true");
+    let resp = client.get(&url).send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let info: HfRepoInfo = resp.json().ok()?;
+
+    match format {
+        ModelFormat::Gguf => {
+            let mut groups: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            for s in &info.siblings {
+                if !s.rfilename.ends_with(".gguf") {
+                    continue;
+                }
+                let key = match s.rfilename.find('/') {
+                    Some(i) => s.rfilename[..i].to_string(),
+                    None => s.rfilename.clone(),
+                };
+                *groups.entry(key).or_default() += s.size.unwrap_or(0);
+            }
+            let (_key, total) = groups
+                .iter()
+                .filter(|(_, sz)| **sz > 0)
+                .min_by_key(|(k, _)| crate::model_store::download::rank_quant(k))?;
+            Some(*total)
+        }
+        ModelFormat::Mlx => {
+            let total: u64 = info
+                .siblings
+                .iter()
+                .filter(|s| {
+                    s.rfilename.ends_with(".safetensors")
+                        || s.rfilename.ends_with(".json")
+                        || s.rfilename.ends_with(".model")
+                })
+                .filter_map(|s| s.size)
+                .sum();
+            if total > 0 { Some(total) } else { None }
+        }
+    }
 }
 
 fn rank_results(results: &mut Vec<SearchResult>, prefers_mlx: bool, available_mem: u64) {
