@@ -154,7 +154,7 @@ jobs:
               echo "Capturing notes from previous RC: $OLD_TAG"
               PREV_BODY=$(gh release view "$OLD_TAG" --json body --jq '.body')
               echo "Deleting previous RC release: $OLD_TAG"
-              gh release delete "$OLD_TAG" --yes --cleanup-tag
+              gh release delete "$OLD_TAG" --yes
             fi
           done
           echo "$PREV_BODY" > /tmp/prev_rc_body.md
