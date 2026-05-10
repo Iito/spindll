@@ -627,18 +627,21 @@ async fn main() -> anyhow::Result<()> {
                 sort: sort_order,
             };
 
+            let mem = spindll::scheduler::budget::MemoryBudget::detect(None);
+            let inference_mem = search::detect_inference_memory(mem.total_ram);
+
             let spinner = indicatif::ProgressBar::new_spinner();
             spinner.set_message(format!("Searching for \"{query}\"..."));
             spinner.enable_steady_tick(std::time::Duration::from_millis(80));
 
             let q = query.clone();
-            let (results, inference_mem) = tokio::task::spawn_blocking(move || {
-                search::search_models(&q, &opts)
+            let results = tokio::task::spawn_blocking(move || {
+                search::search_models(&q, &opts, inference_mem)
             })
             .await??;
 
             spinner.finish_and_clear();
-            println!("Searching for \"{query}\"...\n");
+            println!();
 
             if results.is_empty() {
                 println!("  No models found.");
@@ -697,7 +700,6 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 "gguf"
             };
-            let mem = spindll::scheduler::budget::MemoryBudget::detect(None);
             let mem_label = if inference_mem < mem.total_ram {
                 format!("VRAM: ~{}", search::format_size(inference_mem))
             } else {
