@@ -321,22 +321,22 @@ pub fn generate_streaming_cached(
     let mut n_cur = tokens.len() as i32;
     let mut completion_tokens = 0u32;
 
-    let first_logit_idx;
+    let mut batch = LlamaBatch::new(tokens.len().max(512), 1);
 
-    if cache_hit {
-        // State restore only saves KV cache, not logits. Clear last pos and
-        // re-decode to regenerate logits without shifting the context.
-        let last_pos = (n_cur - 1) as u32;
-        let _ = ctx.clear_kv_cache_seq(Some(0), Some(last_pos), Some(last_pos + 1));
-        let mut batch = LlamaBatch::new(1, 1);
+    // On cache miss, encode_prompt already decoded the full prompt batch and
+    // logits sit at index tokens.len()-1.  On cache hit, restored state has
+    // no logits so we re-eval the last prompt token in a fresh batch.
+    let mut logit_idx = if cache_hit {
+        let last_pos = (tokens.len() - 1) as u32;
+        ctx.clear_kv_cache_seq(Some(0), Some(last_pos), Some(last_pos + 1))
+            .map_err(|e| anyhow::anyhow!("failed to clear last KV position: {e}"))?;
         batch.add(tokens[tokens.len() - 1], n_cur - 1, &[0], true)?;
         ctx.decode(&mut batch)?;
-        first_logit_idx = 0;
+        0
     } else {
-        first_logit_idx = tokens.len() as i32 - 1;
-    }
+        tokens.len() as i32 - 1
+    };
 
-    let mut logit_idx = first_logit_idx;
     for _ in 0..params.max_tokens {
         let token = sampler.sample(ctx, logit_idx);
         sampler.accept(token);
@@ -354,11 +354,11 @@ pub fn generate_streaming_cached(
             break;
         }
 
-        let mut batch = LlamaBatch::new(1, 1);
+        batch.clear();
         batch.add(token, n_cur, &[0], true)?;
         ctx.decode(&mut batch)?;
-        n_cur += 1;
         logit_idx = 0;
+        n_cur += 1;
     }
 
     tracing::Span::current().record("completion_tokens", completion_tokens);
