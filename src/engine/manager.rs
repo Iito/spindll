@@ -930,9 +930,8 @@ static MLX_METALLIB_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mlx
 /// Ensure mlx.metallib is available next to the binary where MLX's
 /// `load_colocated_library("mlx")` expects it.
 ///
-/// 1. If a sidecar file already exists next to the binary, use it (custom override).
-/// 2. Otherwise extract the embedded copy to ~/.spindll/mlx.metallib (canonical location),
-///    then place it next to the binary via symlink (preferred) or copy (fallback).
+/// If a sidecar file already exists and matches the embedded size, keep it.
+/// Otherwise extract the embedded copy directly next to the binary.
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 fn ensure_mlx_metallib() -> bool {
     let exe_dir = match std::env::current_exe()
@@ -945,41 +944,26 @@ fn ensure_mlx_metallib() -> bool {
 
     let sidecar = exe_dir.join("mlx.metallib");
     if sidecar.exists() {
-        return true;
+        let up_to_date = sidecar
+            .metadata()
+            .map(|m| m.len() == MLX_METALLIB_BYTES.len() as u64)
+            .unwrap_or(false);
+        if up_to_date {
+            return true;
+        }
     }
     if exe_dir.join("Resources/mlx.metallib").exists() {
         return true;
     }
 
-    // Ensure canonical copy exists in ~/.spindll/.
-    let home = match std::env::var("HOME") {
-        Ok(h) => std::path::PathBuf::from(h),
-        Err(_) => return false,
-    };
-    let cache_dir = home.join(".spindll");
-    let canonical = cache_dir.join("mlx.metallib");
-
-    if !canonical.exists() {
-        if std::fs::create_dir_all(&cache_dir).is_err() {
-            return false;
+    // Extract embedded copy next to binary.
+    match std::fs::write(&sidecar, MLX_METALLIB_BYTES) {
+        Ok(_) => {
+            tracing::info!("extracted mlx.metallib → {}", sidecar.display());
+            true
         }
-        if let Err(e) = std::fs::write(&canonical, MLX_METALLIB_BYTES) {
-            tracing::warn!(error = %e, "failed to extract embedded mlx.metallib");
-            return false;
-        }
-        tracing::info!("extracted mlx.metallib → {}", canonical.display());
-    }
-
-    // Place it next to the binary so MLX's Metal loader finds it.
-    #[cfg(unix)]
-    if std::os::unix::fs::symlink(&canonical, &sidecar).is_ok() {
-        return true;
-    }
-    // Symlink failed (read-only dir, permissions) — fall back to copy.
-    match std::fs::copy(&canonical, &sidecar) {
-        Ok(_) => true,
         Err(e) => {
-            tracing::warn!(error = %e, "cannot place mlx.metallib next to binary");
+            tracing::warn!(error = %e, "cannot write mlx.metallib next to binary");
             false
         }
     }
