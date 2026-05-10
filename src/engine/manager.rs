@@ -16,6 +16,7 @@ use crate::model_store::registry::ModelFormat;
 
 use super::batch::{BatchEvent, BatchRequest, BatchScheduler};
 use super::kv_cache::KvCache;
+use super::kv_ram_cache::KvRamCache;
 use super::metrics::Metrics;
 use super::ram_cache::RamCache;
 use super::streaming::{GenerateParams, GenerateResult, generate_streaming_cached};
@@ -99,6 +100,7 @@ pub struct ModelManager {
     default_gpu_layers: u32,
     memory_budget: u64,
     kv_cache: Option<KvCache>,
+    kv_ram_cache: Option<KvRamCache>,
     ram_cache: Option<RamCache>,
     metrics: Arc<Metrics>,
     batch_slots: usize,
@@ -187,6 +189,7 @@ impl ModelManager {
             default_gpu_layers,
             memory_budget,
             kv_cache: None,
+            kv_ram_cache: None,
             ram_cache: None,
             metrics: Arc::new(Metrics::new()),
             batch_slots: 0,
@@ -206,6 +209,7 @@ impl ModelManager {
             default_gpu_layers: 0,
             memory_budget,
             kv_cache: None,
+            kv_ram_cache: None,
             ram_cache: None,
             metrics: Arc::new(Metrics::new()),
             batch_slots: 0,
@@ -539,6 +543,16 @@ impl ModelManager {
         self.kv_cache = Some(KvCache::new(max_bytes));
     }
 
+    /// Enable the in-memory KV state cache with the given max size in bytes.
+    pub fn enable_kv_ram_cache(&mut self, max_bytes: u64) {
+        self.kv_ram_cache = Some(KvRamCache::new(max_bytes));
+    }
+
+    /// Returns a reference to the KV RAM cache, if enabled.
+    pub fn kv_ram_cache(&self) -> Option<&KvRamCache> {
+        self.kv_ram_cache.as_ref()
+    }
+
     /// Enable the KV cache with a custom directory.
     pub fn enable_kv_cache_with_dir(&mut self, dir: std::path::PathBuf, max_bytes: u64) {
         self.kv_cache = Some(KvCache::with_dir(dir, max_bytes));
@@ -713,6 +727,7 @@ impl ModelManager {
                     model_name,
                     &loaded.digest,
                     cache,
+                    self.kv_ram_cache.as_ref(),
                     encryption_key,
                     on_token,
                 );
@@ -821,6 +836,7 @@ impl ModelManager {
                     model_name,
                     &loaded.digest,
                     cache,
+                    self.kv_ram_cache.as_ref(),
                     encryption_key,
                     on_token,
                 );

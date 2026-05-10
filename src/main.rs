@@ -59,6 +59,10 @@ enum Commands {
         #[arg(long)]
         kv_cache: Option<Option<String>>,
 
+        /// In-memory KV state cache (e.g. "512M", default 512M when enabled)
+        #[arg(long)]
+        kv_ram_cache: Option<Option<String>>,
+
         /// Concurrent sequence slots per model for batch scheduling (0 = disabled)
         #[arg(long, default_value = "0")]
         batch_slots: usize,
@@ -403,6 +407,7 @@ async fn main() -> anyhow::Result<()> {
             gpu_layers,
             budget,
             kv_cache,
+            kv_ram_cache,
             batch_slots,
             ram_cache,
             http_port,
@@ -422,6 +427,18 @@ async fn main() -> anyhow::Result<()> {
                 let bytes = parse_size_bytes(cache_size.as_deref());
                 manager.enable_kv_cache(bytes);
                 println!("kv cache: {:.1} GB max", bytes as f64 / 1_073_741_824.0);
+            }
+
+            if let Some(cache_size) = kv_ram_cache {
+                let bytes = match cache_size.as_deref() {
+                    Some(s) => parse_size_bytes(Some(s)),
+                    None => 512 * 1_048_576, // 512 MB default
+                };
+                manager.enable_kv_ram_cache(bytes);
+                println!(
+                    "kv ram cache: {:.0} MB max",
+                    bytes as f64 / 1_048_576.0
+                );
             }
 
             if let Some(cache_size) = ram_cache {
