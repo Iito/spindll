@@ -2,6 +2,15 @@ use serde::Deserialize;
 
 use super::registry::ModelFormat;
 
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum SortOrder {
+    #[default]
+    Default,
+    Downloads,
+    Size,
+    Name,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SearchSource {
     HuggingFace,
@@ -55,25 +64,37 @@ struct HfRepoInfo {
     siblings: Vec<HfRepoSibling>,
 }
 
-pub fn search_models(query: &str, limit: usize) -> anyhow::Result<Vec<SearchResult>> {
+pub struct SearchOptions {
+    pub limit: usize,
+    pub format_filter: Option<ModelFormat>,
+    pub sort: SortOrder,
+}
+
+pub fn search_models(query: &str, opts: &SearchOptions) -> anyhow::Result<(Vec<SearchResult>, u64)> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
     let mut results = Vec::new();
 
-    match search_hf_gguf(&client, query) {
-        Ok(gguf) => results.extend(gguf),
-        Err(e) => tracing::warn!("HuggingFace GGUF search failed: {e:#}"),
+    if opts.format_filter != Some(ModelFormat::Mlx) {
+        match search_hf_gguf(&client, query) {
+            Ok(gguf) => results.extend(gguf),
+            Err(e) => tracing::warn!("HuggingFace GGUF search failed: {e:#}"),
+        }
     }
-    match search_hf_mlx(&client, query) {
-        Ok(mlx) => results.extend(mlx),
-        Err(e) => tracing::warn!("HuggingFace MLX search failed: {e:#}"),
+    if opts.format_filter != Some(ModelFormat::Gguf) {
+        match search_hf_mlx(&client, query) {
+            Ok(mlx) => results.extend(mlx),
+            Err(e) => tracing::warn!("HuggingFace MLX search failed: {e:#}"),
+        }
     }
-    match probe_ollama(&client, query) {
-        Ok(Some(ollama)) => results.push(ollama),
-        Ok(None) => {}
-        Err(e) => tracing::warn!("Ollama probe failed: {e:#}"),
+    if opts.format_filter != Some(ModelFormat::Mlx) {
+        match probe_ollama(&client, query) {
+            Ok(Some(ollama)) => results.push(ollama),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("Ollama probe failed: {e:#}"),
+        }
     }
 
     backfill_sizes(&client, &mut results);
@@ -81,10 +102,16 @@ pub fn search_models(query: &str, limit: usize) -> anyhow::Result<Vec<SearchResu
     let prefers_mlx = super::platform_prefers_mlx();
     let mem = crate::scheduler::budget::MemoryBudget::detect(None);
     let inference_mem = detect_inference_memory(mem.total_ram);
-    rank_results(&mut results, prefers_mlx, inference_mem);
 
-    results.truncate(limit);
-    Ok(results)
+    match opts.sort {
+        SortOrder::Default => rank_results(&mut results, prefers_mlx, inference_mem),
+        SortOrder::Downloads => results.sort_by(|a, b| b.downloads.cmp(&a.downloads)),
+        SortOrder::Size => results.sort_by(|a, b| a.estimated_bytes.cmp(&b.estimated_bytes)),
+        SortOrder::Name => results.sort_by(|a, b| a.name.cmp(&b.name)),
+    }
+
+    results.truncate(opts.limit);
+    Ok((results, inference_mem))
 }
 
 fn search_hf_gguf(
@@ -211,19 +238,7 @@ fn estimate_from_api(m: &HfModel, format: &ModelFormat) -> Option<u64> {
     if let Some(ref st) = m.safetensors {
         if st.total > 0 {
             let params_b = st.total as f64 / 1e9;
-            let bpp = match format {
-                ModelFormat::Gguf => DEFAULT_BPP_QUANTIZED,
-                ModelFormat::Mlx => {
-                    let lower = m.id.to_lowercase();
-                    if lower.contains("8bit") || lower.contains("8-bit") {
-                        1.1
-                    } else if lower.contains("bf16") || lower.contains("fp16") {
-                        2.0
-                    } else {
-                        DEFAULT_BPP_QUANTIZED
-                    }
-                }
-            };
+            let bpp = bpp_for_name(&m.id, format);
             return Some((params_b * bpp * 1e9) as u64);
         }
     }
@@ -291,6 +306,19 @@ fn fetch_repo_size(
 
 const DEFAULT_BPP_QUANTIZED: f64 = 0.55;
 
+fn quant_to_bpp(name: &str) -> f64 {
+    match super::download::extract_quant(name) {
+        Some("q2_k") => 0.31,
+        Some("q3_k_m") | Some("q3_k_s") => 0.44,
+        Some("q4_k_m") | Some("q4_k_s") | Some("q4_0") => DEFAULT_BPP_QUANTIZED,
+        Some("q5_k_m") | Some("q5_k_s") | Some("q5_0") => 0.68,
+        Some("q8_0") => 1.06,
+        Some("fp16") | Some("bf16") => 2.0,
+        Some("f32") => 4.0,
+        _ => DEFAULT_BPP_QUANTIZED,
+    }
+}
+
 fn rank_results(results: &mut [SearchResult], prefers_mlx: bool, available_mem: u64) {
     results.sort_by(|a, b| {
         let a_preferred = matches!(a.format, ModelFormat::Mlx) == prefers_mlx;
@@ -306,10 +334,9 @@ fn rank_results(results: &mut [SearchResult], prefers_mlx: bool, available_mem: 
     });
 }
 
-fn estimate_model_bytes(name: &str, format: &ModelFormat) -> Option<u64> {
-    let params = extract_param_billions(name)?;
-    let bytes_per_param = match format {
-        ModelFormat::Gguf => DEFAULT_BPP_QUANTIZED,
+fn bpp_for_name(name: &str, format: &ModelFormat) -> f64 {
+    match format {
+        ModelFormat::Gguf => quant_to_bpp(name),
         ModelFormat::Mlx => {
             let lower = name.to_lowercase();
             if lower.contains("8bit") || lower.contains("8-bit") {
@@ -320,8 +347,12 @@ fn estimate_model_bytes(name: &str, format: &ModelFormat) -> Option<u64> {
                 DEFAULT_BPP_QUANTIZED
             }
         }
-    };
-    Some((params * bytes_per_param * 1e9) as u64)
+    }
+}
+
+fn estimate_model_bytes(name: &str, format: &ModelFormat) -> Option<u64> {
+    let params = extract_param_billions(name)?;
+    Some((params * bpp_for_name(name, format) * 1e9) as u64)
 }
 
 fn extract_param_billions(name: &str) -> Option<f64> {
@@ -409,6 +440,20 @@ mod tests {
     }
 
     #[test]
+    fn estimate_gguf_7b_q8_0() {
+        let est = estimate_model_bytes("Model-7B-Q8_0-GGUF", &ModelFormat::Gguf).unwrap();
+        let gb = est as f64 / 1_073_741_824.0;
+        assert!(gb > 6.0 && gb < 8.0, "got {gb:.1} GB");
+    }
+
+    #[test]
+    fn estimate_gguf_7b_q2_k() {
+        let est = estimate_model_bytes("Model-7B-Q2_K-GGUF", &ModelFormat::Gguf).unwrap();
+        let gb = est as f64 / 1_073_741_824.0;
+        assert!(gb > 1.5 && gb < 3.0, "got {gb:.1} GB");
+    }
+
+    #[test]
     fn estimate_mlx_4bit() {
         let est = estimate_model_bytes("Model-7B-Instruct-4bit", &ModelFormat::Mlx).unwrap();
         let gb = est as f64 / 1_073_741_824.0;
@@ -449,9 +494,6 @@ mod tests {
 
     #[test]
     fn rank_by_vram_on_dedicated_gpu() {
-        // Simulate a machine with 64 GB system RAM but only 8 GB VRAM.
-        // A 12 GB model won't fit in VRAM, so a smaller 4 GB model with
-        // fewer downloads should rank higher.
         let vram: u64 = 8_000_000_000;
         let mut results = vec![
             SearchResult {
@@ -470,10 +512,7 @@ mod tests {
             },
         ];
         rank_results(&mut results, false, vram);
-        assert_eq!(
-            results[0].name, "Niche-7B-GGUF",
-            "model that fits in VRAM should rank above one that doesn't, regardless of downloads",
-        );
+        assert_eq!(results[0].name, "Niche-7B-GGUF");
     }
 
     #[test]
@@ -496,5 +535,21 @@ mod tests {
         ];
         rank_results(&mut results, true, 8_000_000_000);
         assert_eq!(results[0].name, "small");
+    }
+
+    #[test]
+    fn quant_bpp_ordering() {
+        let q8 = quant_to_bpp("Model-Q8_0");
+        let q4 = quant_to_bpp("Model-Q4_K_M");
+        let q2 = quant_to_bpp("Model-Q2_K");
+        let unknown = quant_to_bpp("Model-GGUF");
+        assert!(q8 > q4 && q4 > q2);
+        assert_eq!(unknown, DEFAULT_BPP_QUANTIZED);
+    }
+
+    #[test]
+    fn bpp_for_name_mlx_variants() {
+        assert!((bpp_for_name("Model-8bit", &ModelFormat::Mlx) - 1.1).abs() < 0.01);
+        assert!((bpp_for_name("Model-fp16", &ModelFormat::Mlx) - 2.0).abs() < 0.01);
     }
 }

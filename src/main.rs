@@ -138,6 +138,14 @@ enum Commands {
         /// Maximum results to show
         #[arg(long, default_value = "20")]
         limit: usize,
+
+        /// Filter by format
+        #[arg(long, value_parser = ["gguf", "mlx"])]
+        format: Option<String>,
+
+        /// Sort order (default: hardware-aware ranking)
+        #[arg(long, value_parser = ["downloads", "size", "name"])]
+        sort: Option<String>,
     },
 
     /// Show server status
@@ -598,17 +606,39 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Search { query, limit } => {
+        Commands::Search { query, limit, format, sort } => {
             use spindll::model_store::search;
             use spindll::model_store::registry::ModelFormat;
 
-            println!("Searching for \"{query}\"...\n");
+            let format_filter = match format.as_deref() {
+                Some("gguf") => Some(ModelFormat::Gguf),
+                Some("mlx") => Some(ModelFormat::Mlx),
+                _ => None,
+            };
+            let sort_order = match sort.as_deref() {
+                Some("downloads") => search::SortOrder::Downloads,
+                Some("size") => search::SortOrder::Size,
+                Some("name") => search::SortOrder::Name,
+                _ => search::SortOrder::Default,
+            };
+            let opts = search::SearchOptions {
+                limit,
+                format_filter,
+                sort: sort_order,
+            };
+
+            let spinner = indicatif::ProgressBar::new_spinner();
+            spinner.set_message(format!("Searching for \"{query}\"..."));
+            spinner.enable_steady_tick(std::time::Duration::from_millis(80));
 
             let q = query.clone();
-            let results = tokio::task::spawn_blocking(move || {
-                search::search_models(&q, limit)
+            let (results, inference_mem) = tokio::task::spawn_blocking(move || {
+                search::search_models(&q, &opts)
             })
             .await??;
+
+            spinner.finish_and_clear();
+            println!("Searching for \"{query}\"...\n");
 
             if results.is_empty() {
                 println!("  No models found.");
@@ -625,16 +655,21 @@ async fn main() -> anyhow::Result<()> {
                 .min(max_name);
 
             println!(
-                "  {:<nw$}  {:<6}  {:<4}  {:>10}  {:>10}",
-                "MODEL", "SOURCE", "FMT", "EST. SIZE", "DOWNLOADS",
+                "  {:<nw$}  {:<6}  {:<4}  {:>10}  {:<4}  {:>10}",
+                "MODEL", "SOURCE", "FMT", "EST. SIZE", "FITS", "DOWNLOADS",
                 nw = name_w,
             );
-            println!("  {}", "-".repeat(name_w + 38));
+            println!("  {}", "-".repeat(name_w + 44));
 
             for r in &results {
                 let size = match r.estimated_bytes {
                     Some(b) => format!("~{}", search::format_size(b)),
                     None => "-".into(),
+                };
+                let fits = match r.estimated_bytes {
+                    Some(b) if b < inference_mem => " \u{2713}  ",
+                    Some(_) => " \u{2717}  ",
+                    None => " ?  ",
                 };
                 let dl = if r.downloads > 0 {
                     search::format_downloads(r.downloads)
@@ -651,8 +686,8 @@ async fn main() -> anyhow::Result<()> {
                     r.name.clone()
                 };
                 println!(
-                    "  {:<nw$}  {:<6}  {:<4}  {:>10}  {:>10}",
-                    display_name, r.source, fmt, size, dl,
+                    "  {:<nw$}  {:<6}  {:<4}  {:>10} {} {:>10}",
+                    display_name, r.source, fmt, size, fits, dl,
                     nw = name_w,
                 );
             }
@@ -663,7 +698,6 @@ async fn main() -> anyhow::Result<()> {
                 "gguf"
             };
             let mem = spindll::scheduler::budget::MemoryBudget::detect(None);
-            let inference_mem = search::detect_inference_memory(mem.total_ram);
             let mem_label = if inference_mem < mem.total_ram {
                 format!("VRAM: ~{}", search::format_size(inference_mem))
             } else {
