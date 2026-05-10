@@ -388,6 +388,14 @@ struct OaiChatRequest {
     #[serde(default)]
     #[allow(dead_code)]
     tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Deserialize)]
+struct StreamOptions {
+    #[serde(default)]
+    include_usage: bool,
 }
 
 fn default_true() -> bool {
@@ -613,6 +621,7 @@ async fn oai_chat_completions(
     let mgr = state.manager.clone();
     let store = state.store.clone();
     let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+    let include_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
 
     if req.stream {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
@@ -647,7 +656,7 @@ async fn oai_chat_completions(
                 });
 
                 match result {
-                    Ok(_) => {
+                    Ok(ref stats) => {
                         let (tool_calls, remaining) = parse_tool_calls(&output);
                         if !tool_calls.is_empty() {
                             // Send tool calls as a single chunk
@@ -684,6 +693,21 @@ async fn oai_chat_completions(
                             "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]
                         });
                         let _ = tx.blocking_send(Ok(sse_data(&done_chunk)));
+                        if include_usage {
+                            let usage_chunk = serde_json::json!({
+                                "id": &completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": &req.model,
+                                "choices": [],
+                                "usage": {
+                                    "prompt_tokens": stats.prompt_tokens,
+                                    "completion_tokens": stats.completion_tokens,
+                                    "total_tokens": stats.prompt_tokens + stats.completion_tokens,
+                                }
+                            });
+                            let _ = tx.blocking_send(Ok(sse_data(&usage_chunk)));
+                        }
                         let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
                     }
                     Err(e) => {
@@ -708,7 +732,7 @@ async fn oai_chat_completions(
                 });
 
                 match result {
-                    Ok(_) => {
+                    Ok(ref stats) => {
                         let done_chunk = serde_json::json!({
                             "id": &completion_id,
                             "object": "chat.completion.chunk",
@@ -721,6 +745,21 @@ async fn oai_chat_completions(
                             }]
                         });
                         let _ = tx.blocking_send(Ok(sse_data(&done_chunk)));
+                        if include_usage {
+                            let usage_chunk = serde_json::json!({
+                                "id": &completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": &req.model,
+                                "choices": [],
+                                "usage": {
+                                    "prompt_tokens": stats.prompt_tokens,
+                                    "completion_tokens": stats.completion_tokens,
+                                    "total_tokens": stats.prompt_tokens + stats.completion_tokens,
+                                }
+                            });
+                            let _ = tx.blocking_send(Ok(sse_data(&usage_chunk)));
+                        }
                         let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
                     }
                     Err(e) => {
