@@ -274,6 +274,16 @@ stop_spindll() {
     fi
 }
 
+# ── Feature detection ─────────────────────────────────────────────────────────
+
+build_features() {
+    local feats="cli,http"
+    if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
+        feats="$feats,mlx"
+    fi
+    printf '%s' "$feats"
+}
+
 # ── Bench runner ──────────────────────────────────────────────────────────────
 
 ensure_bench() {
@@ -515,11 +525,17 @@ build_ref() {
     local added=false
     git worktree add -q "$worktree" "$ref"
     added=true
-    if ! (cd "$worktree" && cargo build --release --bin spindll --features cli 2>"$WORK/build-$label.log"); then
+    local feats
+    feats="$(build_features)"
+    if ! (cd "$worktree" && cargo build --release --bin spindll --features "$feats" 2>"$WORK/build-$label.log"); then
         $added && git worktree remove -f "$worktree" 2>/dev/null || true
         die "build failed for $ref (see $WORK/build-$label.log)"
     fi
     cp "$worktree/target/release/spindll" "$out_dir/spindll-$label"
+    # Copy the Metal shader library so the MLX backend can find it next to the binary
+    if [[ -f "$worktree/target/release/mlx.metallib" ]]; then
+        cp "$worktree/target/release/mlx.metallib" "$out_dir/"
+    fi
     $added && git worktree remove -f "$worktree" 2>/dev/null || true
     info "built $out_dir/spindll-$label"
 }
