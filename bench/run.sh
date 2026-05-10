@@ -295,7 +295,12 @@ ensure_bench() {
 }
 
 ensure_spindll() {
-    [[ -x "$SPINDLL_BIN" ]] || die "spindll not found: $SPINDLL_BIN (build with: cargo build --release --bin spindll --features cli,http  — add mlx on Apple Silicon)"
+    if [[ ! -x "$SPINDLL_BIN" ]]; then
+        local feats
+        feats="$(build_features)"
+        info "building spindll binary (features: $feats) ..."
+        (cd "$ROOT" && cargo build --release --bin spindll --features "$feats")
+    fi
 }
 
 run_bench() {
@@ -757,6 +762,12 @@ main() {
     echo "  runs:     $RUNS (+ $WARMUP warmup)"
     echo "  cooldown: ${COOLDOWN}s between phases"
     sep
+
+    if [[ "$MODE" == "compare" ]]; then
+        if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
+            die "compare mode requires macOS Apple Silicon (mlx-engine). Use --mode spindll or --mode before-after on this platform."
+        fi
+    fi
 
     case "$MODE" in
         compare)      mode_compare;;
