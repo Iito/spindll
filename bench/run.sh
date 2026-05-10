@@ -66,6 +66,7 @@ GRPC_PORT_EXPLICIT=false
 SPINDLL_PID=""
 LMS_MANAGED=false
 WORK=""
+SPINDLL_MANAGED=true
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -108,6 +109,74 @@ wait_http() {
 
 cooldown() {
     ((COOLDOWN > 0)) && { info "cooldown ${COOLDOWN}s ..."; sleep "$COOLDOWN"; }
+}
+
+port_in_use() {
+    local host="$1" port="$2"
+    command -v lsof >/dev/null || return 1
+    lsof -nP -iTCP@"$host":"$port" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+is_local_host() {
+    [[ "$1" == "localhost" || "$1" == "127.0.0.1" || "$1" == "::1" ]]
+}
+
+next_free_local_port() {
+    local port="$1"
+    while port_in_use localhost "$port"; do
+        port=$((port + 1))
+    done
+    printf '%s\n' "$port"
+}
+
+prepare_spindll_launch() {
+    SPINDLL_MANAGED=true
+
+    local explicit_ports=false
+    if $URL_SPIN_EXPLICIT || $GRPC_PORT_EXPLICIT || [[ "$HTTP_PORT" != "8080" ]] || [[ "$SPIN_PORT" != "50051" ]]; then
+        explicit_ports=true
+    fi
+
+    local http_busy=false
+    local grpc_busy=false
+    if is_local_host localhost; then
+        port_in_use localhost "$HTTP_PORT" && http_busy=true
+    fi
+    if is_local_host "$GRPC_HOST"; then
+        port_in_use "$GRPC_HOST" "$SPIN_PORT" && grpc_busy=true
+    fi
+
+    if ! $http_busy && ! $grpc_busy; then
+        return
+    fi
+
+    if $explicit_ports; then
+        if wait_http "$URL_SPIN" "existing spindll" 2 >/dev/null 2>&1; then
+            info "warning: another process is already serving on $URL_SPIN / ${GRPC_HOST}:${SPIN_PORT}; reusing that instance because you explicitly selected these ports"
+            info "warning: bench/run.sh will not start or stop a new spindll process for this phase"
+            SPINDLL_MANAGED=false
+            return
+        fi
+        die "ports already in use ($URL_SPIN / ${GRPC_HOST}:${SPIN_PORT}) and the existing process does not look like spindll"
+    fi
+
+    local new_http_port new_grpc_port
+    new_http_port="$(next_free_local_port "$HTTP_PORT")"
+    new_grpc_port="$(next_free_local_port "$SPIN_PORT")"
+    while [[ "$new_http_port" == "$new_grpc_port" ]] || port_in_use localhost "$new_http_port" || port_in_use localhost "$new_grpc_port"; do
+        [[ "$new_http_port" == "$new_grpc_port" ]] && new_grpc_port="$(next_free_local_port "$((new_grpc_port + 1))")"
+        port_in_use localhost "$new_http_port" && new_http_port="$(next_free_local_port "$((new_http_port + 1))")"
+        port_in_use localhost "$new_grpc_port" && new_grpc_port="$(next_free_local_port "$((new_grpc_port + 1))")"
+    done
+
+    info "warning: another process is already listening on the default spindll ports 8080/50051"
+    info "warning: starting benchmark spindll on alternate ports ${new_http_port}/${new_grpc_port} instead"
+    info "warning: running multiple spindll processes is your responsibility; it can exhaust memory and crash the machine or one of the servers"
+
+    HTTP_PORT="$new_http_port"
+    SPIN_PORT="$new_grpc_port"
+    URL_SPIN="http://localhost:${HTTP_PORT}"
+    GRPC_PORT="$SPIN_PORT"
 }
 
 # ── Engine lifecycle ──────────────────────────────────────────────────────────
@@ -180,6 +249,11 @@ stop_mlx() {
 start_spindll() {
     local bin="${1:-$SPINDLL_BIN}"
     [[ -x "$bin" ]] || die "spindll not found: $bin"
+    prepare_spindll_launch
+    if ! $SPINDLL_MANAGED; then
+        SPINDLL_PID=""
+        return
+    fi
     info "starting: $bin serve --port $SPIN_PORT --http-port $HTTP_PORT"
     "$bin" serve --port "$SPIN_PORT" --http-port "$HTTP_PORT" \
         >"$WORK/spindll.log" 2>&1 &
@@ -188,6 +262,10 @@ start_spindll() {
 }
 
 stop_spindll() {
+    if ! $SPINDLL_MANAGED; then
+        info "leaving user-managed spindll running on $URL_SPIN / ${GRPC_HOST}:${SPIN_PORT}"
+        return
+    fi
     if [[ -n "$SPINDLL_PID" ]]; then
         info "stopping spindll (pid $SPINDLL_PID)"
         kill "$SPINDLL_PID" 2>/dev/null || true
@@ -435,11 +513,15 @@ build_ref() {
     local ref="$1" label="$2" out_dir="$3"
     info "building $label ($ref) ..."
     local worktree="$WORK/wt-$label"
+    local added=false
     git worktree add -q "$worktree" "$ref"
-    (cd "$worktree" && cargo build --release --bin spindll --features cli 2>"$WORK/build-$label.log") \
-        || die "build failed for $ref (see $WORK/build-$label.log)"
+    added=true
+    if ! (cd "$worktree" && cargo build --release --bin spindll --features cli 2>"$WORK/build-$label.log"); then
+        $added && git worktree remove -f "$worktree" 2>/dev/null || true
+        die "build failed for $ref (see $WORK/build-$label.log)"
+    fi
     cp "$worktree/target/release/spindll" "$out_dir/spindll-$label"
-    git worktree remove -f "$worktree" 2>/dev/null || true
+    $added && git worktree remove -f "$worktree" 2>/dev/null || true
     info "built $out_dir/spindll-$label"
 }
 
