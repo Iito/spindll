@@ -5,6 +5,7 @@ use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::sampling::LlamaSampler;
 
 use super::kv_cache::{KvCache, load_state_from_disk, save_state_to_disk};
+use super::kv_ram_cache::KvRamCache;
 
 /// Sampling and generation parameters for a single inference request.
 pub struct GenerateParams {
@@ -163,8 +164,20 @@ pub fn generate_streaming(
     })
 }
 
+/// Snapshot the current context state into the RAM cache.
+fn snapshot_to_ram(ctx: &LlamaContext, rc: &KvRamCache, hash: &str, tokens: &[i32]) {
+    let state_size = ctx.get_state_size();
+    let mut buf = vec![0u8; state_size];
+    let actual = unsafe { ctx.copy_state_data(buf.as_mut_ptr()) };
+    buf.truncate(actual);
+    rc.insert(hash, &buf, tokens);
+}
+
 /// Generate with KV cache support. On cache hit, restores saved state instead
 /// of re-encoding the prompt. On miss, saves the post-prompt state for next time.
+///
+/// Three-tier lookup: RAM cache → disk cache → full prefill.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, fields(prompt_tokens, completion_tokens, cache_hit))]
 pub fn generate_streaming_cached(
     model: &LlamaModel,
@@ -174,6 +187,7 @@ pub fn generate_streaming_cached(
     model_name: &str,
     model_digest: &str,
     cache: &KvCache,
+    ram_cache: Option<&KvRamCache>,
     encryption_key: Option<&[u8; 32]>,
     mut on_token: impl FnMut(&str) -> bool,
 ) -> anyhow::Result<GenerateResult> {
@@ -191,12 +205,39 @@ pub fn generate_streaming_cached(
     let prompt_token_count = tokens.len() as u32;
     tracing::Span::current().record("prompt_tokens", prompt_token_count);
     let n_ctx = n_ctx_u32 as usize;
-    let cache_hit;
 
-    // Try loading cached KV state
-    if let Some(cache_path) = cache.lookup(prompt, model_name, model_digest, encryption_key) {
+    let token_ids: Vec<i32> = tokens.iter().map(|t| t.0).collect();
+    let ram_hash = ram_cache.map(|_| KvRamCache::hash_key(prompt, model_name, model_digest));
+
+    // ── Tier 1: RAM cache ──────────────────────────────────────────────
+    let cache_hit = if let (Some(rc), Some(hash)) = (ram_cache, ram_hash.as_deref()) {
+        if let Some((raw_state, cached_tokens)) = rc.lookup(hash) {
+            if cached_tokens.len() == token_ids.len()
+                && cached_tokens.iter().zip(token_ids.iter()).all(|(a, b)| a == b)
+            {
+                let read = unsafe { ctx.set_state_data(&raw_state) };
+                if read > 0 {
+                    tracing::debug!("kv cache: ram hit");
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    // ── Tier 2: Disk cache ─────────────────────────────────────────────
+    let cache_hit = if cache_hit {
+        true
+    } else if let Some(cache_path) = cache.lookup(prompt, model_name, model_digest, encryption_key)
+    {
         let loaded = if encryption_key.is_some() {
-            // Encrypted path: read+decrypt → temp file → state_load_file
             load_state_from_disk(&cache_path, encryption_key).and_then(|plain| {
                 let tmp = cache_path.with_extension("tmp");
                 std::fs::write(&tmp, &plain).ok()?;
@@ -205,17 +246,15 @@ pub fn generate_streaming_cached(
                 result
             })
         } else {
-            // Plaintext path: may or may not have magic byte wrapper
-            load_state_from_disk(&cache_path, None).and_then(|plain| {
-                let tmp = cache_path.with_extension("tmp");
-                std::fs::write(&tmp, &plain).ok()?;
-                let result = ctx.state_load_file(&tmp, n_ctx).ok();
-                std::fs::remove_file(&tmp).ok();
-                result
-            }).or_else(|| {
-                // Fallback: try direct load for legacy cache files without magic byte
-                ctx.state_load_file(&cache_path, n_ctx).ok()
-            })
+            load_state_from_disk(&cache_path, None)
+                .and_then(|plain| {
+                    let tmp = cache_path.with_extension("tmp");
+                    std::fs::write(&tmp, &plain).ok()?;
+                    let result = ctx.state_load_file(&tmp, n_ctx).ok();
+                    std::fs::remove_file(&tmp).ok();
+                    result
+                })
+                .or_else(|| ctx.state_load_file(&cache_path, n_ctx).ok())
         };
 
         match loaded {
@@ -223,22 +262,31 @@ pub fn generate_streaming_cached(
                 if cached_tokens.len() == tokens.len()
                     && cached_tokens.iter().zip(tokens.iter()).all(|(a, b)| a == b) =>
             {
-                cache_hit = true;
+                // Promote to RAM cache for next time.
+                if let (Some(rc), Some(hash)) = (ram_cache, ram_hash.as_deref()) {
+                    snapshot_to_ram(ctx, rc, hash, &token_ids);
+                }
+                true
             }
             _ => {
-                cache_hit = false;
                 encode_prompt(model, ctx, &tokens)?;
+                false
             }
         }
     } else {
-        cache_hit = false;
         encode_prompt(model, ctx, &tokens)?;
-    }
+        false
+    };
 
     tracing::Span::current().record("cache_hit", cache_hit);
 
-    // Save KV state on miss
+    // ── Save on miss ───────────────────────────────────────────────────
     if !cache_hit {
+        // Save to RAM cache.
+        if let (Some(rc), Some(hash)) = (ram_cache, ram_hash.as_deref()) {
+            snapshot_to_ram(ctx, rc, hash, &token_ids);
+        }
+        // Save to disk cache.
         let save_path = cache.save_path(prompt, model_name, model_digest, encryption_key);
         let tmp = save_path.with_extension("tmp");
         if ctx.state_save_file(&tmp, &tokens).is_ok() {
