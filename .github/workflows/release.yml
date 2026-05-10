@@ -84,7 +84,12 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Build (macOS with MLX)
+        if: runner.os == 'macOS'
+        run: cargo build --release --features cli,http,mlx
+
       - name: Build
+        if: runner.os != 'macOS'
         run: cargo build --release --features cli,http
 
       - name: Package binary
@@ -141,14 +146,18 @@ jobs:
           TAG_NAME: ${{ github.ref_name }}
           VERSION_PREFIX: ${{ steps.meta.outputs.version_prefix }}
         run: |
+          PREV_BODY=""
           EXISTING=$(gh release list --json tagName,isPrerelease \
             --jq ".[] | select(.isPrerelease and (.tagName | startswith(\"${VERSION_PREFIX}-rc.\"))) | .tagName")
           for OLD_TAG in $EXISTING; do
             if [ "$OLD_TAG" != "$TAG_NAME" ]; then
+              echo "Capturing notes from previous RC: $OLD_TAG"
+              PREV_BODY=$(gh release view "$OLD_TAG" --json body --jq '.body')
               echo "Deleting previous RC release: $OLD_TAG"
               gh release delete "$OLD_TAG" --yes --cleanup-tag
             fi
           done
+          echo "$PREV_BODY" > /tmp/prev_rc_body.md
 
       - name: Create RC pre-release
         if: steps.meta.outputs.prerelease == 'true'
@@ -156,11 +165,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          gh release create "$TAG_NAME" \
-            --title "$TAG_NAME" \
-            --generate-notes \
-            --prerelease \
-            artifacts/spindll-*
+          PREV_BODY=$(cat /tmp/prev_rc_body.md 2>/dev/null || true)
+          if [ -n "$PREV_BODY" ]; then
+            # Generate notes for the new RC, then prepend previous RC notes.
+            NEW_NOTES=$(gh api repos/{owner}/{repo}/releases/generate-notes \
+              -f tag_name="$TAG_NAME" --jq '.body')
+            COMBINED=$(printf '%s\n\n---\n\n%s' "$PREV_BODY" "$NEW_NOTES")
+            gh release create "$TAG_NAME" \
+              --title "$TAG_NAME" \
+              --notes "$COMBINED" \
+              --prerelease \
+              artifacts/spindll-*
+          else
+            gh release create "$TAG_NAME" \
+              --title "$TAG_NAME" \
+              --generate-notes \
+              --prerelease \
+              artifacts/spindll-*
+          fi
 
       - name: Create release
         if: steps.meta.outputs.prerelease == 'false'
