@@ -321,15 +321,24 @@ pub fn generate_streaming_cached(
     let mut n_cur = tokens.len() as i32;
     let mut completion_tokens = 0u32;
 
-    // Need an initial logits position — on cache hit we need to re-eval the last token
+    let first_logit_idx;
+
     if cache_hit {
+        // State restore only saves KV cache, not logits. Clear last pos and
+        // re-decode to regenerate logits without shifting the context.
+        let last_pos = (n_cur - 1) as u32;
+        let _ = ctx.clear_kv_cache_seq(Some(0), Some(last_pos), Some(last_pos + 1));
         let mut batch = LlamaBatch::new(1, 1);
         batch.add(tokens[tokens.len() - 1], n_cur - 1, &[0], true)?;
         ctx.decode(&mut batch)?;
+        first_logit_idx = 0;
+    } else {
+        first_logit_idx = tokens.len() as i32 - 1;
     }
 
+    let mut logit_idx = first_logit_idx;
     for _ in 0..params.max_tokens {
-        let token = sampler.sample(ctx, 0);
+        let token = sampler.sample(ctx, logit_idx);
         sampler.accept(token);
 
         if model.is_eog_token(token) {
@@ -349,6 +358,7 @@ pub fn generate_streaming_cached(
         batch.add(token, n_cur, &[0], true)?;
         ctx.decode(&mut batch)?;
         n_cur += 1;
+        logit_idx = 0;
     }
 
     tracing::Span::current().record("completion_tokens", completion_tokens);
