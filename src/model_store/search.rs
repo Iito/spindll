@@ -68,29 +68,45 @@ fn search_hf_gguf(
     client: &reqwest::blocking::Client,
     query: &str,
 ) -> anyhow::Result<Vec<SearchResult>> {
-    let url = format!(
-        "https://huggingface.co/api/models?search={}&filter=gguf&sort=downloads&direction=-1&limit=20",
-        urlencoding::encode(query),
-    );
-    let resp = client.get(&url).send()?;
-    if !resp.status().is_success() {
-        anyhow::bail!("HuggingFace API returned {}", resp.status());
-    }
-    let models: Vec<HfModel> = resp.json()?;
+    let mut seen = std::collections::HashSet::new();
+    let mut results = Vec::new();
 
-    Ok(models
-        .into_iter()
-        .map(|m| {
+    let urls = [
+        format!(
+            "https://huggingface.co/api/models?search={}&filter=gguf&sort=downloads&direction=-1&limit=20",
+            urlencoding::encode(query),
+        ),
+        format!(
+            "https://huggingface.co/api/models?search={}+GGUF&sort=downloads&direction=-1&limit=20",
+            urlencoding::encode(query),
+        ),
+    ];
+
+    for url in &urls {
+        let resp = match client.get(url).send() {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue,
+        };
+        let models: Vec<HfModel> = match resp.json() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        for m in models {
+            if m.id.starts_with("mlx-community/") || !seen.insert(m.id.clone()) {
+                continue;
+            }
             let estimated = estimate_model_bytes(&m.id, &ModelFormat::Gguf);
-            SearchResult {
+            results.push(SearchResult {
                 name: m.id,
                 source: SearchSource::HuggingFace,
                 format: ModelFormat::Gguf,
                 downloads: m.downloads,
                 estimated_bytes: estimated,
-            }
-        })
-        .collect())
+            });
+        }
+    }
+
+    Ok(results)
 }
 
 fn search_hf_mlx(
