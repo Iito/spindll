@@ -212,7 +212,7 @@ fn estimate_from_api(m: &HfModel, format: &ModelFormat) -> Option<u64> {
         if st.total > 0 {
             let params_b = st.total as f64 / 1e9;
             let bpp = match format {
-                ModelFormat::Gguf => 0.55,
+                ModelFormat::Gguf => DEFAULT_BPP_QUANTIZED,
                 ModelFormat::Mlx => {
                     let lower = m.id.to_lowercase();
                     if lower.contains("8bit") || lower.contains("8-bit") {
@@ -220,7 +220,7 @@ fn estimate_from_api(m: &HfModel, format: &ModelFormat) -> Option<u64> {
                     } else if lower.contains("bf16") || lower.contains("fp16") {
                         2.0
                     } else {
-                        0.55
+                        DEFAULT_BPP_QUANTIZED
                     }
                 }
             };
@@ -289,7 +289,9 @@ fn fetch_repo_size(
     }
 }
 
-fn rank_results(results: &mut Vec<SearchResult>, prefers_mlx: bool, available_mem: u64) {
+const DEFAULT_BPP_QUANTIZED: f64 = 0.55;
+
+fn rank_results(results: &mut [SearchResult], prefers_mlx: bool, available_mem: u64) {
     results.sort_by(|a, b| {
         let a_preferred = matches!(a.format, ModelFormat::Mlx) == prefers_mlx;
         let b_preferred = matches!(b.format, ModelFormat::Mlx) == prefers_mlx;
@@ -307,7 +309,7 @@ fn rank_results(results: &mut Vec<SearchResult>, prefers_mlx: bool, available_me
 fn estimate_model_bytes(name: &str, format: &ModelFormat) -> Option<u64> {
     let params = extract_param_billions(name)?;
     let bytes_per_param = match format {
-        ModelFormat::Gguf => 0.55,
+        ModelFormat::Gguf => DEFAULT_BPP_QUANTIZED,
         ModelFormat::Mlx => {
             let lower = name.to_lowercase();
             if lower.contains("8bit") || lower.contains("8-bit") {
@@ -315,7 +317,7 @@ fn estimate_model_bytes(name: &str, format: &ModelFormat) -> Option<u64> {
             } else if lower.contains("bf16") || lower.contains("fp16") {
                 2.0
             } else {
-                0.55
+                DEFAULT_BPP_QUANTIZED
             }
         }
     };
