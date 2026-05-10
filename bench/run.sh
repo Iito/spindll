@@ -58,6 +58,8 @@ REGRESSION_THRESHOLD=5  # % tok/s drop that triggers exit 1
 
 OUTPUT=""
 PROMPTS=""
+URL_SPIN_EXPLICIT=false
+GRPC_PORT_EXPLICIT=false
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
@@ -605,9 +607,9 @@ parse_args() {
             --cooldown)    COOLDOWN="$2";    shift 2;;
             --prompts)     PROMPTS="$2";     shift 2;;
             --url-mlx)     URL_MLX="$2";     shift 2;;
-            --url-spin)    URL_SPIN="$2";    shift 2;;
+            --url-spin)    URL_SPIN="$2";    URL_SPIN_EXPLICIT=true; shift 2;;
             --grpc-host)   GRPC_HOST="$2";   shift 2;;
-            --grpc-port)   GRPC_PORT="$2";   shift 2;;
+            --grpc-port)   GRPC_PORT="$2";   GRPC_PORT_EXPLICIT=true; shift 2;;
             --http-port)   HTTP_PORT="$2";   shift 2;;
             --spin-port)   SPIN_PORT="$2";   shift 2;;
             --spindll-bin) SPINDLL_BIN="$2"; shift 2;;
@@ -623,6 +625,15 @@ parse_args() {
         esac
     done
     [[ -n "$MODEL" ]] || die "--model is required (try --help)"
+
+    # Keep localhost defaults in sync with port overrides, but do not
+    # overwrite explicitly provided benchmark endpoints.
+    if ! $URL_SPIN_EXPLICIT; then
+        URL_SPIN="http://localhost:${HTTP_PORT}"
+    fi
+    if ! $GRPC_PORT_EXPLICIT; then
+        GRPC_PORT="$SPIN_PORT"
+    fi
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
