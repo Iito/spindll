@@ -33,6 +33,9 @@ vulkan = ["llama-cpp-2/vulkan"]
 # MLX Swift bridge — Apple Silicon only, compiles mlx_bridge Swift package.
 # Usage: cargo build --features mlx   (aarch64-apple-darwin only)
 mlx    = []
+# In-process benchmark command (spindll bench).
+# Usage: cargo build --features cli,bench
+bench  = ["cli"]
 
 [dependencies]
 # Core — always compiled
