@@ -441,14 +441,26 @@ async fn main() -> anyhow::Result<()> {
                 manager.enable_kv_cache(bytes);
                 println!("kv cache: {:.1} GB max", bytes as f64 / 1_073_741_824.0);
 
-                if !no_kv_ram_cache {
-                    let ram_bytes = kv_ram_cache
+                #[allow(unused_variables)]
+                let ram_bytes: u64 = if !no_kv_ram_cache {
+                    let b = kv_ram_cache
                         .as_deref()
                         .map(|s| parse_size_bytes(Some(s)))
                         .unwrap_or(512 * 1_048_576);
-                    manager.enable_kv_ram_cache(ram_bytes);
-                    println!("kv ram cache: {:.0} MB max", ram_bytes as f64 / 1_048_576.0);
-                }
+                    manager.enable_kv_ram_cache(b);
+                    println!("kv ram cache: {:.0} MB max", b as f64 / 1_048_576.0);
+                    b
+                } else {
+                    0
+                };
+
+                // Mirror the same budgets into the MLX prompt cache (Apple
+                // Silicon + --features mlx only). Same flags drive both backends.
+                #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+                spindll::backend::mlx_swift::set_cache_budgets(ram_bytes, bytes);
+            } else {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+                spindll::backend::mlx_swift::set_cache_budgets(0, 0);
             }
 
             if let Some(cache_size) = ram_cache {

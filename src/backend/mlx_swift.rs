@@ -60,6 +60,23 @@ unsafe extern "C" {
     ) -> i32;
 
     fn mlx_free_floats(data: *mut f32);
+
+    fn mlx_set_cache_budgets(ram_bytes: u64, disk_bytes: u64);
+}
+
+// ---------------------------------------------------------------------------
+// Cache budget configuration
+// ---------------------------------------------------------------------------
+
+/// Configure the MLX prompt cache's RAM and disk byte budgets. Should be called
+/// once before any MLX models are loaded — the disk tier reads `disk_bytes` on
+/// first access, and each loaded model's RAM cache reads `ram_bytes` at the
+/// time the model is constructed. Pass `0` for either tier to disable it.
+pub fn set_cache_budgets(ram_bytes: u64, disk_bytes: u64) {
+    // Safety: setter is a thin write to two module-level globals on the Swift
+    // side. We expect this to be called once at startup, before any concurrent
+    // model loads or chat requests, so no synchronisation is needed.
+    unsafe { mlx_set_cache_budgets(ram_bytes, disk_bytes) }
 }
 
 // ---------------------------------------------------------------------------
