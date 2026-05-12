@@ -615,15 +615,23 @@ public func mlxChatGenerate(
                 let liveCache: [any KVCache]
                 var iterator: TokenIterator
                 let snapshotBits: Int   // precision to re-snapshot the live cache at
+                let wasMiss: Bool
 
                 if let hit = state.promptCache.lookup(tokenIds: tokenIds),
                    canTrimPromptCache(hit.entry.kvCache) {
-                    let restored = hit.entry.kvCache.map { deepCopyCache($0) }
                     let cachedLen = hit.entry.tokenIds.count
                     let prefixLen = hit.prefixLength      // 1 ≤ prefixLen ≤ tokenIds.count, ≤ cachedLen
 
-                    // Roll the restored state back to the shared prefix.
-                    if cachedLen > prefixLen {
+                    // If the cached state covers exactly the shared prefix (no
+                    // trim needed), consume it in place — the save below will
+                    // drop this entry by token prefix anyway, so we don't need
+                    // an independent copy. Otherwise we have to deep-copy, since
+                    // trimming + prefilling would mutate the surviving entry.
+                    let restored: [any KVCache]
+                    if prefixLen == cachedLen {
+                        restored = hit.entry.kvCache
+                    } else {
+                        restored = hit.entry.kvCache.map { deepCopyCache($0) }
                         trimPromptCache(restored, numTokens: cachedLen - prefixLen)
                     }
 
@@ -641,6 +649,7 @@ public func mlxChatGenerate(
                     // Keep the precision we restored at — re-quantizing a coarse
                     // state to a finer width recovers no information.
                     snapshotBits = hit.entry.bits
+                    wasMiss = false
                     iterator = try TokenIterator(
                         input: LMInput(tokens: MLXArray(seedTokens)),
                         model: context.model,
@@ -651,6 +660,7 @@ public func mlxChatGenerate(
                     liveCache = makePromptCache(model: context.model, parameters: params)
                     // Miss: the live cache is f16 — snapshot it near-losslessly.
                     snapshotBits = highBits
+                    wasMiss = true
                     iterator = try TokenIterator(
                         input: LMInput(tokens: MLXArray(tokenIds)),
                         model: context.model,
@@ -695,14 +705,25 @@ public func mlxChatGenerate(
                     _ = chunk.withCString { ptr in callback(ptr, callbackCtx) }
                 }
 
-                // Snapshot the live cache — now covering prompt + generated
-                // tokens — for the next turn's prefix lookup. Skip caches that
-                // can't be trimmed (Mamba/SSM hybrids): they could only ever be
-                // matched whole, which is never useful for prefix reuse.
+                // Hand the live cache — now covering prompt + generated tokens —
+                // to the prompt cache for the next turn's prefix lookup. Skip
+                // non-trimmable caches (Mamba/SSM hybrids): they could only ever
+                // be matched whole, which is never useful for prefix reuse.
+                //
+                // On a miss the live cache is f16 KVCacheSimple — quantize as we
+                // store (a raw KVCacheSimple snapshot would share buffers with
+                // the still-mutating live cache). On a hit the cache's
+                // QuantizedKVCache layers are already independent — deep-copied
+                // for partial-prefix hits, exclusively owned for full-prefix
+                // hits (the dedup in `save` drops the original entry) — so we
+                // hand them to `save` directly. This avoids the redundant
+                // post-generation deep copy that was happening on every hit.
                 if canTrimPromptCache(liveCache) {
+                    let toStore = wasMiss ? snapshotCache(liveCache, bits: snapshotBits)
+                                          : liveCache
                     state.promptCache.save(
                         tokenIds: tokenIds + generatedTokenIds,
-                        kvCache: snapshotCache(liveCache, bits: snapshotBits),
+                        kvCache: toStore,
                         bits: snapshotBits)
                 }
 
