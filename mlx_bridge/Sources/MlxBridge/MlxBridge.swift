@@ -63,14 +63,17 @@ private final class PromptCacheEntry {
     var kvCache: [any KVCache]
     /// Bit width of the quantized attention layers (`highBits` or `lowBits`).
     var bits: Int
+    /// In-RAM footprint of `kvCache`. Updated when `demote` re-quantises.
+    var sizeBytes: Int64
     /// A copy of this state has already been written to the on-disk tier — so
     /// it isn't re-written when the entry is later demoted or evicted.
     var spilled = false
 
     init(tokenIds: [Int32], kvCache: [any KVCache], bits: Int) {
-        self.tokenIds = tokenIds
-        self.kvCache  = kvCache
-        self.bits     = bits
+        self.tokenIds  = tokenIds
+        self.kvCache   = kvCache
+        self.bits      = bits
+        self.sizeBytes = sizeOf(kvCache)
     }
 }
 
@@ -91,6 +94,38 @@ private func demote(_ entry: PromptCacheEntry) {
         return q.toUnquantized().toQuantized(groupSize: kvGroupSize, bits: lowBits)
     }
     entry.bits = lowBits
+    entry.sizeBytes = sizeOf(entry.kvCache)
+}
+
+/// Total bytes occupied by the live state arrays of every layer in `kvCache`.
+/// `MLXArray.nbytes` reports the size of the (possibly-sliced) view.
+private func sizeOf(_ kvCache: [any KVCache]) -> Int64 {
+    var total: Int64 = 0
+    for layer in kvCache {
+        for array in layer.state { total += Int64(array.nbytes) }
+    }
+    return total
+}
+
+// ---------------------------------------------------------------------------
+// Cache budgets — set once at startup via `mlx_set_cache_budgets`. Defaults
+// match the GGUF side's flag defaults so behaviour is consistent if the Rust
+// side never calls the setter.
+// ---------------------------------------------------------------------------
+
+private var mlxRamCacheBudget: Int64  = 512 * 1024 * 1024            // 512 MB
+private var mlxDiskCacheBudget: Int64 = 2 * 1024 * 1024 * 1024       // 2 GB
+
+/// Configure the prompt cache's RAM and disk byte budgets. Should be called
+/// before any models are loaded — `sharedMlxDiskCache` reads `diskBytes` on
+/// first access, and each `PromptCache` reads `ramBytes` at construction. Pass
+/// 0 for either tier to effectively disable it.
+@_cdecl("mlx_set_cache_budgets")
+public func mlxSetCacheBudgets(_ ramBytes: UInt64, _ diskBytes: UInt64) {
+    let clamp: (UInt64) -> Int64 = { Int64(min($0, UInt64(Int64.max))) }
+    mlxRamCacheBudget  = clamp(ramBytes)
+    mlxDiskCacheBudget = clamp(diskBytes)
+    fputs("[mlx-bridge] prompt cache: ram=\(ramBytes >> 20) MB disk=\(diskBytes >> 20) MB\n", stderr)
 }
 
 // ---------------------------------------------------------------------------
@@ -124,9 +159,10 @@ private final class MlxDiskCache {
     private let lock = NSLock()
     private var index: [String: DiskCacheEntry] = [:]
 
-    init(maxBytes: Int64 = 2 * 1024 * 1024 * 1024) {
-        self.maxBytes = maxBytes
-        self.enabled = ProcessInfo.processInfo.environment["SPINDLL_MLX_DISK_CACHE"] != "0"
+    init() {
+        self.maxBytes = mlxDiskCacheBudget
+        self.enabled = mlxDiskCacheBudget > 0
+            && ProcessInfo.processInfo.environment["SPINDLL_MLX_DISK_CACHE"] != "0"
         let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
         self.dir = URL(fileURLWithPath: home)
             .appendingPathComponent(".spindll").appendingPathComponent("cache").appendingPathComponent("mlx")
@@ -225,7 +261,9 @@ private let sharedMlxDiskCache = MlxDiskCache()
 
 private final class PromptCache {
     private var entries: [PromptCacheEntry] = []
-    private let maxSize: Int
+    /// Total in-RAM byte budget for the cache. Configured via `mlx_set_cache_budgets`
+    /// (wired to `--kv-ram-cache`); `0` disables the prompt cache entirely.
+    private let maxBytes: Int64
     /// Don't reuse a state that shares only a handful of tokens — the prefill
     /// we would save is dwarfed by the deep-copy + trim + re-snapshot overhead.
     /// 64 tokens covers a typical chat-template wrapping plus a short turn; below
@@ -239,11 +277,13 @@ private final class PromptCache {
     /// in the shared on-disk tier.
     private let modelDigest: String
 
-    init(modelDigest: String, maxSize: Int = 2, minPrefix: Int = 64) {
+    init(modelDigest: String, maxBytes: Int64? = nil, minPrefix: Int = 64) {
         self.modelDigest = modelDigest
-        self.maxSize = maxSize
-        self.minPrefix = minPrefix
+        self.maxBytes    = maxBytes ?? mlxRamCacheBudget
+        self.minPrefix   = minPrefix
     }
+
+    private var usedBytes: Int64 { entries.reduce(0) { $0 + $1.sizeBytes } }
 
     /// RAM lookup: the entry sharing the longest token prefix with `tokenIds`
     /// (≥ `minPrefix`), promoted to the front of the LRU list.
@@ -263,7 +303,7 @@ private final class PromptCache {
     /// Look up `tokenIds`, checking RAM first and then the on-disk tier; a disk
     /// hit is loaded back into RAM. `nil` if neither has a usable prefix.
     func lookup(tokenIds: [Int32]) -> PromptCacheHit? {
-        guard !tokenIds.isEmpty else { return nil }
+        guard !tokenIds.isEmpty, maxBytes > 0 else { return nil }
         if let hit = lookupRam(tokenIds) { return hit }
         guard tokenIds.count >= diskMinTokens,
               let d = sharedMlxDiskCache.lookup(
@@ -281,9 +321,9 @@ private final class PromptCache {
     /// token sequence is a prefix of the new one is dropped (the new entry
     /// supersedes it). Surviving older entries spill a near-lossless copy to the
     /// on-disk tier and are then demoted to `lowBits` in RAM. The LRU entry, if
-    /// the cache is over capacity, is dropped from RAM (already on disk).
+    /// the cache is over its byte budget, is dropped from RAM (already on disk).
     func save(tokenIds: [Int32], kvCache: [any KVCache], bits: Int) {
-        guard !tokenIds.isEmpty else { return }
+        guard !tokenIds.isEmpty, maxBytes > 0 else { return }
         entries.removeAll { commonPrefixLength($0.tokenIds, tokenIds) == $0.tokenIds.count }
         for e in entries {
             spillToDisk(e)   // while still highBits — disk entries stay near-lossless
@@ -294,7 +334,7 @@ private final class PromptCache {
     }
 
     private func evictExcess() {
-        while entries.count > maxSize, let evicted = entries.popLast() {
+        while usedBytes > maxBytes, let evicted = entries.popLast() {
             spillToDisk(evicted)   // no-op if already spilled or already demoted
         }
     }
