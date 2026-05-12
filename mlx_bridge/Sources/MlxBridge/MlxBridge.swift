@@ -30,9 +30,21 @@ private final class Box<T>: @unchecked Sendable {
 // prompt plus the tokens generated that turn — that is exactly the prefix the
 // next turn's prompt extends.
 //
+// Snapshots are quantized to keep the in-memory footprint small. The freshest
+// entry — the one the active conversation keeps extending — is kept at the
+// higher precision (`highBits`); older entries are demoted to `lowBits` the
+// moment a newer snapshot supersedes them. So the hot path always reuses a
+// near-lossless state while cold entries cost a quarter of an f16 state. This
+// mirrors how macOS keeps active pages uncompressed and compresses inactive
+// ones.
+//
 // Access is serialised by ModelContainer's SerialAccessContainer actor, so no
 // additional lock is needed.
 // ---------------------------------------------------------------------------
+
+private let kvGroupSize = 64
+private let highBits = 8     // freshest snapshot — near-lossless
+private let lowBits  = 4     // demoted (cold) snapshot — ¼ of f16
 
 /// Length of the longest common prefix of two token-id sequences.
 private func commonPrefixLength(_ a: [Int32], _ b: [Int32]) -> Int {
@@ -48,10 +60,13 @@ private final class PromptCacheEntry {
     var tokenIds: [Int32]
     /// KV state covering exactly `tokenIds`: every layer has `offset == tokenIds.count`.
     var kvCache: [any KVCache]
+    /// Bit width of the quantized attention layers (`highBits` or `lowBits`).
+    var bits: Int
 
-    init(tokenIds: [Int32], kvCache: [any KVCache]) {
+    init(tokenIds: [Int32], kvCache: [any KVCache], bits: Int) {
         self.tokenIds = tokenIds
         self.kvCache  = kvCache
+        self.bits     = bits
     }
 }
 
@@ -60,6 +75,18 @@ private final class PromptCacheEntry {
 private struct PromptCacheHit {
     let entry: PromptCacheEntry
     let prefixLength: Int
+}
+
+/// Re-quantize an entry's attention layers down to `lowBits`. Only ever called
+/// on entries that are no longer the most-recently-used, to shrink the in-memory
+/// footprint. Mamba/SSM layers (already independent deep copies) are left as-is.
+private func demote(_ entry: PromptCacheEntry) {
+    guard entry.bits != lowBits else { return }
+    entry.kvCache = entry.kvCache.map { layer -> any KVCache in
+        guard let q = layer as? QuantizedKVCache, q.bits != lowBits else { return layer }
+        return q.toUnquantized().toQuantized(groupSize: kvGroupSize, bits: lowBits)
+    }
+    entry.bits = lowBits
 }
 
 private final class PromptCache {
@@ -92,12 +119,13 @@ private final class PromptCache {
 
     /// Insert (or replace) the entry for `tokenIds`. Any existing entry whose
     /// token sequence is a prefix of the new one is dropped — the new entry
-    /// supersedes it for every future lookup. Evicts the LRU entry if the cache
-    /// is over capacity.
-    func save(tokenIds: [Int32], kvCache: [any KVCache]) {
+    /// supersedes it for every future lookup. Surviving older entries are
+    /// demoted to `lowBits`. Evicts the LRU entry if the cache is over capacity.
+    func save(tokenIds: [Int32], kvCache: [any KVCache], bits: Int) {
         guard !tokenIds.isEmpty else { return }
         entries.removeAll { commonPrefixLength($0.tokenIds, tokenIds) == $0.tokenIds.count }
-        entries.insert(PromptCacheEntry(tokenIds: tokenIds, kvCache: kvCache), at: 0)
+        for e in entries { demote(e) }
+        entries.insert(PromptCacheEntry(tokenIds: tokenIds, kvCache: kvCache, bits: bits), at: 0)
         if entries.count > maxSize { entries.removeLast() }
     }
 }
@@ -312,14 +340,19 @@ private func deepCopyCache(_ layer: any KVCache) -> any KVCache {
 
 /// Take an independent snapshot of a live KV cache for the prompt cache.
 ///
-/// `KVCacheSimple` layers are 4-bit-quantized — roughly a quarter of the f16
-/// footprint, and `trim()` just decrements the offset so prefix reuse is
-/// unaffected. Every other cache type is deep-copied as-is. The result is safe
-/// to retain while the live cache keeps being mutated by generation.
-private func snapshotCache(_ cache: [any KVCache]) -> [any KVCache] {
+/// Attention layers are quantized to `bits` (`trim()` just decrements the offset
+/// so prefix reuse is unaffected by quantization); Mamba/SSM layers are deep-
+/// copied as-is. Works whether the live cache is f16 (`KVCacheSimple`, on a
+/// miss) or already quantized at some other width (`QuantizedKVCache`, on a hit
+/// off a previous snapshot). The result is independent — safe to retain while
+/// generation keeps mutating the live cache.
+private func snapshotCache(_ cache: [any KVCache], bits: Int) -> [any KVCache] {
     cache.map { layer in
         if let simple = layer as? KVCacheSimple {
-            return simple.toQuantized(groupSize: 64, bits: 4)
+            return simple.toQuantized(groupSize: kvGroupSize, bits: bits)
+        }
+        if let q = layer as? QuantizedKVCache, q.bits != bits {
+            return q.toUnquantized().toQuantized(groupSize: kvGroupSize, bits: bits)
         }
         return deepCopyCache(layer)
     }
@@ -383,6 +416,7 @@ public func mlxChatGenerate(
                 // covers prompt + generated tokens) for the next prefix lookup.
                 let liveCache: [any KVCache]
                 var iterator: TokenIterator
+                let snapshotBits: Int   // precision to re-snapshot the live cache at
 
                 if let hit = state.promptCache.lookup(tokenIds: tokenIds),
                    canTrimPromptCache(hit.entry.kvCache) {
@@ -406,6 +440,9 @@ public func mlxChatGenerate(
                     }
 
                     liveCache = restored
+                    // Keep the precision we restored at — re-quantizing a coarse
+                    // state to a finer width recovers no information.
+                    snapshotBits = hit.entry.bits
                     iterator = try TokenIterator(
                         input: LMInput(tokens: MLXArray(seedTokens)),
                         model: context.model,
@@ -414,6 +451,8 @@ public func mlxChatGenerate(
                     )
                 } else {
                     liveCache = makePromptCache(model: context.model, parameters: params)
+                    // Miss: the live cache is f16 — snapshot it near-losslessly.
+                    snapshotBits = highBits
                     iterator = try TokenIterator(
                         input: LMInput(tokens: MLXArray(tokenIds)),
                         model: context.model,
@@ -459,10 +498,15 @@ public func mlxChatGenerate(
                 }
 
                 // Snapshot the live cache — now covering prompt + generated
-                // tokens — for the next turn's prefix lookup.
-                state.promptCache.save(
-                    tokenIds: tokenIds + generatedTokenIds,
-                    kvCache: snapshotCache(liveCache))
+                // tokens — for the next turn's prefix lookup. Skip caches that
+                // can't be trimmed (Mamba/SSM hybrids): they could only ever be
+                // matched whole, which is never useful for prefix reuse.
+                if canTrimPromptCache(liveCache) {
+                    state.promptCache.save(
+                        tokenIds: tokenIds + generatedTokenIds,
+                        kvCache: snapshotCache(liveCache, bits: snapshotBits),
+                        bits: snapshotBits)
+                }
 
                 Stream().synchronize()
             }
