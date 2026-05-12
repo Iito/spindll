@@ -226,8 +226,10 @@ private let sharedMlxDiskCache = MlxDiskCache()
 private final class PromptCache {
     private var entries: [PromptCacheEntry] = []
     private let maxSize: Int
-    /// Don't reuse a state that shares only a handful of tokens — the prefill we
-    /// would save is dwarfed by the copy + trim overhead.
+    /// Don't reuse a state that shares only a handful of tokens — the prefill
+    /// we would save is dwarfed by the deep-copy + trim + re-snapshot overhead.
+    /// 64 tokens covers a typical chat-template wrapping plus a short turn; below
+    /// that, restoring is a net loss vs. a cold prefill.
     private let minPrefix: Int
     /// Only touch the on-disk tier for prompts at least this long — for short
     /// prompts, reading an ~tens-of-MB safetensors back costs more than just
@@ -237,7 +239,7 @@ private final class PromptCache {
     /// in the shared on-disk tier.
     private let modelDigest: String
 
-    init(modelDigest: String, maxSize: Int = 2, minPrefix: Int = 16) {
+    init(modelDigest: String, maxSize: Int = 2, minPrefix: Int = 64) {
         self.modelDigest = modelDigest
         self.maxSize = maxSize
         self.minPrefix = minPrefix
@@ -604,6 +606,12 @@ public func mlxChatGenerate(
                 // miss we prefill the whole prompt into a fresh cache. Either
                 // way the live cache is re-snapshotted after generation (so it
                 // covers prompt + generated tokens) for the next prefix lookup.
+                //
+                // `canTrimPromptCache` is the SWA fallback: for Gemma-style
+                // sliding-window models `RotatingKVCache.isTrimmable` flips to
+                // false once the conversation exceeds the window, in which case
+                // we silently fall back to a cold prefill. Same guard on the
+                // save path below skips snapshotting non-trimmable caches at all.
                 let liveCache: [any KVCache]
                 var iterator: TokenIterator
                 let snapshotBits: Int   // precision to re-snapshot the live cache at
