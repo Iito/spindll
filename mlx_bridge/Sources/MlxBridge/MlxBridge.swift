@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import MLX
 import MLXLLM
 import MLXLMCommon
@@ -62,6 +63,9 @@ private final class PromptCacheEntry {
     var kvCache: [any KVCache]
     /// Bit width of the quantized attention layers (`highBits` or `lowBits`).
     var bits: Int
+    /// A copy of this state has already been written to the on-disk tier — so
+    /// it isn't re-written when the entry is later demoted or evicted.
+    var spilled = false
 
     init(tokenIds: [Int32], kvCache: [any KVCache], bits: Int) {
         self.tokenIds = tokenIds
@@ -89,22 +93,159 @@ private func demote(_ entry: PromptCacheEntry) {
     entry.bits = lowBits
 }
 
+// ---------------------------------------------------------------------------
+// MlxDiskCache — on-disk LRU tier behind PromptCache.
+//
+// Evicted PromptCache entries are written here as safetensors (via
+// mlx-swift-lm's savePromptCache); a RAM miss checks here for a usable token
+// prefix before falling back to a cold prefill, so prompt prefixes survive
+// process restarts. Shared by every loaded model — entries are namespaced by a
+// digest of the model's config.json, so re-downloading a model invalidates them.
+// Set SPINDLL_MLX_DISK_CACHE=0 to disable.
+// ---------------------------------------------------------------------------
+
+private func sha256Hex(_ data: Data) -> String {
+    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+private struct DiskCacheEntry: Codable {
+    var file: String          // "<modelDigest>_<tokenDigest>.safetensors"
+    var modelDigest: String
+    var tokenIds: [Int32]
+    var bits: Int             // quantization width of the attention layers
+    var sizeBytes: Int64
+    var lastUsed: Double      // for LRU ordering
+}
+
+private final class MlxDiskCache {
+    private let dir: URL
+    private let maxBytes: Int64
+    private let enabled: Bool
+    private let lock = NSLock()
+    private var index: [String: DiskCacheEntry] = [:]
+
+    init(maxBytes: Int64 = 2 * 1024 * 1024 * 1024) {
+        self.maxBytes = maxBytes
+        self.enabled = ProcessInfo.processInfo.environment["SPINDLL_MLX_DISK_CACHE"] != "0"
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+        self.dir = URL(fileURLWithPath: home)
+            .appendingPathComponent(".spindll").appendingPathComponent("cache").appendingPathComponent("mlx")
+        guard enabled else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        if let data = try? Data(contentsOf: dir.appendingPathComponent("index.json")),
+           let list = try? JSONDecoder().decode([DiskCacheEntry].self, from: data) {
+            index = Dictionary(list.map { ($0.file, $0) }, uniquingKeysWith: { a, _ in a })
+        }
+    }
+
+    private func saveIndexLocked() {
+        if let data = try? JSONEncoder().encode(Array(index.values)) {
+            try? data.write(to: dir.appendingPathComponent("index.json"), options: .atomic)
+        }
+    }
+
+    private func totalBytesLocked() -> Int64 { index.values.reduce(0) { $0 + $1.sizeBytes } }
+
+    private func evictLocked() {
+        while totalBytesLocked() > maxBytes,
+              let lru = index.values.min(by: { $0.lastUsed < $1.lastUsed }) {
+            index[lru.file] = nil
+            try? FileManager.default.removeItem(at: dir.appendingPathComponent(lru.file))
+        }
+    }
+
+    /// Find this model's disk entry sharing the longest token prefix with
+    /// `tokenIds` (≥ `minPrefix`), load it, refresh its LRU stamp, and return
+    /// its reconstructed KV state. `nil` on no match or a load failure.
+    func lookup(modelDigest: String, tokenIds: [Int32], minPrefix: Int)
+        -> (tokenIds: [Int32], kvCache: [any KVCache], bits: Int)? {
+        guard enabled else { return nil }
+        lock.lock()
+        var best: DiskCacheEntry? = nil
+        var bestLen = 0
+        for e in index.values where e.modelDigest == modelDigest {
+            let l = commonPrefixLength(e.tokenIds, tokenIds)
+            if l > bestLen { bestLen = l; best = e }
+        }
+        guard var entry = best, bestLen >= minPrefix else { lock.unlock(); return nil }
+        let url = dir.appendingPathComponent(entry.file)
+        lock.unlock()
+
+        let loaded: [KVCache]
+        do { loaded = try loadPromptCache(url: url).0 }
+        catch {
+            fputs("[mlx-bridge] disk cache: load failed (\(entry.file)): \(error)\n", stderr)
+            lock.lock(); index[entry.file] = nil; saveIndexLocked(); lock.unlock()
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
+        // loadPromptCache rebuilds QuantizedKVCache layers at the default 8-bit
+        // width — mlx-swift-lm doesn't restore bits/groupSize from metaState — so
+        // re-bind the loaded arrays into caches with the width we recorded.
+        let kvCache: [any KVCache] = entry.bits == 8 ? loaded : loaded.map { layer in
+            guard let q = layer as? QuantizedKVCache, q.bits != entry.bits else { return layer }
+            let nq = QuantizedKVCache(groupSize: q.groupSize, bits: entry.bits)
+            nq.state = q.state
+            nq.offset = q.offset
+            return nq
+        }
+        lock.lock()
+        entry.lastUsed = Date().timeIntervalSinceReferenceDate
+        index[entry.file] = entry
+        saveIndexLocked()
+        lock.unlock()
+        return (entry.tokenIds, kvCache, entry.bits)
+    }
+
+    /// Write an evicted RAM entry to disk, dropping LRU disk entries if over budget.
+    func put(modelDigest: String, tokenIds: [Int32], kvCache: [any KVCache], bits: Int) {
+        guard enabled, !tokenIds.isEmpty else { return }
+        var tokenData = Data(capacity: tokenIds.count * 4)
+        for t in tokenIds { withUnsafeBytes(of: t.littleEndian) { tokenData.append(contentsOf: $0) } }
+        let file = "\(modelDigest)_\(sha256Hex(tokenData)).safetensors"
+        let url = dir.appendingPathComponent(file)
+        do { try savePromptCache(url: url, cache: kvCache, metadata: [:]) }
+        catch {
+            fputs("[mlx-bridge] disk cache: save failed (\(file)): \(error)\n", stderr)
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+        let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        lock.lock()
+        index[file] = DiskCacheEntry(file: file, modelDigest: modelDigest, tokenIds: tokenIds,
+                                     bits: bits, sizeBytes: size, lastUsed: Date().timeIntervalSinceReferenceDate)
+        evictLocked()
+        if index[file] == nil { try? FileManager.default.removeItem(at: url) }  // entry alone > budget
+        saveIndexLocked()
+        lock.unlock()
+    }
+}
+
+private let sharedMlxDiskCache = MlxDiskCache()
+
 private final class PromptCache {
     private var entries: [PromptCacheEntry] = []
     private let maxSize: Int
     /// Don't reuse a state that shares only a handful of tokens — the prefill we
     /// would save is dwarfed by the copy + trim overhead.
     private let minPrefix: Int
+    /// Only touch the on-disk tier for prompts at least this long — for short
+    /// prompts, reading an ~tens-of-MB safetensors back costs more than just
+    /// re-prefilling. The RAM tier is used regardless of length.
+    private let diskMinTokens = 512
+    /// Model identity (digest of config.json) — namespaces this model's entries
+    /// in the shared on-disk tier.
+    private let modelDigest: String
 
-    init(maxSize: Int = 2, minPrefix: Int = 16) {
+    init(modelDigest: String, maxSize: Int = 2, minPrefix: Int = 16) {
+        self.modelDigest = modelDigest
         self.maxSize = maxSize
         self.minPrefix = minPrefix
     }
 
-    /// Return the cached entry sharing the longest token prefix with `tokenIds`
-    /// (at least `minPrefix` tokens), promoting it to the front of the LRU list.
-    func lookup(tokenIds: [Int32]) -> PromptCacheHit? {
-        guard !tokenIds.isEmpty else { return nil }
+    /// RAM lookup: the entry sharing the longest token prefix with `tokenIds`
+    /// (≥ `minPrefix`), promoted to the front of the LRU list.
+    private func lookupRam(_ tokenIds: [Int32]) -> PromptCacheHit? {
         var bestIdx: Int? = nil
         var bestLen = 0
         for (i, e) in entries.enumerated() {
@@ -117,24 +258,63 @@ private final class PromptCache {
         return PromptCacheHit(entry: entry, prefixLength: bestLen)
     }
 
+    /// Look up `tokenIds`, checking RAM first and then the on-disk tier; a disk
+    /// hit is loaded back into RAM. `nil` if neither has a usable prefix.
+    func lookup(tokenIds: [Int32]) -> PromptCacheHit? {
+        guard !tokenIds.isEmpty else { return nil }
+        if let hit = lookupRam(tokenIds) { return hit }
+        guard tokenIds.count >= diskMinTokens,
+              let d = sharedMlxDiskCache.lookup(
+                modelDigest: modelDigest, tokenIds: tokenIds, minPrefix: minPrefix)
+        else { return nil }
+        let entry = PromptCacheEntry(tokenIds: d.tokenIds, kvCache: d.kvCache, bits: d.bits)
+        entry.spilled = true   // it came from disk; no need to write it back
+        entries.removeAll { commonPrefixLength($0.tokenIds, entry.tokenIds) == $0.tokenIds.count }
+        entries.insert(entry, at: 0)
+        evictExcess()
+        return PromptCacheHit(entry: entry, prefixLength: commonPrefixLength(entry.tokenIds, tokenIds))
+    }
+
     /// Insert (or replace) the entry for `tokenIds`. Any existing entry whose
-    /// token sequence is a prefix of the new one is dropped — the new entry
-    /// supersedes it for every future lookup. Surviving older entries are
-    /// demoted to `lowBits`. Evicts the LRU entry if the cache is over capacity.
+    /// token sequence is a prefix of the new one is dropped (the new entry
+    /// supersedes it). Surviving older entries spill a near-lossless copy to the
+    /// on-disk tier and are then demoted to `lowBits` in RAM. The LRU entry, if
+    /// the cache is over capacity, is dropped from RAM (already on disk).
     func save(tokenIds: [Int32], kvCache: [any KVCache], bits: Int) {
         guard !tokenIds.isEmpty else { return }
         entries.removeAll { commonPrefixLength($0.tokenIds, tokenIds) == $0.tokenIds.count }
-        for e in entries { demote(e) }
+        for e in entries {
+            spillToDisk(e)   // while still highBits — disk entries stay near-lossless
+            demote(e)
+        }
         entries.insert(PromptCacheEntry(tokenIds: tokenIds, kvCache: kvCache, bits: bits), at: 0)
-        if entries.count > maxSize { entries.removeLast() }
+        evictExcess()
+    }
+
+    private func evictExcess() {
+        while entries.count > maxSize, let evicted = entries.popLast() {
+            spillToDisk(evicted)   // no-op if already spilled or already demoted
+        }
+    }
+
+    /// Write `entry`'s state to the on-disk tier once, while it's still at the
+    /// higher precision and only if it's long enough to be worth the I/O.
+    private func spillToDisk(_ entry: PromptCacheEntry) {
+        guard !entry.spilled, entry.bits == highBits, entry.tokenIds.count >= diskMinTokens else { return }
+        sharedMlxDiskCache.put(modelDigest: modelDigest,
+                               tokenIds: entry.tokenIds, kvCache: entry.kvCache, bits: entry.bits)
+        entry.spilled = true
     }
 }
 
 // Retains the ModelContainer and prompt KV cache across FFI calls.
 private final class ModelState: @unchecked Sendable {
     let container: ModelContainer
-    let promptCache = PromptCache()
-    init(_ container: ModelContainer) { self.container = container }
+    let promptCache: PromptCache
+    init(_ container: ModelContainer, modelDigest: String) {
+        self.container = container
+        self.promptCache = PromptCache(modelDigest: modelDigest)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,13 +333,23 @@ public func mlxModelLoad(_ path: UnsafePointer<CChar>?) -> UnsafeMutableRawPoint
     let sema = DispatchSemaphore(value: 0)
     let box = Box<ModelState>()
 
+    // Model identity for the on-disk prompt cache: digest of config.json (the
+    // same artefact the Rust side uses as the MLX model version), falling back
+    // to the path if it can't be read.
+    let modelDigest: String
+    if let cfg = try? Data(contentsOf: url.appendingPathComponent("config.json")) {
+        modelDigest = sha256Hex(cfg)
+    } else {
+        modelDigest = sha256Hex(Data(modelPath.utf8))
+    }
+
     Task {
         do {
             let container = try await LLMModelFactory.shared.loadContainer(
                 from: url,
                 using: #huggingFaceTokenizerLoader()
             )
-            box.value = ModelState(container)
+            box.value = ModelState(container, modelDigest: modelDigest)
         } catch {
             // box.value stays nil; Rust side receives NULL
         }
