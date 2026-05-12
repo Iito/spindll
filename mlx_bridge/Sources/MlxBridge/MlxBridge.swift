@@ -18,48 +18,85 @@ private final class Box<T>: @unchecked Sendable {
 // ---------------------------------------------------------------------------
 // PromptCache — in-memory LRU cache of KV state keyed by token sequence.
 //
-// On a cache hit for an
-// identical prompt the expensive prefill is skipped: only the last prompt token
-// is re-processed (one decode step), so TTFT ≈ single-token forward pass.
+// On a cache *prefix* match the saved KV state is restored, trimmed back to the
+// longest token prefix it shares with the new prompt, and only the tokens that
+// are new since then are prefilled — so a follow-up turn in a chat (system +
+// turn1 + turn2 + …) costs O(new tokens) of prefill instead of O(whole prompt).
+// On an exact match (or when the new prompt is itself a prefix of the cached
+// one) just the last prompt token is re-processed, so TTFT ≈ a single decode
+// step.
+//
+// Each stored state is re-snapshotted *after* generation, so it covers the
+// prompt plus the tokens generated that turn — that is exactly the prefix the
+// next turn's prompt extends.
 //
 // Access is serialised by ModelContainer's SerialAccessContainer actor, so no
 // additional lock is needed.
 // ---------------------------------------------------------------------------
 
+/// Length of the longest common prefix of two token-id sequences.
+private func commonPrefixLength(_ a: [Int32], _ b: [Int32]) -> Int {
+    let n = min(a.count, b.count)
+    var i = 0
+    while i < n && a[i] == b[i] { i += 1 }
+    return i
+}
+
 private final class PromptCacheEntry {
-    let tokenIds: [Int32]
-    let lastTokenId: Int32
-    let kvCache: [any KVCache]
+    /// Token sequence this KV state corresponds to — prompt tokens plus any
+    /// tokens generated after it, so a later turn can prefix off this entry.
+    var tokenIds: [Int32]
+    /// KV state covering exactly `tokenIds`: every layer has `offset == tokenIds.count`.
+    var kvCache: [any KVCache]
 
     init(tokenIds: [Int32], kvCache: [any KVCache]) {
-        self.tokenIds  = tokenIds
-        self.lastTokenId = tokenIds.last ?? 0
-        self.kvCache   = kvCache
+        self.tokenIds = tokenIds
+        self.kvCache  = kvCache
     }
+}
+
+/// Result of a prompt-cache lookup: the matched entry and how many leading
+/// tokens it shares with the requested prompt.
+private struct PromptCacheHit {
+    let entry: PromptCacheEntry
+    let prefixLength: Int
 }
 
 private final class PromptCache {
     private var entries: [PromptCacheEntry] = []
     private let maxSize: Int
+    /// Don't reuse a state that shares only a handful of tokens — the prefill we
+    /// would save is dwarfed by the copy + trim overhead.
+    private let minPrefix: Int
 
-    init(maxSize: Int = 2) { self.maxSize = maxSize }
-
-    /// Return the entry whose token sequence exactly matches, and promote it
-    /// to the front of the LRU list.
-    func lookup(tokenIds: [Int32]) -> PromptCacheEntry? {
-        guard !tokenIds.isEmpty,
-              let idx = entries.firstIndex(where: { $0.tokenIds == tokenIds })
-        else { return nil }
-        let entry = entries.remove(at: idx)
-        entries.insert(entry, at: 0)
-        return entry
+    init(maxSize: Int = 2, minPrefix: Int = 16) {
+        self.maxSize = maxSize
+        self.minPrefix = minPrefix
     }
 
-    /// Insert (or replace) an entry for the given token sequence, evicting the
-    /// least-recently-used entry if the cache is full.
+    /// Return the cached entry sharing the longest token prefix with `tokenIds`
+    /// (at least `minPrefix` tokens), promoting it to the front of the LRU list.
+    func lookup(tokenIds: [Int32]) -> PromptCacheHit? {
+        guard !tokenIds.isEmpty else { return nil }
+        var bestIdx: Int? = nil
+        var bestLen = 0
+        for (i, e) in entries.enumerated() {
+            let l = commonPrefixLength(e.tokenIds, tokenIds)
+            if l > bestLen { bestLen = l; bestIdx = i }
+        }
+        guard let idx = bestIdx, bestLen >= minPrefix else { return nil }
+        let entry = entries.remove(at: idx)
+        entries.insert(entry, at: 0)
+        return PromptCacheHit(entry: entry, prefixLength: bestLen)
+    }
+
+    /// Insert (or replace) the entry for `tokenIds`. Any existing entry whose
+    /// token sequence is a prefix of the new one is dropped — the new entry
+    /// supersedes it for every future lookup. Evicts the LRU entry if the cache
+    /// is over capacity.
     func save(tokenIds: [Int32], kvCache: [any KVCache]) {
         guard !tokenIds.isEmpty else { return }
-        entries.removeAll { $0.tokenIds == tokenIds }
+        entries.removeAll { commonPrefixLength($0.tokenIds, tokenIds) == $0.tokenIds.count }
         entries.insert(PromptCacheEntry(tokenIds: tokenIds, kvCache: kvCache), at: 0)
         if entries.count > maxSize { entries.removeLast() }
     }
@@ -273,6 +310,21 @@ private func deepCopyCache(_ layer: any KVCache) -> any KVCache {
     return copied
 }
 
+/// Take an independent snapshot of a live KV cache for the prompt cache.
+///
+/// `KVCacheSimple` layers are 4-bit-quantized — roughly a quarter of the f16
+/// footprint, and `trim()` just decrements the offset so prefix reuse is
+/// unaffected. Every other cache type is deep-copied as-is. The result is safe
+/// to retain while the live cache keeps being mutated by generation.
+private func snapshotCache(_ cache: [any KVCache]) -> [any KVCache] {
+    cache.map { layer in
+        if let simple = layer as? KVCacheSimple {
+            return simple.toQuantized(groupSize: 64, bits: 4)
+        }
+        return deepCopyCache(layer)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // mlx_chat_generate
 // ---------------------------------------------------------------------------
@@ -322,48 +374,52 @@ public func mlxChatGenerate(
                     tokenizer: context.tokenizer, messages: msgs)
                 let tokenIds = rawIds.map { Int32($0) }
 
-                // --- Prompt KV cache ---
-                // On a hit we restore the saved KV state (trimmed by 1 token),
-                // then feed only the last prompt token to TokenIterator so that
-                // prefill is a single decode step instead of N steps.
-                // On a miss we run full prefill and snapshot the resulting cache
-                // (before generation) for the next call with the same prompt.
+                // --- Prompt KV cache (prefix reuse) ---
+                // Look for a cached state sharing a token prefix with this
+                // prompt. On a hit we restore that state, trim it back to the
+                // shared-prefix length, and prefill only the new tokens; on a
+                // miss we prefill the whole prompt into a fresh cache. Either
+                // way the live cache is re-snapshotted after generation (so it
+                // covers prompt + generated tokens) for the next prefix lookup.
+                let liveCache: [any KVCache]
                 var iterator: TokenIterator
-                if let entry = state.promptCache.lookup(tokenIds: tokenIds) {
-                    // HIT: restore cache at offset N-1, run last token only.
-                    let restoredCache = entry.kvCache.map { deepCopyCache($0) }
-                    trimPromptCache(restoredCache, numTokens: 1)
-                    let seedInput = LMInput(tokens: MLXArray([entry.lastTokenId]))
+
+                if let hit = state.promptCache.lookup(tokenIds: tokenIds),
+                   canTrimPromptCache(hit.entry.kvCache) {
+                    let restored = hit.entry.kvCache.map { deepCopyCache($0) }
+                    let cachedLen = hit.entry.tokenIds.count
+                    let prefixLen = hit.prefixLength      // 1 ≤ prefixLen ≤ tokenIds.count, ≤ cachedLen
+
+                    // Roll the restored state back to the shared prefix.
+                    if cachedLen > prefixLen {
+                        trimPromptCache(restored, numTokens: cachedLen - prefixLen)
+                    }
+
+                    let seedTokens: [Int32]
+                    if prefixLen < tokenIds.count {
+                        seedTokens = Array(tokenIds[prefixLen...])
+                    } else {
+                        // Whole prompt already cached — re-process just the last
+                        // token so TokenIterator has logits to sample from.
+                        trimPromptCache(restored, numTokens: 1)
+                        seedTokens = [tokenIds[tokenIds.count - 1]]
+                    }
+
+                    liveCache = restored
                     iterator = try TokenIterator(
-                        input: seedInput,
+                        input: LMInput(tokens: MLXArray(seedTokens)),
                         model: context.model,
-                        cache: restoredCache,
+                        cache: liveCache,
                         parameters: params
                     )
                 } else {
-                    // MISS: full prefill.  We own the cache object so we can
-                    // snapshot it (via copy()) immediately after init — the KVCache
-                    // instances are classes and are mutated in-place by TokenIterator,
-                    // so ownedCache already reflects the post-prefill state.
-                    let ownedCache = makePromptCache(model: context.model, parameters: params)
-                    let lmInput = LMInput(tokens: MLXArray(tokenIds))
+                    liveCache = makePromptCache(model: context.model, parameters: params)
                     iterator = try TokenIterator(
-                        input: lmInput,
+                        input: LMInput(tokens: MLXArray(tokenIds)),
                         model: context.model,
-                        cache: ownedCache,
+                        cache: liveCache,
                         parameters: params
                     )
-                    // Snapshot at offset=N (all prompt tokens processed, before decode).
-                    // Use toQuantized() to create independent data — .copy() uses
-                    // MLXArray views that share the underlying buffer, so mutations
-                    // during generation corrupt the "snapshot".
-                    let snapshot: [any KVCache] = ownedCache.map { layer in
-                        if let simple = layer as? KVCacheSimple {
-                            return simple.toQuantized(groupSize: 64, bits: 4)
-                        }
-                        return deepCopyCache(layer)
-                    }
-                    state.promptCache.save(tokenIds: tokenIds, kvCache: snapshot)
                 }
 
                 var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
@@ -379,7 +435,11 @@ public func mlxChatGenerate(
                 }
 
                 var cancelled = false
+                var generatedTokenIds: [Int32] = []
                 while let tokenId = iterator.next() {
+                    // TokenIterator has appended `tokenId` to liveCache by now,
+                    // so liveCache.offset == tokenIds.count + generatedTokenIds.count.
+                    generatedTokenIds.append(Int32(tokenId))
                     if stopTokenIds.contains(tokenId) { break }
                     generated += 1
                     detokenizer.append(token: tokenId)
@@ -397,6 +457,12 @@ public func mlxChatGenerate(
                 if !cancelled, let chunk = detokenizer.next() {
                     _ = chunk.withCString { ptr in callback(ptr, callbackCtx) }
                 }
+
+                // Snapshot the live cache — now covering prompt + generated
+                // tokens — for the next turn's prefix lookup.
+                state.promptCache.save(
+                    tokenIds: tokenIds + generatedTokenIds,
+                    kvCache: snapshotCache(liveCache))
 
                 Stream().synchronize()
             }
