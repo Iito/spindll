@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 use crate::backend::llamacpp::LlamaCppModel;
 use crate::backend::{BackendLoadParams, BackendModel, InferenceBackend};
 use crate::model_store::registry::ModelFormat;
+use super::device::DeviceTarget;
 
 use super::batch::{BatchEvent, BatchRequest, BatchScheduler};
 use super::kv_cache::KvCache;
@@ -48,6 +49,8 @@ pub struct LoadOptions {
     pub priority: EvictionPriority,
     /// Reload this long after eviction under VRAM pressure. `None` disables.
     pub idle_reload: Option<Duration>,
+    /// Target device for this model (e.g. cuda:0, metal, mlx, cpu).
+    pub device: DeviceTarget,
 }
 
 /// A model that has been loaded into memory and is ready for inference.
@@ -78,6 +81,8 @@ pub struct LoadedModel {
     pub batch_tx: Option<std::sync::mpsc::Sender<BatchRequest>>,
     pub priority: EvictionPriority,
     pub idle_reload: Option<Duration>,
+    /// Device this model was loaded onto (for status reporting).
+    pub device: String,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +91,7 @@ struct PendingReload {
     path: PathBuf,
     digest: String,
     gpu_layers: Option<u32>,
+    device: DeviceTarget,
     priority: EvictionPriority,
     idle_reload: Duration,
 }
@@ -98,6 +104,7 @@ pub struct ModelManager {
     models: RwLock<HashMap<String, LoadedModel>>,
     default_n_ctx: u32,
     default_gpu_layers: u32,
+    default_device: DeviceTarget,
     memory_budget: u64,
     clamp_budget_to_live: bool,
     kv_cache: Option<KvCache>,
@@ -188,6 +195,7 @@ impl ModelManager {
             models: RwLock::new(HashMap::new()),
             default_n_ctx: n_ctx,
             default_gpu_layers,
+            default_device: DeviceTarget::Auto,
             memory_budget,
             clamp_budget_to_live,
             kv_cache: None,
@@ -202,6 +210,10 @@ impl ModelManager {
         })
     }
 
+    pub fn set_default_device(&mut self, device: DeviceTarget) {
+        self.default_device = device;
+    }
+
     #[cfg(test)]
     pub fn with_backends(backends: Vec<Box<dyn InferenceBackend>>, memory_budget: u64) -> Self {
         Self {
@@ -209,6 +221,7 @@ impl ModelManager {
             models: RwLock::new(HashMap::new()),
             default_n_ctx: 2048,
             default_gpu_layers: 0,
+            default_device: DeviceTarget::Auto,
             memory_budget,
             clamp_budget_to_live: memory_budget > 0,
             kv_cache: None,
@@ -299,6 +312,7 @@ impl ModelManager {
                         path: model.file_path.clone(),
                         digest: model.digest.clone(),
                         gpu_layers: model.requested_gpu_layers,
+                        device: model.device.parse().unwrap_or_default(),
                         priority: model.priority,
                         idle_reload: d,
                     });
@@ -307,16 +321,28 @@ impl ModelManager {
         }
     }
 
-    fn backend_for_format(&self, format: &ModelFormat) -> anyhow::Result<&dyn InferenceBackend> {
-        let target = match format {
-            ModelFormat::Gguf => "llamacpp",
-            ModelFormat::Mlx => "mlx",
+    fn backend_for_device(
+        &self,
+        device: &DeviceTarget,
+        format: &ModelFormat,
+    ) -> anyhow::Result<&dyn InferenceBackend> {
+        let target = match device {
+            DeviceTarget::Mlx => "mlx",
+            DeviceTarget::Cuda(_) | DeviceTarget::Vulkan(_) | DeviceTarget::Cpu => "llamacpp",
+            DeviceTarget::Metal => match format {
+                ModelFormat::Mlx => "mlx",
+                ModelFormat::Gguf => "llamacpp",
+            },
+            DeviceTarget::Auto => match format {
+                ModelFormat::Gguf => "llamacpp",
+                ModelFormat::Mlx => "mlx",
+            },
         };
         self.backends
             .iter()
             .find(|b| b.name() == target)
             .map(|b| b.as_ref())
-            .ok_or_else(|| anyhow::anyhow!("no backend available for {target} format"))
+            .ok_or_else(|| anyhow::anyhow!("no {target} backend available for device {device}"))
     }
 
     fn infer_format(path: &Path) -> ModelFormat {
@@ -364,9 +390,16 @@ impl ModelManager {
         opts: LoadOptions,
     ) -> anyhow::Result<()> {
         self.cancel_watcher(name);
-        let LoadOptions { gpu_layers, digest, priority, idle_reload } = opts;
+        let LoadOptions { gpu_layers, digest, priority, idle_reload, device } = opts;
+        let device = if device == DeviceTarget::Auto {
+            self.default_device.clone()
+        } else {
+            device
+        };
         let format = Self::infer_format(path);
-        let backend = self.backend_for_format(&format)?;
+        device.validate_for_format(&format)?;
+
+        let backend = self.backend_for_device(&device, &format)?;
         let from_ram_cache = self
             .ram_cache
             .as_ref()
@@ -403,12 +436,17 @@ impl ModelManager {
         };
         let load_budget = load_budget.saturating_sub(planned_scheduler_bytes);
 
-        let layers = gpu_layers.unwrap_or(self.default_gpu_layers);
+        let layers = if device.force_cpu() {
+            0
+        } else {
+            gpu_layers.unwrap_or(self.default_gpu_layers)
+        };
 
         let load_params = BackendLoadParams {
             n_ctx: self.default_n_ctx,
             n_gpu_layers: Some(layers),
             memory_budget: load_budget,
+            main_gpu: device.main_gpu(),
         };
 
         let model = backend.load_model(path, load_params)?;
@@ -423,14 +461,20 @@ impl ModelManager {
         let n_ctx_train = model.n_ctx_train();
         let size_bytes = model.size_bytes();
 
-        // Scheduler needs its own GGUF model copy.
+        // Scheduler needs its own GGUF model copy pinned to the same device.
         let batch_tx = if self.batch_slots > 0 && model.supports_batching() {
             let (tx, rx) = std::sync::mpsc::channel::<BatchRequest>();
             let max_seq = self.batch_slots;
             let model_name = name.to_string();
 
             let sched_backend = crate::backend::llamacpp::shared_backend();
-            let sched_params = LlamaModelParams::default().with_n_gpu_layers(layers);
+            let mut sched_params = LlamaModelParams::default().with_n_gpu_layers(layers);
+            if let Some(gpu_id) = device.main_gpu() {
+                use llama_cpp_2::model::params::LlamaSplitMode;
+                sched_params = sched_params
+                    .with_main_gpu(gpu_id)
+                    .with_split_mode(LlamaSplitMode::None);
+            }
             let sched_model = LlamaModel::load_from_file(sched_backend, path, &sched_params)
                 .map_err(|e| anyhow::anyhow!("failed to load scheduler model: {e}"))?;
 
@@ -450,6 +494,7 @@ impl ModelManager {
             None
         };
 
+        let device_label = device.to_string();
         let scheduler_size_bytes = if batch_tx.is_some() { size_bytes } else { 0 };
         let loaded = LoadedModel {
             model,
@@ -466,6 +511,7 @@ impl ModelManager {
             batch_tx,
             priority,
             idle_reload,
+            device: device_label,
         };
 
         self.models.write().unwrap().insert(name.to_string(), loaded);
@@ -521,8 +567,8 @@ impl ModelManager {
         self.models.read().unwrap().contains_key(name)
     }
 
-    /// List all loaded models as `(name, memory_bytes, gpu_layers, digest, n_ctx, n_ctx_train)` tuples.
-    pub fn loaded_models(&self) -> Vec<(String, u64, u32, String, u32, u32)> {
+    /// List all loaded models as `(name, memory_bytes, gpu_layers, digest, n_ctx, n_ctx_train, device)` tuples.
+    pub fn loaded_models(&self) -> Vec<(String, u64, u32, String, u32, u32, String)> {
         self.models
             .read()
             .unwrap()
@@ -535,6 +581,7 @@ impl ModelManager {
                     m.digest.clone(),
                     m.n_ctx,
                     m.n_ctx_train,
+                    m.device.clone(),
                 )
             })
             .collect()
@@ -968,6 +1015,7 @@ async fn reload_watcher(weak: Weak<ModelManager>, spec: PendingReload) {
             digest: spec.digest.clone(),
             priority: spec.priority,
             idle_reload: Some(spec.idle_reload),
+            device: spec.device.clone(),
         };
         let mgr_blocking = mgr.clone();
         let path = spec.path.clone();
