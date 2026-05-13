@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::model::params::{LlamaModelParams, LlamaSplitMode};
 use llama_cpp_2::model::{AddBos, LlamaModel};
 
 use crate::engine::streaming::{GenerateParams, GenerateResult, generate_streaming};
@@ -106,7 +106,12 @@ impl InferenceBackend for LlamaCppBackend {
             0
         });
 
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
+        let mut model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
+        if let Some(gpu_id) = params.main_gpu {
+            model_params = model_params
+                .with_main_gpu(gpu_id)
+                .with_split_mode(LlamaSplitMode::None);
+        }
         let model = LlamaModel::load_from_file(shared_backend(), path, &model_params)
             .map_err(|e| anyhow::anyhow!("failed to load model: {e}"))?;
 
@@ -115,19 +120,25 @@ impl InferenceBackend for LlamaCppBackend {
         let n_ctx = resolve_n_ctx(&model, params.n_ctx, n_ctx_train, size_bytes, params.memory_budget);
 
         let device = if gpu_layers == 0 {
-            "cpu"
+            "cpu".to_string()
         } else if cfg!(target_os = "macos") || cfg!(feature = "metal") {
-            "metal"
+            "metal".to_string()
         } else if cfg!(feature = "cuda") {
-            "cuda"
+            match params.main_gpu {
+                Some(id) => format!("cuda:{id}"),
+                None => "cuda".to_string(),
+            }
         } else if cfg!(feature = "vulkan") {
-            "vulkan"
+            match params.main_gpu {
+                Some(id) => format!("vulkan:{id}"),
+                None => "vulkan".to_string(),
+            }
         } else {
-            "cpu"
+            "cpu".to_string()
         };
         tracing::info!(
             layers = model.n_layer(),
-            device,
+            %device,
             size_bytes,
             n_ctx,
             n_ctx_train,

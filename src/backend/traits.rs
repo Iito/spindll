@@ -11,6 +11,10 @@ pub struct BackendLoadParams {
     /// model's weights are mmap'd. 0 = unlimited. Backends that auto-size
     /// n_ctx use this as the budget ceiling.
     pub memory_budget: u64,
+    /// Target GPU device index for multi-GPU systems. When `Some`, the
+    /// backend pins the model to this device and disables cross-GPU layer
+    /// splitting (split_mode = None). `None` = default device selection.
+    pub main_gpu: Option<i32>,
 }
 
 pub trait InferenceBackend: Send + Sync {
