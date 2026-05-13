@@ -104,7 +104,7 @@ async fn models(State(state): State<AppState>) -> impl IntoResponse {
         .manager
         .loaded_models()
         .into_iter()
-        .map(|(name, _, _, _, n_ctx, n_ctx_train)| (name, (n_ctx, n_ctx_train)))
+        .map(|(name, _, _, _, n_ctx, n_ctx_train, _)| (name, (n_ctx, n_ctx_train)))
         .collect();
 
     let list: Vec<ModelInfo> = reg
@@ -254,6 +254,8 @@ struct LoadRequest {
     model: String,
     #[serde(default)]
     gpu_layers: Option<i32>,
+    #[serde(default)]
+    device: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -281,8 +283,24 @@ async fn load(
     };
     let digest = state.store.resolve_model_digest(&req.model).unwrap_or_default();
     let gpu_layers = req.gpu_layers.and_then(|l| if l < 0 { None } else { Some(l as u32) });
+    let device: crate::engine::DeviceTarget = match req.device.as_deref().unwrap_or("auto").parse() {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
 
-    match state.manager.load_model_with_digest(&req.model, &path, gpu_layers, digest) {
+    let opts = crate::engine::LoadOptions {
+        gpu_layers,
+        digest,
+        device,
+        ..Default::default()
+    };
+    match state.manager.load_model_with_options(&req.model, &path, opts) {
         Ok(()) => Json(LoadResponse { already_loaded: false }).into_response(),
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
