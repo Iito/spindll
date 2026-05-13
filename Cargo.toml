@@ -36,6 +36,8 @@ mlx    = []
 # In-process benchmark command (spindll bench).
 # Usage: cargo build --features cli,bench
 bench  = ["cli"]
+# Vision / multimodal support via llama.cpp's mtmd (multimodal) API.
+vision = ["llama-cpp-2/mtmd", "dep:base64"]
 
 [dependencies]
 # Core — always compiled
@@ -61,6 +63,9 @@ sysinfo      = "0.35"
 memory-stats = "1"
 libc         = "0.2"
 urlencoding  = "2"
+
+# vision (optional)
+base64 = { version = "0.22", optional = true }
 
 # http server (optional)
 axum       = { version = "0.8", features = ["macros"], optional = true }

@@ -53,6 +53,34 @@ fn send_usage(
     }
 }
 
+/// Convert proto `Message` list with `parts` into engine `MultimodalMessage` list.
+#[cfg(feature = "vision")]
+fn proto_to_multimodal(messages: &[crate::proto::Message]) -> Vec<crate::engine::MultimodalMessage> {
+    use crate::engine::multimodal::{ContentPart, MultimodalMessage};
+
+    messages.iter().map(|m| {
+        if m.parts.is_empty() {
+            // Text-only message — wrap content as a single Text part.
+            MultimodalMessage {
+                role: m.role.clone(),
+                content: vec![ContentPart::Text(m.content.clone())],
+            }
+        } else {
+            let content = m.parts.iter().map(|p| {
+                if p.r#type == "image" {
+                    ContentPart::ImageBytes {
+                        data: p.image_data.clone(),
+                        media_type: if p.media_type.is_empty() { None } else { Some(p.media_type.clone()) },
+                    }
+                } else {
+                    ContentPart::Text(p.text.clone())
+                }
+            }).collect();
+            MultimodalMessage { role: m.role.clone(), content }
+        }
+    }).collect()
+}
+
 #[tonic::async_trait]
 impl Spindll for SpindllService {
     type GenerateStream = ReceiverStream<Result<GenerateResponse, Status>>;
@@ -131,27 +159,66 @@ impl Spindll for SpindllService {
                 }
             }
 
-            let messages: Vec<_> = req.messages.iter()
-                .map(|m| (m.role.clone(), m.content.clone()))
-                .collect();
             let params = proto_params_to_engine(req.params);
-            let enc_key: Option<[u8; 32]> = if req.encryption_key.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&req.encryption_key);
-                Some(arr)
-            } else {
-                None
-            };
             let start = std::time::Instant::now();
 
-            let result = mgr.generate_chat(&req.model, &messages, &params, enc_key.as_ref(), |token| {
-                let resp = ChatResponse {
-                    token: token.to_string(),
-                    done: false,
-                    usage: None,
+            // Check if any message has multimodal content parts.
+            #[cfg(feature = "vision")]
+            let has_parts = req.messages.iter().any(|m| !m.parts.is_empty());
+
+            #[cfg(feature = "vision")]
+            let result = if has_parts {
+                let mm_messages = proto_to_multimodal(&req.messages);
+                mgr.generate_chat_multimodal(&req.model, &mm_messages, &params, |token| {
+                    let resp = ChatResponse {
+                        token: token.to_string(),
+                        done: false,
+                        usage: None,
+                    };
+                    tx.blocking_send(Ok(resp)).is_ok()
+                })
+            } else {
+                let messages: Vec<_> = req.messages.iter()
+                    .map(|m| (m.role.clone(), m.content.clone()))
+                    .collect();
+                let enc_key: Option<[u8; 32]> = if req.encryption_key.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&req.encryption_key);
+                    Some(arr)
+                } else {
+                    None
                 };
-                tx.blocking_send(Ok(resp)).is_ok()
-            });
+                mgr.generate_chat(&req.model, &messages, &params, enc_key.as_ref(), |token| {
+                    let resp = ChatResponse {
+                        token: token.to_string(),
+                        done: false,
+                        usage: None,
+                    };
+                    tx.blocking_send(Ok(resp)).is_ok()
+                })
+            };
+
+            #[cfg(not(feature = "vision"))]
+            let result = {
+                let messages: Vec<_> = req.messages.iter()
+                    .map(|m| (m.role.clone(), m.content.clone()))
+                    .collect();
+                let enc_key: Option<[u8; 32]> = if req.encryption_key.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&req.encryption_key);
+                    Some(arr)
+                } else {
+                    None
+                };
+                mgr.generate_chat(&req.model, &messages, &params, enc_key.as_ref(), |token| {
+                    let resp = ChatResponse {
+                        token: token.to_string(),
+                        done: false,
+                        usage: None,
+                    };
+                    tx.blocking_send(Ok(resp)).is_ok()
+                })
+            };
 
             match result {
                 Err(e) => {
@@ -300,7 +367,14 @@ impl Spindll for SpindllService {
             .load_model_with_options(
                 &req.model,
                 &model_path,
-                LoadOptions { gpu_layers, digest, priority, idle_reload },
+                LoadOptions {
+                    gpu_layers,
+                    digest,
+                    priority,
+                    idle_reload,
+                    #[cfg(feature = "vision")]
+                    mmproj_path: self.model_store.resolve_mmproj_path(&req.model).unwrap_or(None),
+                },
             )
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -487,6 +561,7 @@ mod tests {
             format: ModelFormat::Gguf,
             base_model: String::new(),
             source: ModelSource::HfSourceDownloaded,
+            mmproj_path: None,
         });
         reg.add("mlx-community/Llama-3.1-8B-4bit".into(), ModelEntry {
             repo: "mlx-community/Llama-3.1-8B-4bit".into(),
@@ -503,6 +578,7 @@ mod tests {
             format: ModelFormat::Mlx,
             base_model: "llama3.1-8b".into(),
             source: ModelSource::HfSourceDownloaded,
+            mmproj_path: None,
         });
         reg.save(&store.registry_path()).unwrap();
 

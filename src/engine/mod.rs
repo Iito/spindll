@@ -5,6 +5,8 @@ pub mod kv_cache;
 pub mod kv_ram_cache;
 pub mod manager;
 pub mod metrics;
+#[cfg(feature = "vision")]
+pub mod multimodal;
 pub mod ram_cache;
 pub mod streaming;
 
@@ -13,6 +15,8 @@ pub use kv_cache::KvCache;
 pub use kv_ram_cache::KvRamCache;
 pub use manager::{EvictionPriority, LoadOptions, ModelManager};
 pub use metrics::Metrics;
+#[cfg(feature = "vision")]
+pub use multimodal::{ContentPart, MultimodalMessage};
 pub use ram_cache::RamCache;
 pub use streaming::{GenerateParams, GenerateResult};
 

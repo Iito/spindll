@@ -88,6 +88,8 @@ pub enum HfDownload {
         size: u64,
         /// SHA-256 digest.
         digest: String,
+        /// Path to the multimodal projector GGUF, if one was found alongside.
+        mmproj_path: Option<PathBuf>,
     },
     /// An MLX safetensors directory was downloaded.
     Mlx {
@@ -172,12 +174,35 @@ pub fn download_hf_auto(
         let first = first_dest.expect("targets is non-empty");
         let digest = sha256_file(&first)?;
 
+        // Download mmproj sibling if present (e.g. *mmproj*.gguf).
+        let mmproj_path = {
+            let mmproj_sibling = info
+                .siblings
+                .iter()
+                .find(|s| {
+                    let lower = s.rfilename.to_lowercase();
+                    lower.contains("mmproj") && lower.ends_with(".gguf")
+                });
+            if let Some(mmproj) = mmproj_sibling {
+                tracing::info!(file = %mmproj.rfilename, "downloading mmproj");
+                let cached = repo.get(&mmproj.rfilename)?;
+                let dest = dest_dir.join(&mmproj.rfilename);
+                if !dest.exists() {
+                    link_or_copy(&cached, &dest)?;
+                }
+                Some(dest)
+            } else {
+                None
+            }
+        };
+
         tracing::info!(path = %first.display(), shards = targets.len(), "GGUF download complete");
         return Ok(HfDownload::Gguf {
             path: first,
             filename: target.rfilename.clone(),
             size: total_size,
             digest,
+            mmproj_path,
         });
     }
 

@@ -43,6 +43,26 @@ const char* mlx_apply_chat_template(
     const char*     messages_json
 );
 
+// Chat generation with image input for VLM models.
+// `messages_json` is a UTF-8 JSON array: [{"role":"user","content":"..."}, ...].
+// `image_path` is a NUL-terminated file path to an image (JPEG/PNG/etc),
+// or NULL for text-only requests with a VLM model.
+// Returns the number of completion tokens generated, or -1 on error.
+int32_t mlx_chat_generate_vision(
+    MlxModelHandle*  handle,
+    const char*      messages_json,
+    const char*      image_path,
+    uint32_t         max_tokens,
+    float            temperature,
+    float            top_p,
+    uint32_t         seed,
+    MlxTokenCallback callback,
+    void*            user_data
+);
+
+// Returns 1 if the model was loaded as a VLM (supports vision), 0 otherwise.
+int32_t mlx_model_is_vlm(MlxModelHandle* handle);
+
 // Release a string previously returned by mlx_apply_chat_template.
 // Safe to call with NULL.
 void mlx_free_string(const char* s);

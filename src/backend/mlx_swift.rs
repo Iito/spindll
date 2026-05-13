@@ -45,6 +45,20 @@ unsafe extern "C" {
         callback_ctx:  *mut c_void,
     ) -> i32;
 
+    fn mlx_chat_generate_vision(
+        handle:        *mut MlxModelHandle,
+        messages_json: *const c_char,
+        image_path:    *const c_char,
+        max_tokens:    u32,
+        temperature:   f32,
+        top_p:         f32,
+        seed:          u32,
+        callback:      unsafe extern "C" fn(*const c_char, *mut c_void) -> c_int,
+        callback_ctx:  *mut c_void,
+    ) -> i32;
+
+    fn mlx_model_is_vlm(handle: *mut MlxModelHandle) -> i32;
+
     fn mlx_apply_chat_template(
         handle:        *mut MlxModelHandle,
         messages_json: *const c_char,
@@ -145,6 +159,8 @@ pub struct MlxSwiftEngine {
     pub model_size_bytes: u64,
     /// Per-token KV bytes from config.json. 0 if config incomplete.
     pub kv_bytes_per_token: u64,
+    /// True if the model was loaded as a VLM (supports vision input).
+    pub is_vlm: bool,
 }
 
 // The handle is an opaque pointer managed by Swift ARC; it is never aliased.
@@ -194,11 +210,14 @@ impl MlxSwiftEngine {
             })
             .unwrap_or(0);
 
+        let is_vlm = unsafe { mlx_model_is_vlm(handle) } != 0;
+
         Ok(Self {
             handle,
             model_n_ctx,
             model_size_bytes,
             kv_bytes_per_token,
+            is_vlm,
         })
     }
 
@@ -370,6 +389,127 @@ impl MlxSwiftEngine {
             cache_hit:         false,
         })
     }
+
+    /// Vision-aware chat generation: sends messages + image bytes to the Swift
+    /// VLM pipeline. The image is attached to the last user message.
+    /// Vision-aware chat generation: sends messages + image file path to the
+    /// Swift VLM pipeline. The image is attached to the last user message.
+    #[cfg(feature = "vision")]
+    fn vision_generate_dyn(
+        &self,
+        messages: &[crate::engine::MultimodalMessage],
+        params: &GenerateParams,
+        on_token: &mut dyn FnMut(&str) -> bool,
+    ) -> anyhow::Result<GenerateResult> {
+        use crate::engine::ContentPart;
+
+        // Build JSON messages (role + content text only — image goes via file path).
+        let json: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| {
+                let text: String = m.content.iter().filter_map(|p| match p {
+                    ContentPart::Text(t) => Some(t.as_str()),
+                    _ => None,
+                }).collect::<Vec<_>>().join("");
+                serde_json::json!({ "role": &m.role, "content": text })
+            })
+            .collect();
+        let json_str = serde_json::to_string(&json)
+            .map_err(|e| anyhow::anyhow!("failed to encode chat messages: {e}"))?;
+        let c_json = CString::new(json_str)?;
+
+        // Extract the first image and write to a temp file so Swift can load via URL.
+        let _tmp_path: Option<std::path::PathBuf>; // clean up after generation
+        let c_image_path: Option<CString> = {
+            let image_bytes = messages.iter().rev().find_map(|m| {
+                m.content.iter().find_map(|p| match p {
+                    ContentPart::ImageBytes { data, media_type } => Some((data, media_type)),
+                    _ => None,
+                })
+            });
+            if let Some((data, media_type)) = image_bytes {
+                let ext = match media_type.as_deref() {
+                    Some("image/jpeg") => "jpg",
+                    Some("image/png") => "png",
+                    Some("image/gif") => "gif",
+                    Some("image/webp") => "webp",
+                    _ => "jpg",
+                };
+                let path = std::env::temp_dir().join(format!("spindll_vlm_{}.{ext}", std::process::id()));
+                std::fs::write(&path, data)
+                    .map_err(|e| anyhow::anyhow!("failed to write temp image: {e}"))?;
+                let path_str = path.to_str()
+                    .ok_or_else(|| anyhow::anyhow!("temp path not UTF-8"))?
+                    .to_string();
+                _tmp_path = Some(path);
+                Some(CString::new(path_str)?)
+            } else {
+                _tmp_path = None;
+                None
+            }
+        };
+
+        let (tx, rx) = mpsc::sync_channel::<String>(64);
+        let sender = Box::new(TokenSender { tx });
+
+        let handle_addr: usize = self.handle as usize;
+        let sender_addr: usize = Box::into_raw(sender) as usize;
+
+        let max_tok = params.max_tokens;
+        let temp    = params.temperature;
+        let top_p   = params.top_p;
+        let seed    = params.seed;
+
+        let join = std::thread::spawn(move || {
+            let h = handle_addr as *mut MlxModelHandle;
+            let s = sender_addr as *mut TokenSender;
+            let img_ptr = c_image_path.as_ref()
+                .map(|p| p.as_ptr())
+                .unwrap_or(std::ptr::null());
+            let result = unsafe {
+                mlx_chat_generate_vision(
+                    h,
+                    c_json.as_ptr(),
+                    img_ptr,
+                    max_tok,
+                    temp,
+                    top_p,
+                    seed,
+                    token_callback,
+                    s as *mut c_void,
+                )
+            };
+            drop(unsafe { Box::from_raw(s) });
+            result
+        });
+
+        let mut completion_tokens = 0u32;
+        for token in &rx {
+            if token.is_empty() { continue; }
+            completion_tokens += 1;
+            if !on_token(&token) { break; }
+        }
+        drop(rx);
+
+        let raw_result = join
+            .join()
+            .map_err(|_| anyhow::anyhow!("MLX vision generation thread panicked"))?;
+
+        // Clean up temp image file.
+        if let Some(ref p) = _tmp_path {
+            let _ = std::fs::remove_file(p);
+        }
+
+        if raw_result < 0 {
+            anyhow::bail!(
+                "mlx_chat_generate_vision returned error ({}) — check server \
+                 logs for [mlx-bridge] diagnostics",
+                raw_result,
+            );
+        }
+
+        Ok(GenerateResult { prompt_tokens: 0, completion_tokens, cache_hit: false })
+    }
 }
 
 impl BackendModel for MlxSwiftEngine {
@@ -477,6 +617,24 @@ impl BackendModel for MlxSwiftEngine {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    #[cfg(feature = "vision")]
+    fn supports_vision(&self) -> bool {
+        self.is_vlm
+    }
+
+    #[cfg(feature = "vision")]
+    fn generate_multimodal(
+        &self,
+        messages: &[crate::engine::MultimodalMessage],
+        params: &GenerateParams,
+        on_token: &mut dyn FnMut(&str) -> bool,
+    ) -> anyhow::Result<GenerateResult> {
+        if !self.is_vlm {
+            anyhow::bail!("model was loaded as text-only (LLM), not a vision model (VLM)");
+        }
+        self.vision_generate_dyn(messages, params, on_token)
     }
 }
 

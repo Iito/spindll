@@ -244,6 +244,7 @@ async fn run_once_grpc(
         messages: vec![Message {
             role: "user".to_string(),
             content: prompt.to_string(),
+            parts: vec![],
         }],
         params: Some(GenerateParams {
             temperature: Some(args.temperature),

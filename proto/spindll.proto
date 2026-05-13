@@ -72,6 +72,15 @@ message ChatResponse {
 message Message {
   string role = 1;     // "system", "user", "assistant"
   string content = 2;
+  // Multimodal content parts (vision). When non-empty, these replace `content`.
+  repeated ContentPart parts = 3;
+}
+
+message ContentPart {
+  string type = 1;     // "text" or "image"
+  string text = 2;     // populated when type == "text"
+  bytes image_data = 3;   // populated when type == "image"
+  string media_type = 4;  // e.g. "image/png" (optional)
 }
 
 message GenerateParams {
