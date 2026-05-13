@@ -51,6 +51,10 @@ enum Commands {
         #[arg(long)]
         gpu_layers: Option<u32>,
 
+        /// Default device target (auto, cpu, metal, cuda:N, vulkan:N, mlx)
+        #[arg(long, default_value = "auto")]
+        device: String,
+
         /// Memory budget for loaded models (e.g. "8G", omit for full live availability)
         #[arg(long)]
         budget: Option<String>,
@@ -111,6 +115,10 @@ enum Commands {
         /// Max tokens to generate
         #[arg(long, default_value = "512")]
         max_tokens: u32,
+
+        /// Device target (auto, cpu, metal, cuda:N, vulkan:N, mlx)
+        #[arg(long, default_value = "auto")]
+        device: String,
     },
 
     /// Benchmark one or two models (GGUF vs GGUF, MLX vs MLX, or mixed)
@@ -306,6 +314,7 @@ fn bench_by_format(
         n_ctx: ctx_size,
         n_gpu_layers: None,
         memory_budget: 0,
+        main_gpu: None,
     };
     let model = backend.load_model(path, load_params)?;
     let params = spindll::engine::GenerateParams {
@@ -421,6 +430,7 @@ async fn main() -> anyhow::Result<()> {
             port,
             ctx_size,
             gpu_layers,
+            device,
             budget,
             kv_cache,
             no_kv_cache,
@@ -430,6 +440,7 @@ async fn main() -> anyhow::Result<()> {
             ram_cache,
             http_port,
         } => {
+            let default_device: spindll::engine::DeviceTarget = device.parse()?;
             let mem = spindll::scheduler::budget::MemoryBudget::detect(budget.as_deref());
             const GB: f64 = 1_073_741_824.0;
             println!(
@@ -440,6 +451,7 @@ async fn main() -> anyhow::Result<()> {
             );
             let mut manager =
                 spindll::engine::ModelManager::new(ctx_size, gpu_layers, mem.budget)?;
+            manager.set_default_device(default_device);
 
             if !no_kv_cache {
                 let bytes = kv_cache
@@ -521,7 +533,9 @@ async fn main() -> anyhow::Result<()> {
             kv_cache,
             system,
             max_tokens,
+            device,
         } => {
+            let device: spindll::engine::DeviceTarget = device.parse()?;
             let store = spindll::model_store::ModelStore::new(None);
             let model_path = store.resolve_model_path(&model)?;
             let digest = store.resolve_model_digest(&model).unwrap_or_default();
@@ -536,7 +550,12 @@ async fn main() -> anyhow::Result<()> {
                 manager.enable_kv_cache(bytes);
             }
 
-            manager.load_model_with_digest(&model, &model_path, None, digest)?;
+            let opts = spindll::engine::LoadOptions {
+                digest,
+                device,
+                ..Default::default()
+            };
+            manager.load_model_with_options(&model, &model_path, opts)?;
 
             let system_prompt = system.unwrap_or_else(|| "You are a helpful assistant.".to_string());
             let messages: Vec<(String, String)> = vec![
@@ -805,10 +824,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("no models loaded");
             } else {
                 println!(
-                    "{:<35} {:>10} {:>6}  {}",
-                    "MODEL", "MEMORY", "GPU", "DIGEST"
+                    "{:<35} {:>10} {:>6}  {:<10} {}",
+                    "MODEL", "MEMORY", "GPU", "DEVICE", "DIGEST"
                 );
-                println!("{}", "-".repeat(75));
+                println!("{}", "-".repeat(85));
                 for m in &resp.models {
                     let size = if m.memory_used >= 1_073_741_824 {
                         format!("{:.1} GB", m.memory_used as f64 / 1_073_741_824.0)
@@ -820,9 +839,10 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         &m.digest
                     };
+                    let device = if m.device.is_empty() { "auto" } else { &m.device };
                     println!(
-                        "{:<35} {:>10} {:>4}L  {}",
-                        m.name, size, m.gpu_layers, digest_short
+                        "{:<35} {:>10} {:>4}L  {:<10} {}",
+                        m.name, size, m.gpu_layers, device, digest_short
                     );
                 }
             }
