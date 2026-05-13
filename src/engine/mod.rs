@@ -1,6 +1,7 @@
 //! Inference engine — model loading, text generation, KV caching, and metrics.
 
 pub mod batch;
+pub mod device;
 pub mod kv_cache;
 pub mod kv_ram_cache;
 pub mod manager;
@@ -9,6 +10,7 @@ pub mod ram_cache;
 pub mod streaming;
 
 pub use batch::{BatchEvent, BatchRequest, BatchScheduler};
+pub use device::DeviceTarget;
 pub use kv_cache::KvCache;
 pub use kv_ram_cache::KvRamCache;
 pub use manager::{EvictionPriority, LoadOptions, ModelManager};
