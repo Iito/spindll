@@ -507,15 +507,17 @@ public func mlxEmbed(
     let sema = DispatchSemaphore(value: 0)
     let box = Box<(UnsafeMutablePointer<Float>, Int32, Int32)>()
 
+    // NOTE: This path produces *heuristic* embeddings from a generative LM by
+    // mean-pooling the input embedding rows for the tokenised text. It is NOT
+    // a true pseudo-inverse hidden-state recovery — the previous
+    // `matmul(logits, W_embed)` formula did not compute one either. Use a
+    // dedicated embedding model (e.g. sentence-transformers MLX) for any
+    // task where vector quality matters.
     Task {
         do {
             try await state.container.perform(nonSendable: inputText) { context, txt in
                 let tokenIds = context.tokenizer.encode(text: txt)
                 guard !tokenIds.isEmpty else { return }
-
-                let tokens = MLXArray(tokenIds.map { Int32($0) })
-                let input = LMInput.Text(tokens: tokens.expandedDimensions(axis: 0))
-                let output = context.model(input, cache: nil, state: nil)
 
                 let allParams = context.model.parameters().flattened()
 
@@ -538,16 +540,14 @@ public func mlxEmbed(
                     fullWeight = embedWeight
                 }
 
-                let hidden = matmul(
-                    output.logits.asType(.float32),
-                    fullWeight.asType(.float32))
-                let seqAxis = hidden.ndim - 2
-                let pooled = hidden.mean(axis: seqAxis).reshaped(-1)
+                // Look up the input embedding row per token and mean-pool.
+                let idxArr = MLXArray(tokenIds.map { Int32($0) })
+                let rows = fullWeight.asType(.float32).take(idxArr, axis: 0)
+                let pooled = rows.mean(axis: 0).reshaped(-1)
 
                 let norm = MLX.sqrt((pooled * pooled).sum())
                 let normalized = norm.item(Float.self) > 0 ? pooled / norm : pooled
                 MLX.eval(normalized)
-                Stream().synchronize()
 
                 let floats = normalized.asArray(Float.self)
                 let buf = UnsafeMutablePointer<Float>.allocate(capacity: floats.count)
