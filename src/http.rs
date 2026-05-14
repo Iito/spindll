@@ -971,6 +971,11 @@ struct OaiEmbeddingRequest {
     input: EmbeddingInput,
     #[serde(default)]
     encoding_format: Option<String>,
+    /// OpenAI lets clients ask for a reduced output dimensionality.
+    /// We don't support truncation yet — reject when supplied so callers
+    /// don't silently get full-dimension embeddings.
+    #[serde(default)]
+    dimensions: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -978,31 +983,121 @@ struct OaiEmbeddingRequest {
 enum EmbeddingInput {
     Single(String),
     Batch(Vec<String>),
+    /// OpenAI-spec token-id inputs: `list[int]` (single) and `list[list[int]]`
+    /// (batch). The order matters here — serde tries variants top-down, so
+    /// these have to come after the string forms to avoid coercion. The
+    /// payload is not used (rejected with 400 below) but is parsed so we
+    /// return a structured error instead of a generic JSON decode failure.
+    #[allow(dead_code)]
+    TokenIds(Vec<i32>),
+    #[allow(dead_code)]
+    TokenIdsBatch(Vec<Vec<i32>>),
+}
+
+/// Hard cap on a single embedding input length, in characters/tokens, to bound
+/// server-side memory before tokenization or matmul.
+const MAX_EMBED_INPUT_LEN: usize = 32_768;
+
+/// Encode an embedding vector as base64'd little-endian f32 (OpenAI spec).
+/// Stdlib-only implementation to avoid adding a base64 crate dependency for
+/// a single encode site.
+fn encode_embedding_base64(v: &[f32]) -> String {
+    const A: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bytes = Vec::with_capacity(v.len() * 4);
+    for f in v {
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | bytes[i + 2] as u32;
+        out.push(A[((n >> 18) & 0x3f) as usize] as char);
+        out.push(A[((n >> 12) & 0x3f) as usize] as char);
+        out.push(A[((n >> 6) & 0x3f) as usize] as char);
+        out.push(A[(n & 0x3f) as usize] as char);
+        i += 3;
+    }
+    let rem = bytes.len() - i;
+    if rem == 1 {
+        let n = (bytes[i] as u32) << 16;
+        out.push(A[((n >> 18) & 0x3f) as usize] as char);
+        out.push(A[((n >> 12) & 0x3f) as usize] as char);
+        out.push('=');
+        out.push('=');
+    } else if rem == 2 {
+        let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
+        out.push(A[((n >> 18) & 0x3f) as usize] as char);
+        out.push(A[((n >> 12) & 0x3f) as usize] as char);
+        out.push(A[((n >> 6) & 0x3f) as usize] as char);
+        out.push('=');
+    }
+    out
 }
 
 async fn oai_embeddings(
     State(state): State<AppState>,
     Json(req): Json<OaiEmbeddingRequest>,
 ) -> impl IntoResponse {
-    if let Some(ref fmt) = req.encoding_format {
-        if fmt != "float" {
+    // encoding_format: only "float" and "base64" are valid per OpenAI spec.
+    let want_base64 = match req.encoding_format.as_deref() {
+        None | Some("float") => false,
+        Some("base64") => true,
+        Some(other) => {
             return (
                 axum::http::StatusCode::BAD_REQUEST,
-                Json(oai_error("only float encoding_format is supported")),
+                Json(oai_error(&format!(
+                    "encoding_format '{other}' not supported (use 'float' or 'base64')"
+                ))),
             )
                 .into_response();
         }
+    };
+
+    if req.dimensions.is_some() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(oai_error(
+                "the `dimensions` parameter is not supported by this backend",
+            )),
+        )
+            .into_response();
     }
 
+    // Normalise all four input shapes into Vec<String>. Token-id inputs
+    // currently can't bypass the tokenizer (no token-array embed path on
+    // backends yet) — reject so clients don't get a confusing tokenisation.
     let texts: Vec<String> = match req.input {
         EmbeddingInput::Single(s) => vec![s],
         EmbeddingInput::Batch(v) => v,
+        EmbeddingInput::TokenIds(_) | EmbeddingInput::TokenIdsBatch(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(oai_error(
+                    "token-id input is not yet supported; pass a string or array of strings",
+                )),
+            )
+                .into_response();
+        }
     };
 
     if texts.is_empty() || texts.iter().any(|t| t.is_empty()) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            Json(oai_error("input must be a non-empty string or array of non-empty strings")),
+            Json(oai_error(
+                "input must be a non-empty string or array of non-empty strings",
+            )),
+        )
+            .into_response();
+    }
+
+    if let Some(over) = texts.iter().find(|t| t.len() > MAX_EMBED_INPUT_LEN) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(oai_error(&format!(
+                "input exceeds {MAX_EMBED_INPUT_LEN}-char limit ({} chars)",
+                over.len()
+            ))),
         )
             .into_response();
     }
@@ -1020,10 +1115,15 @@ async fn oai_embeddings(
         for (i, text) in texts.iter().enumerate() {
             let r = mgr.embed(&req.model, text)?;
             total_tokens += r.prompt_tokens;
+            let embedding_val = if want_base64 {
+                serde_json::Value::String(encode_embedding_base64(&r.embedding))
+            } else {
+                serde_json::json!(r.embedding)
+            };
             data.push(serde_json::json!({
                 "object": "embedding",
                 "index": i,
-                "embedding": r.embedding,
+                "embedding": embedding_val,
             }));
         }
 
@@ -1044,11 +1144,20 @@ async fn oai_embeddings(
             }))
             .into_response()
         }
-        Ok(Err(e)) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(oai_error(&e.to_string())),
-        )
-            .into_response(),
+        // Surface "model not loaded" / "embeddings not supported" as 400 so
+        // clients can distinguish capability errors from infra failures.
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            let status = if msg.contains("not loaded")
+                || msg.contains("does not support")
+                || msg.contains("not supported")
+            {
+                axum::http::StatusCode::BAD_REQUEST
+            } else {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(oai_error(&msg))).into_response()
+        }
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(oai_error(&e.to_string())),
@@ -1290,7 +1399,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oai_embeddings_rejects_base64_format() {
+    async fn oai_embeddings_rejects_unknown_encoding_format() {
         let dir = tempfile::tempdir().unwrap();
         let (store, mgr) = setup_store_and_manager(dir.path());
         let app = router(mgr, store);
@@ -1298,7 +1407,30 @@ mod tests {
         let body = serde_json::json!({
             "model": "test-org/test-model",
             "input": "hello",
-            "encoding_format": "base64"
+            "encoding_format": "binary"  // not "float" or "base64"
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn oai_embeddings_rejects_dimensions_param() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        let app = router(mgr, store);
+
+        let body = serde_json::json!({
+            "model": "test-org/test-model",
+            "input": "hello",
+            "dimensions": 256,
         });
 
         let req = axum::http::Request::builder()

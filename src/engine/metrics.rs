@@ -12,6 +12,7 @@ pub struct Metrics {
     pub generate_requests: AtomicU64,
     pub generate_errors: AtomicU64,
     pub embed_requests: AtomicU64,
+    pub embed_errors: AtomicU64,
     pub total_embed_time_us: AtomicU64,
 }
 
@@ -26,6 +27,7 @@ pub struct MetricsSnapshot {
     pub generate_requests: u64,
     pub generate_errors: u64,
     pub embed_requests: u64,
+    pub embed_errors: u64,
     pub total_embed_time_us: u64,
 }
 
@@ -42,6 +44,7 @@ impl Metrics {
             generate_requests: AtomicU64::new(0),
             generate_errors: AtomicU64::new(0),
             embed_requests: AtomicU64::new(0),
+            embed_errors: AtomicU64::new(0),
             total_embed_time_us: AtomicU64::new(0),
         }
     }
@@ -58,6 +61,7 @@ impl Metrics {
             generate_requests: self.generate_requests.load(Relaxed),
             generate_errors: self.generate_errors.load(Relaxed),
             embed_requests: self.embed_requests.load(Relaxed),
+            embed_errors: self.embed_errors.load(Relaxed),
             total_embed_time_us: self.total_embed_time_us.load(Relaxed),
         }
     }
@@ -94,9 +98,15 @@ impl Metrics {
         self.total_embed_time_us.fetch_add(elapsed_us, Relaxed);
     }
 
-    /// Increment the error counter.
+    /// Increment the generation error counter.
     pub fn record_error(&self) {
         self.generate_errors.fetch_add(1, Relaxed);
+    }
+
+    /// Increment the embedding error counter (kept separate from
+    /// `generate_errors` so embed failures don't pollute generation health).
+    pub fn record_embed_error(&self) {
+        self.embed_errors.fetch_add(1, Relaxed);
     }
 }
 
