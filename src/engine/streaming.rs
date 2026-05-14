@@ -207,7 +207,8 @@ pub fn generate_streaming_cached(
     let n_ctx = n_ctx_u32 as usize;
 
     let token_ids: Vec<i32> = tokens.iter().map(|t| t.0).collect();
-    let ram_hash = ram_cache.map(|_| KvRamCache::hash_key(prompt, model_name, model_digest));
+    let ram_hash = ram_cache
+        .map(|_| KvRamCache::hash_key(prompt, model_name, model_digest, encryption_key));
 
     // ── Tier 1: RAM cache ──────────────────────────────────────────────
     let cache_hit = if let (Some(rc), Some(hash)) = (ram_cache, ram_hash.as_deref()) {
@@ -216,10 +217,18 @@ pub fn generate_streaming_cached(
                 && cached_tokens.iter().zip(token_ids.iter()).all(|(a, b)| a == b)
             {
                 let read = unsafe { ctx.set_state_data(&raw_state) };
-                if read > 0 {
+                // Require a full restore — partial reads leave ctx in a
+                // half-loaded state and would silently skip prompt prefill.
+                if read == raw_state.len() {
                     tracing::debug!("kv cache: ram hit");
                     true
                 } else {
+                    tracing::warn!(
+                        read,
+                        expected = raw_state.len(),
+                        "kv ram cache: partial restore; falling back to prefill"
+                    );
+                    ctx.clear_kv_cache();
                     false
                 }
             } else {
@@ -268,7 +277,15 @@ pub fn generate_streaming_cached(
                 }
                 true
             }
-            _ => {
+            Some(_) => {
+                // state_load_file installed stale KV state before token
+                // validation rejected it — clear before prefill so the new
+                // decode runs on an empty cache instead of a contaminated one.
+                ctx.clear_kv_cache();
+                encode_prompt(model, ctx, &tokens)?;
+                false
+            }
+            None => {
                 encode_prompt(model, ctx, &tokens)?;
                 false
             }

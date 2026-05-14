@@ -301,19 +301,24 @@ private final class PromptCache {
     }
 
     /// Look up `tokenIds`, checking RAM first and then the on-disk tier; a disk
-    /// hit is loaded back into RAM. `nil` if neither has a usable prefix.
+    /// hit is loaded back into RAM (when RAM tier is enabled). `nil` if neither
+    /// has a usable prefix. `maxBytes == 0` disables only the RAM tier — disk
+    /// lookups still run so callers using `--no-kv-ram-cache` keep their disk
+    /// cache.
     func lookup(tokenIds: [Int32]) -> PromptCacheHit? {
-        guard !tokenIds.isEmpty, maxBytes > 0 else { return nil }
-        if let hit = lookupRam(tokenIds) { return hit }
+        guard !tokenIds.isEmpty else { return nil }
+        if maxBytes > 0, let hit = lookupRam(tokenIds) { return hit }
         guard tokenIds.count >= diskMinTokens,
               let d = sharedMlxDiskCache.lookup(
                 modelDigest: modelDigest, tokenIds: tokenIds, minPrefix: minPrefix)
         else { return nil }
         let entry = PromptCacheEntry(tokenIds: d.tokenIds, kvCache: d.kvCache, bits: d.bits)
         entry.spilled = true   // it came from disk; no need to write it back
-        entries.removeAll { commonPrefixLength($0.tokenIds, entry.tokenIds) == $0.tokenIds.count }
-        entries.insert(entry, at: 0)
-        evictExcess()
+        if maxBytes > 0 {
+            entries.removeAll { commonPrefixLength($0.tokenIds, entry.tokenIds) == $0.tokenIds.count }
+            entries.insert(entry, at: 0)
+            evictExcess()
+        }
         return PromptCacheHit(entry: entry, prefixLength: commonPrefixLength(entry.tokenIds, tokenIds))
     }
 
@@ -323,7 +328,14 @@ private final class PromptCache {
     /// on-disk tier and are then demoted to `lowBits` in RAM. The LRU entry, if
     /// the cache is over its byte budget, is dropped from RAM (already on disk).
     func save(tokenIds: [Int32], kvCache: [any KVCache], bits: Int) {
-        guard !tokenIds.isEmpty, maxBytes > 0 else { return }
+        guard !tokenIds.isEmpty else { return }
+        // RAM tier disabled: skip RAM bookkeeping but still spill to disk so
+        // `--no-kv-ram-cache` users keep their on-disk cache.
+        if maxBytes == 0 {
+            let entry = PromptCacheEntry(tokenIds: tokenIds, kvCache: kvCache, bits: bits)
+            spillToDisk(entry)
+            return
+        }
         entries.removeAll { commonPrefixLength($0.tokenIds, tokenIds) == $0.tokenIds.count }
         for e in entries {
             spillToDisk(e)   // while still highBits — disk entries stay near-lossless
