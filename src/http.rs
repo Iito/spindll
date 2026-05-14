@@ -970,6 +970,9 @@ struct OaiEmbeddingRequest {
     model: String,
     input: EmbeddingInput,
     #[serde(default)]
+    #[allow(dead_code)]
+    user: Option<String>,
+    #[serde(default)]
     encoding_format: Option<String>,
     /// OpenAI lets clients ask for a reduced output dimensionality.
     /// We don't support truncation yet — reject when supplied so callers
@@ -997,6 +1000,7 @@ enum EmbeddingInput {
 /// Hard cap on a single embedding input length, in characters/tokens, to bound
 /// server-side memory before tokenization or matmul.
 const MAX_EMBED_INPUT_LEN: usize = 32_768;
+const MAX_EMBED_BATCH: usize = 2048;
 
 /// Encode an embedding vector as base64'd little-endian f32 (OpenAI spec).
 /// Stdlib-only implementation to avoid adding a base64 crate dependency for
@@ -1087,6 +1091,17 @@ async fn oai_embeddings(
             Json(oai_error(
                 "input must be a non-empty string or array of non-empty strings",
             )),
+        )
+            .into_response();
+    }
+
+    if texts.len() > MAX_EMBED_BATCH {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(oai_error(&format!(
+                "input array exceeds {MAX_EMBED_BATCH}-item limit ({} items)",
+                texts.len()
+            ))),
         )
             .into_response();
     }
@@ -1385,6 +1400,28 @@ mod tests {
         let body = serde_json::json!({
             "model": "test-org/test-model",
             "input": ""
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn oai_embeddings_rejects_too_many_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        let app = router(mgr, store);
+
+        let body = serde_json::json!({
+            "model": "test-org/test-model",
+            "input": vec!["x"; MAX_EMBED_BATCH + 1],
         });
 
         let req = axum::http::Request::builder()
