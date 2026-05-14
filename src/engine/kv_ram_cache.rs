@@ -1,3 +1,9 @@
+//! In-memory KV state cache for the llama.cpp backend.
+//!
+//! Entries are keyed by exact prompt hash, so hits require the same prompt and
+//! do not reuse partial prefixes. The shared `--kv-ram-cache` budget flag also
+//! budgets MLX prefix caching, but MLX performs prefix reuse internally.
+
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
