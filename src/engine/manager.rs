@@ -891,7 +891,7 @@ impl ModelManager {
             }
             Err(e) => {
                 tracing::error!(error = %e, elapsed_ms = elapsed_us / 1000, "embedding failed");
-                self.metrics.record_error();
+                self.metrics.record_embed_error();
             }
         }
         result
