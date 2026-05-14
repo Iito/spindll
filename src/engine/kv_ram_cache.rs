@@ -41,13 +41,28 @@ impl KvRamCache {
         }
     }
 
-    /// Compute the RAM cache key (no encryption_key — RAM entries are plaintext).
-    pub fn hash_key(prompt: &str, model_name: &str, model_digest: &str) -> String {
+    /// Compute the RAM cache key.
+    ///
+    /// `encryption_key` is mixed into the hash even though RAM entries are
+    /// stored plaintext — without it, two callers with the same prompt but
+    /// different keys would share a cache slot, leaking plaintext KV state
+    /// across encryption (tenant) boundaries. Matches `KvCache::hash_prompt`.
+    pub fn hash_key(
+        prompt: &str,
+        model_name: &str,
+        model_digest: &str,
+        encryption_key: Option<&[u8; 32]>,
+    ) -> String {
         let mut hasher = Sha256::new();
         hasher.update(model_name.as_bytes());
         hasher.update(b"\x00");
         hasher.update(model_digest.as_bytes());
         hasher.update(b"\x00");
+        if let Some(key) = encryption_key {
+            hasher.update(b"enc:");
+            hasher.update(key);
+            hasher.update(b"\x00");
+        }
         hasher.update(prompt.as_bytes());
         format!("{:x}", hasher.finalize())
     }
@@ -61,7 +76,7 @@ impl KvRamCache {
         entry.last_used = next_access_id();
         let decompressed =
             zstd::decode_all(std::io::Cursor::new(&entry.compressed_state)).ok()?;
-        tracing::debug!(hash = &hash[..12], "kv ram cache hit");
+        tracing::debug!(hash = &hash[..hash.len().min(12)], "kv ram cache hit");
         Some((decompressed, entry.tokens.clone()))
     }
 
@@ -156,7 +171,7 @@ mod tests {
         let cache = KvRamCache::new(1_048_576); // 1 MB
         let state = make_state(4096);
         let tokens = vec![1i32, 2, 3, 42];
-        let hash = KvRamCache::hash_key("hello", "model", "digest");
+        let hash = KvRamCache::hash_key("hello", "model", "digest", None);
 
         cache.insert(&hash, &state, &tokens);
         let (loaded, loaded_tokens) = cache.lookup(&hash).expect("should hit");
@@ -253,19 +268,18 @@ mod tests {
     }
 
     #[test]
-    fn hash_key_excludes_encryption() {
-        let h1 = KvRamCache::hash_key("prompt", "model", "digest");
-        let h2 = KvRamCache::hash_key("prompt", "model", "digest");
-        assert_eq!(h1, h2);
+    fn hash_key_includes_encryption() {
+        // Two callers with no encryption key share the same slot — expected.
+        let h_a = KvRamCache::hash_key("prompt", "model", "digest", None);
+        let h_b = KvRamCache::hash_key("prompt", "model", "digest", None);
+        assert_eq!(h_a, h_b);
 
-        // Different from KvCache::hash_prompt which includes encryption_key.
-        let h_disk = super::super::kv_cache::KvCache::hash_prompt(
-            "prompt",
-            "model",
-            "digest",
-            Some(&[0xAA; 32]),
-        );
-        assert_ne!(h1, h_disk);
+        // Different keys must hash differently — otherwise plaintext KV state
+        // leaks across encryption boundaries.
+        let h_k1 = KvRamCache::hash_key("prompt", "model", "digest", Some(&[0xAA; 32]));
+        let h_k2 = KvRamCache::hash_key("prompt", "model", "digest", Some(&[0xBB; 32]));
+        assert_ne!(h_a, h_k1);
+        assert_ne!(h_k1, h_k2);
     }
 
     #[test]
