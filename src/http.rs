@@ -587,21 +587,61 @@ struct OaiImageUrl {
     url: String,
 }
 
+/// Hard cap on decoded image bytes from a single `image_url` part.
+/// 32 MiB covers every common-sense JPEG/PNG/WebP and stops a single base64
+/// payload from forcing hundreds of MB of allocation in the request handler.
+#[cfg(feature = "vision")]
+const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+
+/// MIME types accepted by both backends. Anything else is rejected before
+/// hitting `MtmdBitmap::from_buffer` or MLX's ImageIO sniff.
+#[cfg(feature = "vision")]
+const ALLOWED_IMAGE_MEDIA: &[&str] = &[
+    "image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp",
+];
+
 /// Decode a `data:image/png;base64,...` URI into raw bytes and media type.
+/// Rejects payloads whose base64 length implies > [`MAX_IMAGE_BYTES`] decoded.
 #[cfg(feature = "vision")]
 fn decode_data_uri(uri: &str) -> anyhow::Result<(Vec<u8>, Option<String>)> {
     use base64::Engine as _;
 
     let rest = uri.strip_prefix("data:")
-        .ok_or_else(|| anyhow::anyhow!("image_url must be a data: URI"))?;
+        .ok_or_else(|| anyhow::anyhow!("image_url must be a data: URI (http(s) URLs not yet supported)"))?;
     let (header, b64) = rest.split_once(",")
         .ok_or_else(|| anyhow::anyhow!("malformed data URI: missing comma"))?;
 
-    let media_type = header.strip_suffix(";base64")
-        .map(|s| s.to_string());
+    let media_type = header.strip_suffix(";base64").map(|s| {
+        // Strip any `;param=value` tail (e.g. `image/jpeg;charset=foo`).
+        s.split(';').next().unwrap_or(s).trim().to_lowercase()
+    });
+
+    // Bound decoded size before we allocate. base64 expands ~4 bytes → 3 bytes
+    // of output; pre-check on encoded length so we never decode a huge blob
+    // just to throw it away.
+    if b64.len() / 4 * 3 > MAX_IMAGE_BYTES {
+        anyhow::bail!(
+            "image exceeds {} byte limit (encoded ~{} bytes)",
+            MAX_IMAGE_BYTES,
+            b64.len() / 4 * 3,
+        );
+    }
 
     let data = base64::engine::general_purpose::STANDARD.decode(b64)
         .map_err(|e| anyhow::anyhow!("base64 decode failed: {e}"))?;
+
+    if data.len() > MAX_IMAGE_BYTES {
+        anyhow::bail!("image exceeds {} byte limit ({} bytes)", MAX_IMAGE_BYTES, data.len());
+    }
+
+    if let Some(mt) = &media_type {
+        if !ALLOWED_IMAGE_MEDIA.contains(&mt.as_str()) {
+            anyhow::bail!(
+                "unsupported image media type {mt}; allowed: {}",
+                ALLOWED_IMAGE_MEDIA.join(", ")
+            );
+        }
+    }
 
     Ok((data, media_type))
 }

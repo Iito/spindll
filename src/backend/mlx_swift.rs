@@ -417,11 +417,35 @@ impl MlxSwiftEngine {
         let json_str = serde_json::to_string(&json)
             .map_err(|e| anyhow::anyhow!("failed to encode chat messages: {e}"))?;
         let c_json = CString::new(json_str)?;
+        // Capture an estimate before c_json moves into the worker thread.
+        // Real count requires plumbing an out-param through the Swift FFI.
+        let prompt_tokens_estimate = (c_json.as_bytes().len() / 4) as u32;
 
-        // Extract the first image and write to a temp file so Swift can load via URL.
-        let _tmp_path: Option<std::path::PathBuf>; // clean up after generation
+        // Count images; MLX VLM FFI only takes one path. Reject >1 explicitly so
+        // callers don't silently lose images (llamacpp can handle multi-image —
+        // future work to plumb a list across FFI).
+        let image_count: usize = messages.iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|p| matches!(p, ContentPart::ImageBytes { .. }))
+            .count();
+        if image_count > 1 {
+            anyhow::bail!(
+                "MLX VLM path supports only one image per request (got {}); \
+                 use the llama.cpp backend for multi-image input",
+                image_count
+            );
+        }
+
+        // Extract the single image (if any) and write to a per-call temp file
+        // so concurrent VLM requests on the same PID don't race on the path.
+        // Drop guard removes the file on every exit path.
+        struct TempFileGuard(std::path::PathBuf);
+        impl Drop for TempFileGuard {
+            fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+        }
+        let tmp_guard: Option<TempFileGuard>;
         let c_image_path: Option<CString> = {
-            let image_bytes = messages.iter().rev().find_map(|m| {
+            let image_bytes = messages.iter().find_map(|m| {
                 m.content.iter().find_map(|p| match p {
                     ContentPart::ImageBytes { data, media_type } => Some((data, media_type)),
                     _ => None,
@@ -435,16 +459,27 @@ impl MlxSwiftEngine {
                     Some("image/webp") => "webp",
                     _ => "jpg",
                 };
-                let path = std::env::temp_dir().join(format!("spindll_vlm_{}.{ext}", std::process::id()));
+                // Per-call unique suffix: process id + monotonic counter + nanos.
+                static REQ_COUNTER: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let n = REQ_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(0);
+                let path = std::env::temp_dir().join(format!(
+                    "spindll_vlm_{}_{}_{:x}.{ext}",
+                    std::process::id(), n, nanos,
+                ));
                 std::fs::write(&path, data)
                     .map_err(|e| anyhow::anyhow!("failed to write temp image: {e}"))?;
                 let path_str = path.to_str()
                     .ok_or_else(|| anyhow::anyhow!("temp path not UTF-8"))?
                     .to_string();
-                _tmp_path = Some(path);
+                tmp_guard = Some(TempFileGuard(path));
                 Some(CString::new(path_str)?)
             } else {
-                _tmp_path = None;
+                tmp_guard = None;
                 None
             }
         };
@@ -495,10 +530,8 @@ impl MlxSwiftEngine {
             .join()
             .map_err(|_| anyhow::anyhow!("MLX vision generation thread panicked"))?;
 
-        // Clean up temp image file.
-        if let Some(ref p) = _tmp_path {
-            let _ = std::fs::remove_file(p);
-        }
+        // tmp_guard drops here, removing the temp file.
+        drop(tmp_guard);
 
         if raw_result < 0 {
             anyhow::bail!(
@@ -508,7 +541,7 @@ impl MlxSwiftEngine {
             );
         }
 
-        Ok(GenerateResult { prompt_tokens: 0, completion_tokens, cache_hit: false })
+        Ok(GenerateResult { prompt_tokens: prompt_tokens_estimate, completion_tokens, cache_hit: false })
     }
 }
 

@@ -114,10 +114,15 @@ pub fn download_hf_auto(
     let repo = api.model(repo_id.to_string());
     let info = repo.info()?;
 
+    // Exclude mmproj projector GGUFs — they're vision adapter weights, not
+    // language model weights, and must not be selected as the main model.
     let gguf_files: Vec<_> = info
         .siblings
         .iter()
-        .filter(|s| s.rfilename.ends_with(".gguf"))
+        .filter(|s| {
+            let name = s.rfilename.as_str();
+            name.ends_with(".gguf") && !name.to_lowercase().contains("mmproj")
+        })
         .collect();
 
     if !gguf_files.is_empty() {
@@ -313,10 +318,15 @@ pub fn download_gguf(repo_id: &str, quant: Option<&str>, dest_dir: &Path) -> any
     let repo = api.model(repo_id.to_string());
 
     let info = repo.info()?;
+    // Exclude mmproj projector GGUFs — they're vision adapter weights, not
+    // language model weights, and must not be selected as the main model.
     let gguf_files: Vec<_> = info
         .siblings
         .iter()
-        .filter(|s| s.rfilename.ends_with(".gguf"))
+        .filter(|s| {
+            let name = s.rfilename.as_str();
+            name.ends_with(".gguf") && !name.to_lowercase().contains("mmproj")
+        })
         .collect();
 
     if gguf_files.is_empty() {

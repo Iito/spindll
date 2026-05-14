@@ -151,7 +151,22 @@ impl Spindll for SpindllService {
                     }
                 };
                 let digest = store.resolve_model_digest(&req.model).unwrap_or_default();
-                if let Err(e) = mgr.load_model_with_digest(&req.model, &path, None, digest) {
+                // Pull the mmproj path from the registry on autoload so the
+                // first image request doesn't load without vision support.
+                #[cfg(feature = "vision")]
+                let mmproj_path = store.resolve_mmproj_path(&req.model).ok().flatten();
+                #[cfg(feature = "vision")]
+                let opts = crate::engine::manager::LoadOptions {
+                    digest,
+                    mmproj_path,
+                    ..Default::default()
+                };
+                #[cfg(not(feature = "vision"))]
+                let opts = crate::engine::manager::LoadOptions {
+                    digest,
+                    ..Default::default()
+                };
+                if let Err(e) = mgr.load_model_with_options(&req.model, &path, opts) {
                     let _ = tx.blocking_send(Err(Status::internal(
                         format!("failed to load model '{}': {e}", req.model)
                     )));
@@ -162,12 +177,16 @@ impl Spindll for SpindllService {
             let params = proto_params_to_engine(req.params);
             let start = std::time::Instant::now();
 
-            // Check if any message has multimodal content parts.
+            // Route to the vision path only when at least one part is actually
+            // an image. Text-only `parts` (legitimate per OpenAI spec) stay on
+            // the text path so they work on non-VLM models.
             #[cfg(feature = "vision")]
-            let has_parts = req.messages.iter().any(|m| !m.parts.is_empty());
+            let has_image = req.messages.iter().any(|m| {
+                m.parts.iter().any(|p| p.r#type == "image")
+            });
 
             #[cfg(feature = "vision")]
-            let result = if has_parts {
+            let result = if has_image {
                 let mm_messages = proto_to_multimodal(&req.messages);
                 mgr.generate_chat_multimodal(&req.model, &mm_messages, &params, |token| {
                     let resp = ChatResponse {
