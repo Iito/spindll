@@ -56,19 +56,19 @@ enum Commands {
         budget: Option<String>,
 
         /// Disk KV cache size for prompt prefixes (e.g. "2G", default 2G)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "no_kv_cache")]
         kv_cache: Option<String>,
 
         /// Disable disk KV cache
-        #[arg(long)]
+        #[arg(long, conflicts_with = "kv_cache")]
         no_kv_cache: bool,
 
-        /// In-memory KV state cache size (e.g. "512M", default 512M)
-        #[arg(long)]
+        /// In-memory KV cache budget. llama.cpp requires exact prompt matches; MLX reuses prefixes internally.
+        #[arg(long, conflicts_with = "no_kv_ram_cache")]
         kv_ram_cache: Option<String>,
 
         /// Disable the in-memory KV state cache
-        #[arg(long)]
+        #[arg(long, conflicts_with = "kv_ram_cache")]
         no_kv_ram_cache: bool,
 
         /// Concurrent sequence slots per model for batch scheduling (0 = disabled)
