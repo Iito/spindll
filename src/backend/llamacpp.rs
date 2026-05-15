@@ -231,7 +231,7 @@ impl BackendModel for LlamaCppModel {
         }
 
         let n_tokens = tokens.len().min(self.n_ctx as usize);
-        let n_batch: u32 = (n_tokens as u32).max(32).min(self.n_ctx);
+        let n_batch: u32 = (n_tokens as u32).min(self.n_ctx);
 
         let ctx_params = LlamaContextParams::default()
             .with_embeddings(true)
