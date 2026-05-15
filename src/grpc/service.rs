@@ -151,8 +151,7 @@ impl Spindll for SpindllService {
                     }
                 };
                 let digest = store.resolve_model_digest(&req.model).unwrap_or_default();
-                // Pull the mmproj path from the registry on autoload so the
-                // first image request doesn't load without vision support.
+                // mmproj_path on autoload → first image req has vision.
                 #[cfg(feature = "vision")]
                 let mmproj_path = store.resolve_mmproj_path(&req.model).ok().flatten();
                 #[cfg(feature = "vision")]
@@ -177,9 +176,7 @@ impl Spindll for SpindllService {
             let params = proto_params_to_engine(req.params);
             let start = std::time::Instant::now();
 
-            // Route to the vision path only when at least one part is actually
-            // an image. Text-only `parts` (legitimate per OpenAI spec) stay on
-            // the text path so they work on non-VLM models.
+            // Vision path only if ≥1 image part. Text-only `parts` stay on text path.
             #[cfg(feature = "vision")]
             let has_image = req.messages.iter().any(|m| {
                 m.parts.iter().any(|p| p.r#type == "image")

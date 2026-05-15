@@ -417,13 +417,10 @@ impl MlxSwiftEngine {
         let json_str = serde_json::to_string(&json)
             .map_err(|e| anyhow::anyhow!("failed to encode chat messages: {e}"))?;
         let c_json = CString::new(json_str)?;
-        // Capture an estimate before c_json moves into the worker thread.
-        // Real count requires plumbing an out-param through the Swift FFI.
+        // Estimate before c_json moves; real count needs FFI out-param.
         let prompt_tokens_estimate = (c_json.as_bytes().len() / 4) as u32;
 
-        // Count images; MLX VLM FFI only takes one path. Reject >1 explicitly so
-        // callers don't silently lose images (llamacpp can handle multi-image —
-        // future work to plumb a list across FFI).
+        // MLX VLM FFI takes one image path. Reject >1 (llamacpp handles multi).
         let image_count: usize = messages.iter()
             .flat_map(|m| m.content.iter())
             .filter(|p| matches!(p, ContentPart::ImageBytes { .. }))
@@ -436,9 +433,7 @@ impl MlxSwiftEngine {
             );
         }
 
-        // Extract the single image (if any) and write to a per-call temp file
-        // so concurrent VLM requests on the same PID don't race on the path.
-        // Drop guard removes the file on every exit path.
+        // Per-call temp file + Drop guard: avoids same-PID path races + leaks on panic.
         struct TempFileGuard(std::path::PathBuf);
         impl Drop for TempFileGuard {
             fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
@@ -459,7 +454,7 @@ impl MlxSwiftEngine {
                     Some("image/webp") => "webp",
                     _ => "jpg",
                 };
-                // Per-call unique suffix: process id + monotonic counter + nanos.
+                // Unique suffix: pid + counter + nanos.
                 static REQ_COUNTER: std::sync::atomic::AtomicU64 =
                     std::sync::atomic::AtomicU64::new(0);
                 let n = REQ_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -530,7 +525,6 @@ impl MlxSwiftEngine {
             .join()
             .map_err(|_| anyhow::anyhow!("MLX vision generation thread panicked"))?;
 
-        // tmp_guard drops here, removing the temp file.
         drop(tmp_guard);
 
         if raw_result < 0 {

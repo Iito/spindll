@@ -587,21 +587,17 @@ struct OaiImageUrl {
     url: String,
 }
 
-/// Hard cap on decoded image bytes from a single `image_url` part.
-/// 32 MiB covers every common-sense JPEG/PNG/WebP and stops a single base64
-/// payload from forcing hundreds of MB of allocation in the request handler.
+/// Per-image decoded byte cap. Bounds request-handler allocation.
 #[cfg(feature = "vision")]
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 
-/// MIME types accepted by both backends. Anything else is rejected before
-/// hitting `MtmdBitmap::from_buffer` or MLX's ImageIO sniff.
+/// MIME allow-list. Rejected before `MtmdBitmap::from_buffer` / MLX ImageIO.
 #[cfg(feature = "vision")]
 const ALLOWED_IMAGE_MEDIA: &[&str] = &[
     "image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp",
 ];
 
-/// Decode a `data:image/png;base64,...` URI into raw bytes and media type.
-/// Rejects payloads whose base64 length implies > [`MAX_IMAGE_BYTES`] decoded.
+/// Decode `data:...;base64,...` URI. Rejects > MAX_IMAGE_BYTES.
 #[cfg(feature = "vision")]
 fn decode_data_uri(uri: &str) -> anyhow::Result<(Vec<u8>, Option<String>)> {
     use base64::Engine as _;
@@ -612,13 +608,11 @@ fn decode_data_uri(uri: &str) -> anyhow::Result<(Vec<u8>, Option<String>)> {
         .ok_or_else(|| anyhow::anyhow!("malformed data URI: missing comma"))?;
 
     let media_type = header.strip_suffix(";base64").map(|s| {
-        // Strip any `;param=value` tail (e.g. `image/jpeg;charset=foo`).
+        // Strip `;param=value` tail.
         s.split(';').next().unwrap_or(s).trim().to_lowercase()
     });
 
-    // Bound decoded size before we allocate. base64 expands ~4 bytes → 3 bytes
-    // of output; pre-check on encoded length so we never decode a huge blob
-    // just to throw it away.
+    // Pre-check encoded length (b64 ~4→3 bytes) → reject before alloc.
     if b64.len() / 4 * 3 > MAX_IMAGE_BYTES {
         anyhow::bail!(
             "image exceeds {} byte limit (encoded ~{} bytes)",

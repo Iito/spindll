@@ -114,8 +114,7 @@ pub fn download_hf_auto(
     let repo = api.model(repo_id.to_string());
     let info = repo.info()?;
 
-    // Exclude mmproj projector GGUFs — they're vision adapter weights, not
-    // language model weights, and must not be selected as the main model.
+    // Exclude mmproj GGUFs (vision adapter, not language weights).
     let gguf_files: Vec<_> = info
         .siblings
         .iter()
@@ -318,8 +317,7 @@ pub fn download_gguf(repo_id: &str, quant: Option<&str>, dest_dir: &Path) -> any
     let repo = api.model(repo_id.to_string());
 
     let info = repo.info()?;
-    // Exclude mmproj projector GGUFs — they're vision adapter weights, not
-    // language model weights, and must not be selected as the main model.
+    // Exclude mmproj GGUFs (vision adapter, not language weights).
     let gguf_files: Vec<_> = info
         .siblings
         .iter()
