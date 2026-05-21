@@ -33,6 +33,9 @@ fn proto_params_to_engine(p: Option<crate::proto::GenerateParams>) -> GeneratePa
             top_k:       p.top_k      .unwrap_or(40),
             seed:        p.seed       .map(|v| v as u32).unwrap_or(42),
             prefill_only: false,
+            draft_model_name: None,
+            n_draft: 0,
+            n_gram_draft: 0,
         },
         None => GenerateParams::default(),
     }
@@ -446,7 +449,7 @@ mod tests {
     use crate::backend::{BackendLoadParams, BackendModel, InferenceBackend};
     use crate::engine::streaming::{GenerateParams as EngineParams, GenerateResult};
     use crate::model_store::registry::{ModelEntry, ModelFormat, Registry};
-    use crate::proto::spindll_server::Spindll as _; // trait needed for .list()
+
 
     struct FakeBackend;
     impl InferenceBackend for FakeBackend {

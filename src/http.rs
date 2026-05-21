@@ -221,6 +221,9 @@ async fn chat(
                 top_k: p.top_k.unwrap_or(40),
                 seed: p.seed.unwrap_or(42),
                 prefill_only: false,
+                draft_model_name: None,
+                n_draft: 0,
+                n_gram_draft: 0,
             },
             None => GenerateParams::default(),
         };
@@ -641,6 +644,9 @@ async fn oai_chat_completions(
                 top_k: 40,
                 seed: req.seed.unwrap_or(42),
                 prefill_only: false,
+                draft_model_name: None,
+                n_draft: 0,
+                n_gram_draft: 0,
             };
 
             let completion_id = format!("chatcmpl-{:016x}", std::time::SystemTime::now()
@@ -786,6 +792,9 @@ async fn oai_chat_completions(
                 top_k: 40,
                 seed: req.seed.unwrap_or(42),
                 prefill_only: false,
+                draft_model_name: None,
+                n_draft: 0,
+                n_gram_draft: 0,
             };
 
             let mut output = String::new();
@@ -895,6 +904,9 @@ async fn oai_completions(
                 top_k: 40,
                 seed: req.seed.unwrap_or(42),
                 prefill_only: false,
+                draft_model_name: None,
+                n_draft: 0,
+                n_gram_draft: 0,
             };
 
             let completion_id = format!("cmpl-{:016x}", std::time::SystemTime::now()
@@ -952,6 +964,9 @@ async fn oai_completions(
                 top_k: 40,
                 seed: req.seed.unwrap_or(42),
                 prefill_only: false,
+                draft_model_name: None,
+                n_draft: 0,
+                n_gram_draft: 0,
             };
 
             let mut output = String::new();
@@ -1267,7 +1282,7 @@ mod tests {
             for tok in &["Hello", " world"] {
                 if !on_token(tok) { break; }
             }
-            Ok(GenerateResult { prompt_tokens: 5, completion_tokens: 2, cache_hit: false })
+            Ok(GenerateResult { prompt_tokens: 5, completion_tokens: 2, cache_hit: false, ..Default::default() })
         }
         fn apply_chat_template(&self, _: &[(String, String)]) -> anyhow::Result<String> { Ok("prompt".into()) }
         fn n_ctx(&self) -> u32 { 2048 }

@@ -1,8 +1,9 @@
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
@@ -135,6 +136,7 @@ impl InferenceBackend for LlamaCppBackend {
         );
 
         Ok(Box::new(LlamaCppModel {
+            spec_ctx: Mutex::new(None),
             model,
             n_ctx,
             n_ctx_train,
@@ -148,7 +150,15 @@ impl InferenceBackend for LlamaCppBackend {
     }
 }
 
+/// SAFETY: llama.cpp contexts are safe to use from a single thread at a time;
+/// Mutex ensures exclusive access.
+struct SendCtx(LlamaContext<'static>);
+unsafe impl Send for SendCtx {}
+
 pub struct LlamaCppModel {
+    // SAFETY: spec_ctx borrows from `model` via FFI handles; transmuted to
+    // 'static. MUST be declared above `model` so it drops first.
+    spec_ctx: Mutex<Option<SendCtx>>,
     model: LlamaModel,
     n_ctx: u32,
     n_ctx_train: u32,
@@ -167,6 +177,33 @@ impl LlamaCppModel {
 
     pub fn gpu_layers(&self) -> u32 {
         self.gpu_layers
+    }
+
+    /// Borrow a persistent context for speculative decoding. First call creates;
+    /// subsequent calls reset KV and reuse, eliminating per-call ctx allocation.
+    pub fn with_spec_ctx<R>(
+        &self,
+        _n_batch_min: u32,
+        f: impl FnOnce(&LlamaModel, &mut LlamaContext) -> anyhow::Result<R>,
+    ) -> anyhow::Result<R> {
+        let mut guard = self.spec_ctx.lock().unwrap();
+        if guard.is_none() {
+            let ctx_params = LlamaContextParams::default()
+                .with_n_ctx(NonZeroU32::new(self.n_ctx))
+                .with_n_batch(self.n_ctx);
+            let ctx = self
+                .model
+                .new_context(shared_backend(), ctx_params)
+                .map_err(|e| anyhow::anyhow!("failed to create context: {e}"))?;
+            // SAFETY: see field doc.
+            let ctx_static: LlamaContext<'static> = unsafe { std::mem::transmute(ctx) };
+            *guard = Some(SendCtx(ctx_static));
+        }
+        let ctx = &mut guard.as_mut().unwrap().0;
+        let _ = ctx.clear_kv_cache_seq(Some(0), None, None);
+        // SAFETY: narrow lifetime back to &self.
+        let ctx: &mut LlamaContext<'_> = unsafe { std::mem::transmute(ctx) };
+        f(&self.model, ctx)
     }
 }
 
