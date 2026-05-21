@@ -14,6 +14,10 @@ pub struct Metrics {
     pub embed_requests: AtomicU64,
     pub embed_errors: AtomicU64,
     pub total_embed_time_us: AtomicU64,
+    pub spec_drafts_proposed: AtomicU64,
+    pub spec_drafts_accepted: AtomicU64,
+    pub spec_cycles: AtomicU64,
+    pub spec_requests: AtomicU64,
 }
 
 /// Point-in-time snapshot of all metrics counters.
@@ -29,6 +33,10 @@ pub struct MetricsSnapshot {
     pub embed_requests: u64,
     pub embed_errors: u64,
     pub total_embed_time_us: u64,
+    pub spec_drafts_proposed: u64,
+    pub spec_drafts_accepted: u64,
+    pub spec_cycles: u64,
+    pub spec_requests: u64,
 }
 
 impl Default for Metrics {
@@ -52,6 +60,10 @@ impl Metrics {
             embed_requests: AtomicU64::new(0),
             embed_errors: AtomicU64::new(0),
             total_embed_time_us: AtomicU64::new(0),
+            spec_drafts_proposed: AtomicU64::new(0),
+            spec_drafts_accepted: AtomicU64::new(0),
+            spec_cycles: AtomicU64::new(0),
+            spec_requests: AtomicU64::new(0),
         }
     }
 
@@ -69,7 +81,19 @@ impl Metrics {
             embed_requests: self.embed_requests.load(Relaxed),
             embed_errors: self.embed_errors.load(Relaxed),
             total_embed_time_us: self.total_embed_time_us.load(Relaxed),
+            spec_drafts_proposed: self.spec_drafts_proposed.load(Relaxed),
+            spec_drafts_accepted: self.spec_drafts_accepted.load(Relaxed),
+            spec_cycles: self.spec_cycles.load(Relaxed),
+            spec_requests: self.spec_requests.load(Relaxed),
         }
+    }
+
+    /// Record per-request speculative-decoding counters.
+    pub fn record_speculative(&self, proposed: u64, accepted: u64, cycles: u64) {
+        self.spec_requests.fetch_add(1, Relaxed);
+        self.spec_drafts_proposed.fetch_add(proposed, Relaxed);
+        self.spec_drafts_accepted.fetch_add(accepted, Relaxed);
+        self.spec_cycles.fetch_add(cycles, Relaxed);
     }
 
     /// Record a completed generation request.
@@ -127,5 +151,12 @@ impl MetricsSnapshot {
     pub fn avg_tokens_per_second(&self) -> f32 {
         if self.total_generate_time_us == 0 { 0.0 }
         else { self.total_completion_tokens as f32 / (self.total_generate_time_us as f32 / 1_000_000.0) }
+    }
+
+    /// Speculative-decoding acceptance rate (accepted / proposed) in `[0.0, 1.0]`.
+    /// Returns 0.0 when no spec-decoding requests have been recorded.
+    pub fn spec_acceptance_rate(&self) -> f32 {
+        if self.spec_drafts_proposed == 0 { 0.0 }
+        else { self.spec_drafts_accepted as f32 / self.spec_drafts_proposed as f32 }
     }
 }
