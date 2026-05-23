@@ -4,55 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### Added
-
-- **Per-model eviction priority + idle-reload watcher** — models can be pinned or
-  deprioritised for eviction; idle-reload watches previously-loaded models and
-  brings them back when memory permits.
-- **MLX prompt KV cache** — prefix caching for MLX models with fused chat generate,
-  matching the GGUF backend's disk-backed cache.
-- **MLX chat template support** — reads Jinja chat templates via the Swift bridge,
-  falling back to ChatML when the model ships without one.
-- `docs/mlx-bridge.md` documenting the `mlx_bridge/` Swift package: C ABI,
-  prompt KV cache, build pipeline, and Rust FFI integration. Linked from the
-  `docs/` index and from a new `mlx_bridge/README.md` pointer.
-
-### Changed
-
-- `bench` command gated from release builds (`#[cfg(debug_assertions)]`).
-- Bench throughput reporting now separates decode tok/s from total tok/s;
-  comparison model is optional for single-model profiling.
-- `run` command routes through `ModelManager` instead of dispatching to backends
-  directly; gains `--ctx-size` and `--budget` flags.
-- Bench memory footprint measurement switched from raw `phys_footprint_mb` FFI to
-  the `memory-stats` crate.
-
-### Fixed
-
-- **MLX KV cache corruption** — quantize cache snapshots before storing to prevent
-  stale float buffers on cache hits; deep-copy `MambaCache` state to prevent
-  shared-buffer corruption across generations.
-- **MLX ChatML fallback** — models without a chat template no longer panic; the
-  bridge falls back to ChatML formatting.
-- MLX pull/run/rm bugs: import path resolution, model removal, incorrect format
-  detection.
-- MLX backend skipped gracefully when metallib not found next to binary.
-- `platform_prefers_mlx` gated on the `mlx` feature flag — no longer suggests MLX
-  format on builds compiled without the feature.
-- Reject MLX pull on unsupported platforms instead of downloading unusable weights.
-- Split GGUF models: download all shards instead of only the first file.
-- Suppress llama.cpp C-level log messages from leaking into terminal output;
-  restore log suppression with correct `ggml` level mapping.
-- Xcode toolchain rpath for Swift concurrency dylib on macOS.
-- Honor `--budget 0` flag and guard registry save against empty model stores.
-- **Linux budget-aware loading** — account for batch scheduler weight in memory
-  budget calculations, add `clamp_budget_to_live` to prevent over-allocation on
-  explicit budgets, use `checked_div` in `resolve_n_ctx` to avoid division by zero
-  on very small budgets.
-- README links to `docs/API.md` (removed in the v0.5.0 docs split) now point to
-  `docs/README.md` and `docs/api-rust.md`.
-
-## [0.5.0] - 2026-04-28
+## [0.5.0] - 2026-05-23
 
 ### Added
 
@@ -65,6 +17,16 @@ All notable changes to this project will be documented in this file.
   override auto-detection.
 - **MLX repo resolver** — maps Ollama names and HuggingFace GGUF repos to their
   `mlx-community` equivalents using a hardcoded table + HF API search fallback.
+- **Per-model eviction priority + idle-reload watcher** — models can be pinned or
+  deprioritised for eviction; idle-reload watches previously-loaded models and
+  brings them back when memory permits.
+- **MLX prompt KV cache** — prefix caching for MLX models with fused chat generate,
+  matching the GGUF backend's disk-backed cache.
+- **MLX chat template support** — reads Jinja chat templates via the Swift bridge,
+  falling back to ChatML when the model ships without one.
+- **`spindll search`** — search for models across HuggingFace and Ollama registries,
+  ranked by host hardware compatibility (preferred format first, models that fit
+  in available RAM before those that don't, then by download count).
 - **Registry versioning** — `registry.json` carries a `version` field with automatic forward
   migration on load and a read-only guard for files written by newer spindll versions.
 - **`base_model` field** — canonical model identity in the registry, enabling cross-format name
@@ -84,6 +46,9 @@ All notable changes to this project will be documented in this file.
   surface as `Repo (q4_k_m)` vs `Repo (fp16)` instead of duplicate labels.
 - **Dynamic column widths in `spindll list`** — MODEL and ARCH columns size to their longest
   entry so `mlx-community/...` paths don't wrap or truncate.
+- **Standalone binary** — embedded `mlx.metallib` in binary for standalone installs.
+- `docs/mlx-bridge.md` documenting the `mlx_bridge/` Swift package: C ABI,
+  prompt KV cache, build pipeline, and Rust FFI integration.
 
 ### Changed
 
@@ -92,14 +57,16 @@ All notable changes to this project will be documented in this file.
   (`Auto` / `Gguf` / `Mlx`); existing gRPC and HTTP handlers pass `Auto`.
 - CLI `run` and `bench` commands dispatch through `backend_for_format()` instead of
   separate per-format code paths.
-- KV cache byte estimation in `total_loaded_bytes` downcasts to `LlamaCppModel` — non-GGUF
-  backends report weight size only.
+- `run` command routes through `ModelManager` instead of dispatching to backends
+  directly; gains `--ctx-size` and `--budget` flags.
 - Context window sizing moved from the manager into each backend's `load_model`, threaded
   through `BackendLoadParams.memory_budget`.
 - `BackendLoadParams` gains a `memory_budget: u64` field; pass `0` for live-tracking auto-mode.
 - Default memory budget no longer applies a 20% reserve — `available_memory_platform` already
   excludes wired/active pages so the reserve was double-counting OS overhead.
 - `pull` default GGUF picker prefers q4_k_m (was: first file in repo, often fp16).
+- `bench` command gated from release builds.
+- Bench throughput reporting separates decode tok/s from total tok/s.
 
 ### Fixed
 
@@ -107,22 +74,32 @@ All notable changes to this project will be documented in this file.
   `LlamaBackend::init()` is now a `OnceLock` singleton in `backend::llamacpp`.
 - Context window silently exceeding available memory — `resolve_n_ctx` clamps to
   `min(budget, available_ram)` and floors at 512 tokens.
-- `n_batch == n_ctx` now set in every context-creation site (Engine, BatchScheduler,
-  manager's KV-cached path, `LlamaCppModel::generate`) — prevents GGML_ASSERT crashes on
+- `n_batch == n_ctx` now set in every context-creation site — prevents GGML_ASSERT crashes on
   prompts longer than 512 tokens.
 - `context_length` backfill now re-reads GGUF headers when the stored value is 0.
+- **MLX KV cache corruption** — quantize cache snapshots before storing to prevent
+  stale float buffers on cache hits; deep-copy `MambaCache` state to prevent
+  shared-buffer corruption across generations.
+- **MLX ChatML fallback** — models without a chat template no longer panic.
+- MLX pull/run/rm bugs: import path resolution, model removal, incorrect format detection.
+- MLX backend skipped gracefully when metallib not found next to binary.
 - MLX directory size reported as 0 due to `symlink_metadata` not following HF hub symlinks.
-- macOS available-memory calculation now includes `speculative_count` (file-cache prefetch
-  pages the kernel reclaims first under pressure) — recovers 1–2 GB that was understated.
+- `platform_prefers_mlx` gated on the `mlx` feature flag.
+- Reject MLX pull on unsupported platforms instead of downloading unusable weights.
+- Split GGUF models: download all shards instead of only the first file.
+- Suppress llama.cpp C-level log messages from leaking into terminal output.
+- Xcode toolchain rpath for Swift concurrency dylib on macOS.
+- Honor `--budget 0` flag and guard registry save against empty model stores.
+- **Linux budget-aware loading** — batch scheduler weight in memory budget calculations,
+  `clamp_budget_to_live` for over-allocation, `checked_div` in `resolve_n_ctx`.
+- macOS available-memory now includes `speculative_count`, recovering 1–2 GB.
 
 ### MLX bridge correctness
 
-- Switch generation loop from `AsyncStream<Generation>` to synchronous `TokenIterator`,
-  matching mlx-swift-lm's `runSynchronousGenerationLoop`.
-- `extraEOSTokens` now resolved through `convertTokenToId` so Gemma3 `<end_of_turn>`,
-  Phi `<|end|>`, and SmolLM `<turn|>` tokens actually stop generation.
-- Final detokenizer flush after the loop so partial-UTF-8 bytes aren't dropped on
-  maxTokens mid-codepoint exits.
+- Synchronous `TokenIterator` replacing `AsyncStream<Generation>`.
+- `extraEOSTokens` resolved through `convertTokenToId` so Gemma3, Phi, and SmolLM
+  stop tokens work correctly.
+- Final detokenizer flush for partial-UTF-8 bytes on maxTokens exits.
 - `Stream().synchronize()` before `perform` teardown to drain in-flight async evals.
 - `Memory.cacheLimit = 64MB` moved into `mlx_model_load` to amortise across runs.
 
