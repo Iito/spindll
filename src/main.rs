@@ -103,6 +103,14 @@ enum Commands {
         /// Enable KV cache for prompt prefixes (e.g. "2G", default 2G when enabled)
         #[arg(long)]
         kv_cache: Option<Option<String>>,
+
+        /// System prompt (default: "You are a helpful assistant.")
+        #[arg(long)]
+        system: Option<String>,
+
+        /// Max tokens to generate
+        #[arg(long, default_value = "512")]
+        max_tokens: u32,
     },
 
     /// Benchmark one or two models (GGUF vs GGUF, MLX vs MLX, or mixed)
@@ -511,6 +519,8 @@ async fn main() -> anyhow::Result<()> {
             ctx_size,
             budget,
             kv_cache,
+            system,
+            max_tokens,
         } => {
             let store = spindll::model_store::ModelStore::new(None);
             let model_path = store.resolve_model_path(&model)?;
@@ -528,8 +538,17 @@ async fn main() -> anyhow::Result<()> {
 
             manager.load_model_with_digest(&model, &model_path, None, digest)?;
 
-            let params = spindll::engine::GenerateParams::default();
-            manager.generate(&model, &prompt, &params, None, |token| {
+            let system_prompt = system.unwrap_or_else(|| "You are a helpful assistant.".to_string());
+            let messages: Vec<(String, String)> = vec![
+                ("system".to_string(), system_prompt),
+                ("user".to_string(), prompt),
+            ];
+
+            let params = spindll::engine::GenerateParams {
+                max_tokens,
+                ..Default::default()
+            };
+            manager.generate_chat(&model, &messages, &params, None, |token| {
                 use std::io::Write;
                 print!("{token}");
                 std::io::stdout().flush().ok();
