@@ -103,6 +103,22 @@ enum Commands {
         /// Enable KV cache for prompt prefixes (e.g. "2G", default 2G when enabled)
         #[arg(long)]
         kv_cache: Option<Option<String>>,
+
+        /// Greedy speculative decoding: name of a separately-loadable small
+        /// model used to propose tokens. Must share the target's vocabulary.
+        /// Forces temperature=0.0 and bypasses the KV cache.
+        #[arg(long)]
+        draft: Option<String>,
+
+        /// Number of tokens the draft proposes per verification cycle.
+        #[arg(long, default_value = "5")]
+        n_draft: u32,
+
+        /// Enable n-gram speculative drafting (no separate model needed).
+        /// Value is the per-cycle draft cap. `0` disables. Mutually exclusive
+        /// with `--draft`; if both are set, `--draft` wins.
+        #[arg(long, default_value = "0")]
+        n_gram_draft: u32,
     },
 
     /// Benchmark one or two models (GGUF vs GGUF, MLX vs MLX, or mixed)
@@ -133,6 +149,18 @@ enum Commands {
         /// Output JSON instead of a table
         #[arg(long)]
         json: bool,
+
+        /// Draft model for speculative decoding.
+        #[arg(long)]
+        draft: Option<String>,
+
+        /// Draft tokens per verify cycle when `--draft` is set.
+        #[arg(long, default_value = "5")]
+        n_draft: u32,
+
+        /// Enable n-gram speculative drafting (no separate model needed).
+        #[arg(long, default_value = "0")]
+        n_gram_draft: u32,
     },
 
     /// Import models from Ollama
@@ -215,6 +243,7 @@ fn manager_memory_budget(raw_budget: Option<&str>, detected_budget: u64) -> u64 
 // Backend dispatch
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "bench")]
 fn backend_for_format(
     format: &spindll::model_store::registry::ModelFormat,
 ) -> anyhow::Result<Box<dyn spindll::backend::InferenceBackend>> {
@@ -246,6 +275,10 @@ struct BenchResult {
     total_ms: f64,
     completion_tokens: u32,
     mem_peak_mb: f64,
+    /// Speculative-decoding acceptance rate (0..1). 0.0 when spec wasn't used.
+    spec_acceptance: f64,
+    /// Average draft tokens proposed per cycle. 0.0 when spec wasn't used.
+    spec_proposed_per_cycle: f64,
 }
 
 /// Resident memory of this process in MB. Uses `memory-stats` which wraps
@@ -343,6 +376,176 @@ fn bench_by_format(
         total_ms: total_ms_sum / runs as f64,
         completion_tokens: last_tokens,
         mem_peak_mb: mem_peak,
+        spec_acceptance: 0.0,
+        spec_proposed_per_cycle: 0.0,
+    })
+}
+
+#[cfg(feature = "bench")]
+fn bench_speculative(
+    target_path: &std::path::Path,
+    draft_path: &std::path::Path,
+    prompt: &str,
+    max_tokens: u32,
+    runs: u32,
+    ctx_size: u32,
+    n_draft: u32,
+) -> anyhow::Result<BenchResult> {
+    if runs == 0 {
+        anyhow::bail!("--runs must be greater than 0");
+    }
+
+    let manager = spindll::engine::ModelManager::new(ctx_size, None, 0)?;
+    manager.load_model("target", target_path, None)?;
+    manager.load_model("draft", draft_path, None)?;
+
+    let params = spindll::engine::GenerateParams {
+        max_tokens,
+        temperature: 0.0,
+        top_k: 1,
+        top_p: 1.0,
+        draft_model_name: Some("draft".to_string()),
+        n_draft,
+        ..Default::default()
+    };
+
+    let _ = manager.generate("target", prompt, &params, None, |_| true)?;
+
+    let mut ttft_sum = 0.0f64;
+    let mut tps_sum = 0.0f64;
+    let mut total_ms_sum = 0.0f64;
+    let mut last_tokens = 0u32;
+    let mut mem_peak = 0.0f64;
+    let mut proposed_sum = 0u64;
+    let mut accepted_sum = 0u64;
+    let mut cycles_sum = 0u64;
+
+    for _ in 0..runs {
+        let start = std::time::Instant::now();
+        let mut first = true;
+        let mut ttft = 0.0f64;
+        let result = manager.generate("target", prompt, &params, None, |_token| {
+            if first {
+                ttft = start.elapsed().as_secs_f64() * 1000.0;
+                first = false;
+            }
+            true
+        })?;
+        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+        ttft_sum += ttft;
+        tps_sum += decode_tok_per_sec(result.completion_tokens, ttft, total_ms);
+        total_ms_sum += total_ms;
+        last_tokens = result.completion_tokens;
+        proposed_sum += u64::from(result.spec_drafts_proposed);
+        accepted_sum += u64::from(result.spec_drafts_accepted);
+        cycles_sum += u64::from(result.spec_cycles);
+        let sample = phys_footprint_mb();
+        if sample > mem_peak {
+            mem_peak = sample;
+        }
+    }
+
+    let acceptance = if proposed_sum == 0 {
+        0.0
+    } else {
+        accepted_sum as f64 / proposed_sum as f64
+    };
+    let per_cycle = if cycles_sum == 0 {
+        0.0
+    } else {
+        proposed_sum as f64 / cycles_sum as f64
+    };
+
+    Ok(BenchResult {
+        format_name: "GGUF+SPEC",
+        ttft_ms: ttft_sum / runs as f64,
+        tok_per_sec: tps_sum / runs as f64,
+        total_ms: total_ms_sum / runs as f64,
+        completion_tokens: last_tokens,
+        mem_peak_mb: mem_peak,
+        spec_acceptance: acceptance,
+        spec_proposed_per_cycle: per_cycle,
+    })
+}
+
+#[cfg(feature = "bench")]
+fn bench_speculative_ngram(
+    target_path: &std::path::Path,
+    prompt: &str,
+    max_tokens: u32,
+    runs: u32,
+    ctx_size: u32,
+    n_gram_draft: u32,
+) -> anyhow::Result<BenchResult> {
+    if runs == 0 {
+        anyhow::bail!("--runs must be greater than 0");
+    }
+    let manager = spindll::engine::ModelManager::new(ctx_size, None, 0)?;
+    manager.load_model("target", target_path, None)?;
+    let params = spindll::engine::GenerateParams {
+        max_tokens,
+        temperature: 0.0,
+        top_k: 1,
+        top_p: 1.0,
+        n_gram_draft,
+        ..Default::default()
+    };
+    let _ = manager.generate("target", prompt, &params, None, |_| true)?;
+
+    let mut ttft_sum = 0.0f64;
+    let mut tps_sum = 0.0f64;
+    let mut total_ms_sum = 0.0f64;
+    let mut last_tokens = 0u32;
+    let mut mem_peak = 0.0f64;
+    let mut proposed_sum = 0u64;
+    let mut accepted_sum = 0u64;
+    let mut cycles_sum = 0u64;
+
+    for _ in 0..runs {
+        let start = std::time::Instant::now();
+        let mut first = true;
+        let mut ttft = 0.0f64;
+        let result = manager.generate("target", prompt, &params, None, |_t| {
+            if first {
+                ttft = start.elapsed().as_secs_f64() * 1000.0;
+                first = false;
+            }
+            true
+        })?;
+        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+        ttft_sum += ttft;
+        tps_sum += decode_tok_per_sec(result.completion_tokens, ttft, total_ms);
+        total_ms_sum += total_ms;
+        last_tokens = result.completion_tokens;
+        proposed_sum += u64::from(result.spec_drafts_proposed);
+        accepted_sum += u64::from(result.spec_drafts_accepted);
+        cycles_sum += u64::from(result.spec_cycles);
+        let sample = phys_footprint_mb();
+        if sample > mem_peak {
+            mem_peak = sample;
+        }
+    }
+
+    let acceptance = if proposed_sum == 0 {
+        0.0
+    } else {
+        accepted_sum as f64 / proposed_sum as f64
+    };
+    let per_cycle = if cycles_sum == 0 {
+        0.0
+    } else {
+        proposed_sum as f64 / cycles_sum as f64
+    };
+
+    Ok(BenchResult {
+        format_name: "GGUF+NGRAM",
+        ttft_ms: ttft_sum / runs as f64,
+        tok_per_sec: tps_sum / runs as f64,
+        total_ms: total_ms_sum / runs as f64,
+        completion_tokens: last_tokens,
+        mem_peak_mb: mem_peak,
+        spec_acceptance: acceptance,
+        spec_proposed_per_cycle: per_cycle,
     })
 }
 
@@ -511,6 +714,9 @@ async fn main() -> anyhow::Result<()> {
             ctx_size,
             budget,
             kv_cache,
+            draft,
+            n_draft,
+            n_gram_draft,
         } => {
             let store = spindll::model_store::ModelStore::new(None);
             let model_path = store.resolve_model_path(&model)?;
@@ -528,7 +734,26 @@ async fn main() -> anyhow::Result<()> {
 
             manager.load_model_with_digest(&model, &model_path, None, digest)?;
 
-            let params = spindll::engine::GenerateParams::default();
+            // Optionally load a draft model for speculative decoding.
+            if let Some(draft_name) = draft.as_deref() {
+                let draft_path = store.resolve_model_path(draft_name)?;
+                let draft_digest = store.resolve_model_digest(draft_name).unwrap_or_default();
+                manager.load_model_with_digest(
+                    draft_name,
+                    &draft_path,
+                    None,
+                    draft_digest,
+                )?;
+            }
+
+            let use_spec = draft.is_some() || n_gram_draft > 0;
+            let params = spindll::engine::GenerateParams {
+                draft_model_name: draft.clone(),
+                n_draft,
+                n_gram_draft,
+                temperature: if use_spec { 0.0 } else { 0.8 },
+                ..Default::default()
+            };
             manager.generate(&model, &prompt, &params, None, |token| {
                 use std::io::Write;
                 print!("{token}");
@@ -546,6 +771,9 @@ async fn main() -> anyhow::Result<()> {
             ctx_size,
             prompt,
             json,
+            draft,
+            n_draft,
+            n_gram_draft,
         } => {
             let store = spindll::model_store::ModelStore::new(None);
             let default_prompt =
@@ -566,6 +794,17 @@ async fn main() -> anyhow::Result<()> {
 
             use std::io::Write;
             std::io::stderr().flush().ok();
+            println!("prompt    {:?}", prompt_str);
+            println!(
+                "runs      {} (+ 1 warmup)  max-tokens={}  ctx-size={} (GGUF)",
+                runs, max_tokens, ctx_size
+            );
+            println!("{}", "─".repeat(80));
+            println!(
+                "{:<36} {:>9} {:>9} {:>8} {:>9} {:>9} {:>8} {:>6}",
+                "MODEL", "FMT", "P/C TOK", "TTFT", "DEC/S", "TOTAL/S", "TOTAL", "MEM"
+            );
+            println!("{}", "─".repeat(80));
 
             if json {
                 let mut results = serde_json::json!([{
@@ -643,6 +882,34 @@ async fn main() -> anyhow::Result<()> {
                         fl, tps_pct, ttft_pct, sl,
                     );
                 }
+            }
+
+            // Speculative-decoding comparison
+            if let Some(draft_name) = draft.as_ref() {
+                let dp = store.resolve_model_path(draft_name)?;
+                let rs = bench_speculative(
+                    &path1, &dp, prompt_str, max_tokens, runs, ctx_size, n_draft,
+                )?;
+                print_bench_row(&format!("{} + draft={}", model, draft_name), &rs);
+                println!("{}", "─".repeat(80));
+                println!(
+                    "spec acceptance: {:.1}%  drafts/cycle: {:.2}  spec-vs-base tps: {:.2}x",
+                    rs.spec_acceptance * 100.0,
+                    rs.spec_proposed_per_cycle,
+                    rs.tok_per_sec / r1.tok_per_sec,
+                );
+            } else if n_gram_draft > 0 {
+                let rs = bench_speculative_ngram(
+                    &path1, prompt_str, max_tokens, runs, ctx_size, n_gram_draft,
+                )?;
+                print_bench_row(&format!("{} + n-gram={}", model, n_gram_draft), &rs);
+                println!("{}", "─".repeat(80));
+                println!(
+                    "ngram acceptance: {:.1}%  drafts/cycle: {:.2}  ngram-vs-base tps: {:.2}x",
+                    rs.spec_acceptance * 100.0,
+                    rs.spec_proposed_per_cycle,
+                    rs.tok_per_sec / r1.tok_per_sec,
+                );
             }
         }
         Commands::Search { query, limit, format, sort } => {

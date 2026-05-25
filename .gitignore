@@ -1,4 +1,6 @@
 /target
+/target-wsl
+/target-wsl-cuda
 /mlx_bridge/.build
 /bench/results/
 
@@ -14,3 +16,5 @@ tools/
 
 # Agent run artifacts (review outputs, autoloop trial logs, sessions)
 .refs/
+/.worktrees
+/skills-lock.json

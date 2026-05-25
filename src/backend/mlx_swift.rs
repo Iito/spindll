@@ -268,7 +268,7 @@ impl MlxSwiftEngine {
             );
         }
 
-        Ok(GenerateResult { prompt_tokens: 0, completion_tokens, cache_hit: false })
+        Ok(GenerateResult { prompt_tokens: 0, completion_tokens, cache_hit: false, ..Default::default() })
     }
 
     /// Generate tokens from `prompt`, calling `on_token` for each text chunk.
@@ -293,11 +293,7 @@ impl MlxSwiftEngine {
         // No disk KV cache on MLX -- prefill would burn full decode then drop
         // the result. Return zeros so gRPC Prefill is a cheap no-op.
         if params.prefill_only {
-            return Ok(GenerateResult {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                cache_hit: false,
-            });
+            return Ok(GenerateResult::default());
         }
 
         let c_prompt = CString::new(prompt)?;
@@ -368,6 +364,7 @@ impl MlxSwiftEngine {
             prompt_tokens:     0,
             completion_tokens,
             cache_hit:         false,
+            ..Default::default()
         })
     }
 }
@@ -390,7 +387,7 @@ impl BackendModel for MlxSwiftEngine {
     ) -> anyhow::Result<GenerateResult> {
         // MLX has no disk KV cache; prefill is a cheap no-op.
         if params.prefill_only {
-            return Ok(GenerateResult { prompt_tokens: 0, completion_tokens: 0, cache_hit: false });
+            return Ok(GenerateResult::default());
         }
         self.chat_generate_dyn(messages, params, on_token)
     }

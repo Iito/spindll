@@ -19,7 +19,10 @@ use super::kv_cache::KvCache;
 use super::kv_ram_cache::KvRamCache;
 use super::metrics::Metrics;
 use super::ram_cache::RamCache;
-use super::streaming::{GenerateParams, GenerateResult, generate_streaming_cached};
+use super::streaming::{
+    GenerateParams, GenerateResult, generate_streaming_cached,
+    generate_streaming_speculative, generate_streaming_speculative_ngram,
+};
 
 /// Eviction tier. Low evicts first, LRU tiebreak within tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -608,7 +611,19 @@ impl ModelManager {
         mut on_token: impl FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
         let _active = ActiveGuard::new(&self.active_requests);
-        let batch_tx = {
+        // Speculative decoding forces the direct path: the batch scheduler
+        // multiplex doesn't know about draft models.
+        let force_direct = params.draft_model_name.is_some() || params.n_gram_draft > 0;
+        let batch_tx = if force_direct {
+            let models = self.models.read().unwrap();
+            if let Some(m) = models.get(model_name) {
+                *m.last_used.write().unwrap() = Instant::now();
+                if m.batch_tx.is_some() {
+                    tracing::debug!(model = model_name, "bypassing batch scheduler for speculative decoding");
+                }
+            }
+            None
+        } else {
             let models = self.models.read().unwrap();
             models.get(model_name).and_then(|m| {
                 *m.last_used.write().unwrap() = Instant::now();
@@ -644,6 +659,13 @@ impl ModelManager {
                         stats.cache_hit,
                     );
                 }
+                if stats.spec_cycles > 0 {
+                    self.metrics.record_speculative(
+                        stats.spec_drafts_proposed as u64,
+                        stats.spec_drafts_accepted as u64,
+                        stats.spec_cycles as u64,
+                    );
+                }
             }
             Err(e) => {
                 tracing::error!(error = %e, elapsed_ms = elapsed_us / 1000, "generation failed");
@@ -671,6 +693,10 @@ impl ModelManager {
                 top_k: params.top_k,
                 seed: params.seed,
                 prefill_only: params.prefill_only,
+                // Batch scheduler path doesn't support speculative decoding.
+                draft_model_name: None,
+                n_draft: 0,
+                n_gram_draft: 0,
             },
             response_tx: resp_tx,
         };
@@ -693,6 +719,7 @@ impl ModelManager {
                         prompt_tokens,
                         completion_tokens,
                         cache_hit: false,
+                        ..Default::default()
                     });
                 }
                 Some(BatchEvent::Error(msg)) => {
@@ -704,11 +731,7 @@ impl ModelManager {
             }
         }
 
-        Ok(GenerateResult {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            cache_hit: false,
-        })
+        Ok(GenerateResult::default())
     }
 
     /// Per-request context path. Uses KV cache for GGUF models when available,
@@ -721,6 +744,23 @@ impl ModelManager {
         encryption_key: Option<&[u8; 32]>,
         on_token: &mut dyn FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
+        // Speculative decoding fast path: target+draft must both be loaded
+        // GGUF (llamacpp), and sampling must be greedy. Any failure of those
+        // preconditions returns an error so the user notices the misconfig
+        // rather than silently falling back to plain generation.
+        if let Some(draft_name) = params.draft_model_name.as_ref() {
+            return self.generate_speculative(
+                model_name,
+                draft_name,
+                prompt,
+                params,
+                on_token,
+            );
+        }
+        if params.n_gram_draft > 0 {
+            return self.generate_speculative_ngram(model_name, prompt, params, on_token);
+        }
+
         let models = self.models.read().unwrap();
         let loaded = models
             .get(model_name)
@@ -757,6 +797,148 @@ impl ModelManager {
         loaded.model.generate(prompt, params, on_token)
     }
 
+    /// Run greedy speculative decoding using `draft_name` as the proposer and
+    /// `target_name` as the verifier. Both must be loaded GGUF models with
+    /// identical vocabularies.
+    fn generate_speculative(
+        &self,
+        target_name: &str,
+        draft_name: &str,
+        prompt: &str,
+        params: &GenerateParams,
+        on_token: &mut dyn FnMut(&str) -> bool,
+    ) -> anyhow::Result<GenerateResult> {
+        if params.temperature != 0.0 {
+            anyhow::bail!(
+                "speculative decoding requires temperature=0.0 (got {}); stochastic verify is not implemented yet",
+                params.temperature
+            );
+        }
+        if target_name == draft_name {
+            // Same name is legal (used by the self-speculation correctness
+            // test) — log it as suspicious but allow.
+            tracing::debug!(model = target_name, "speculative decoding with self as draft");
+        }
+
+        let models = self.models.read().unwrap();
+        let target_loaded = models
+            .get(target_name)
+            .ok_or_else(|| anyhow::anyhow!("target model '{}' not loaded", target_name))?;
+        let draft_loaded = models
+            .get(draft_name)
+            .ok_or_else(|| anyhow::anyhow!("draft model '{}' not loaded", draft_name))?;
+        *target_loaded.last_used.write().unwrap() = Instant::now();
+        *draft_loaded.last_used.write().unwrap() = Instant::now();
+
+        let target_llama = target_loaded
+            .model
+            .as_any()
+            .downcast_ref::<LlamaCppModel>()
+            .ok_or_else(|| {
+                anyhow::anyhow!("speculative decoding currently requires a GGUF target model")
+            })?;
+        let draft_llama = draft_loaded
+            .model
+            .as_any()
+            .downcast_ref::<LlamaCppModel>()
+            .ok_or_else(|| {
+                anyhow::anyhow!("speculative decoding currently requires a GGUF draft model")
+            })?;
+
+        let target_n_ctx = target_loaded.n_ctx;
+        let draft_n_ctx = draft_loaded.n_ctx;
+        let n_draft = params.n_draft.max(1);
+        // Draft batch needs at least n_draft tokens (verify batch on target
+        // is the same size). 64 covers reasonable n_draft values and avoids
+        // wasting compute buffers on the draft.
+        let draft_n_batch = n_draft.max(64).min(draft_n_ctx);
+        let target_n_batch = target_n_ctx; // prefill batch may be large
+
+        // Self-spec (target==draft) would deadlock on the shared spec_ctx Mutex.
+        let same_model = std::ptr::eq(target_llama as *const _, draft_llama as *const _);
+        if same_model {
+            let target_ctx_params = LlamaContextParams::default()
+                .with_n_ctx(NonZeroU32::new(target_n_ctx))
+                .with_n_batch(target_n_batch);
+            let mut target_ctx = target_llama
+                .llama_model()
+                .new_context(target_llama.llama_backend(), target_ctx_params)
+                .map_err(|e| anyhow::anyhow!("failed to create target context: {e}"))?;
+            let draft_ctx_params = LlamaContextParams::default()
+                .with_n_ctx(NonZeroU32::new(draft_n_ctx))
+                .with_n_batch(draft_n_batch);
+            let mut draft_ctx = draft_llama
+                .llama_model()
+                .new_context(draft_llama.llama_backend(), draft_ctx_params)
+                .map_err(|e| anyhow::anyhow!("failed to create draft context: {e}"))?;
+            return generate_streaming_speculative(
+                target_llama.llama_model(),
+                &mut target_ctx,
+                draft_llama.llama_model(),
+                &mut draft_ctx,
+                prompt,
+                params,
+                n_draft,
+                on_token,
+            );
+        }
+
+        target_llama.with_spec_ctx(target_n_batch, |target_model, target_ctx| {
+            draft_llama.with_spec_ctx(draft_n_batch, |draft_model, draft_ctx| {
+                generate_streaming_speculative(
+                    target_model,
+                    target_ctx,
+                    draft_model,
+                    draft_ctx,
+                    prompt,
+                    params,
+                    n_draft,
+                    &mut *on_token,
+                )
+            })
+        })
+    }
+
+    /// N-gram-driven greedy spec decoding, single model.
+    fn generate_speculative_ngram(
+        &self,
+        target_name: &str,
+        prompt: &str,
+        params: &GenerateParams,
+        on_token: &mut dyn FnMut(&str) -> bool,
+    ) -> anyhow::Result<GenerateResult> {
+        if params.temperature != 0.0 {
+            anyhow::bail!(
+                "n-gram speculative decoding requires temperature=0.0 (got {})",
+                params.temperature
+            );
+        }
+        let models = self.models.read().unwrap();
+        let loaded = models
+            .get(target_name)
+            .ok_or_else(|| anyhow::anyhow!("target model '{}' not loaded", target_name))?;
+        *loaded.last_used.write().unwrap() = Instant::now();
+        let llama = loaded
+            .model
+            .as_any()
+            .downcast_ref::<LlamaCppModel>()
+            .ok_or_else(|| {
+                anyhow::anyhow!("n-gram speculative decoding currently requires a GGUF target model")
+            })?;
+        let n_draft = params.n_gram_draft.max(1);
+        let target_n_batch = loaded.n_ctx;
+        llama.with_spec_ctx(target_n_batch, |target_model, target_ctx| {
+            generate_streaming_speculative_ngram(
+                target_model,
+                target_ctx,
+                prompt,
+                params,
+                n_draft,
+                &mut *on_token,
+            )
+        })
+    }
+
     /// Apply the model's chat template and generate in one step.
     ///
     /// Backends that support fused template + generation (e.g. MLX) use a
@@ -775,7 +957,17 @@ impl ModelManager {
         mut on_token: impl FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
         let _active = ActiveGuard::new(&self.active_requests);
-        let batch_tx = {
+        let force_direct = params.draft_model_name.is_some() || params.n_gram_draft > 0;
+        let batch_tx = if force_direct {
+            let models = self.models.read().unwrap();
+            if let Some(m) = models.get(model_name) {
+                *m.last_used.write().unwrap() = Instant::now();
+                if m.batch_tx.is_some() {
+                    tracing::debug!(model = model_name, "bypassing batch scheduler for speculative decoding");
+                }
+            }
+            None
+        } else {
             let models = self.models.read().unwrap();
             models.get(model_name).and_then(|m| {
                 *m.last_used.write().unwrap() = Instant::now();
@@ -831,6 +1023,23 @@ impl ModelManager {
         encryption_key: Option<&[u8; 32]>,
         on_token: &mut dyn FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
+        // Speculative decoding requires the rendered prompt string — apply
+        // the template here, then dispatch to the generic spec path.
+        if params.draft_model_name.is_some() {
+            let prompt = self.apply_chat_template(model_name, messages)?;
+            return self.generate_speculative(
+                model_name,
+                params.draft_model_name.as_deref().unwrap(),
+                &prompt,
+                params,
+                on_token,
+            );
+        }
+        if params.n_gram_draft > 0 {
+            let prompt = self.apply_chat_template(model_name, messages)?;
+            return self.generate_speculative_ngram(model_name, &prompt, params, on_token);
+        }
+
         let models = self.models.read().unwrap();
         let loaded = models
             .get(model_name)
