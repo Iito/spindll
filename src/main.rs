@@ -409,15 +409,12 @@ fn bench_speculative(
         ..Default::default()
     };
 
-    // warmup
     let _ = manager.generate("target", prompt, &params, None, |_| true)?;
 
     let mut ttft_sum = 0.0f64;
-    let mut decode_tps_sum = 0.0f64;
-    let mut total_tps_sum = 0.0f64;
+    let mut tps_sum = 0.0f64;
     let mut total_ms_sum = 0.0f64;
-    let mut prompt_token_sum = 0u64;
-    let mut completion_token_sum = 0u64;
+    let mut last_tokens = 0u32;
     let mut mem_peak = 0.0f64;
     let mut proposed_sum = 0u64;
     let mut accepted_sum = 0u64;
@@ -434,14 +431,11 @@ fn bench_speculative(
             }
             true
         })?;
-        let elapsed = start.elapsed().as_secs_f64();
-        let (decode_tps, total_tps) = bench_sample_rates(result.completion_tokens, elapsed, ttft);
+        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
         ttft_sum += ttft;
-        decode_tps_sum += decode_tps;
-        total_tps_sum += total_tps;
-        total_ms_sum += elapsed * 1000.0;
-        prompt_token_sum += u64::from(result.prompt_tokens);
-        completion_token_sum += u64::from(result.completion_tokens);
+        tps_sum += decode_tok_per_sec(result.completion_tokens, ttft, total_ms);
+        total_ms_sum += total_ms;
+        last_tokens = result.completion_tokens;
         proposed_sum += u64::from(result.spec_drafts_proposed);
         accepted_sum += u64::from(result.spec_drafts_accepted);
         cycles_sum += u64::from(result.spec_cycles);
@@ -464,12 +458,10 @@ fn bench_speculative(
 
     Ok(BenchResult {
         format_name: "GGUF+SPEC",
-        prompt_tokens: average_tokens(prompt_token_sum, runs),
-        completion_tokens: average_tokens(completion_token_sum, runs),
         ttft_ms: ttft_sum / runs as f64,
-        decode_tokens_per_sec: decode_tps_sum / runs as f64,
-        total_tokens_per_sec: total_tps_sum / runs as f64,
+        tok_per_sec: tps_sum / runs as f64,
         total_ms: total_ms_sum / runs as f64,
+        completion_tokens: last_tokens,
         mem_peak_mb: mem_peak,
         spec_acceptance: acceptance,
         spec_proposed_per_cycle: per_cycle,
@@ -499,16 +491,16 @@ fn bench_speculative_ngram(
         ..Default::default()
     };
     let _ = manager.generate("target", prompt, &params, None, |_| true)?;
+
     let mut ttft_sum = 0.0f64;
-    let mut decode_tps_sum = 0.0f64;
-    let mut total_tps_sum = 0.0f64;
+    let mut tps_sum = 0.0f64;
     let mut total_ms_sum = 0.0f64;
-    let mut prompt_token_sum = 0u64;
-    let mut completion_token_sum = 0u64;
+    let mut last_tokens = 0u32;
     let mut mem_peak = 0.0f64;
     let mut proposed_sum = 0u64;
     let mut accepted_sum = 0u64;
     let mut cycles_sum = 0u64;
+
     for _ in 0..runs {
         let start = std::time::Instant::now();
         let mut first = true;
@@ -520,15 +512,11 @@ fn bench_speculative_ngram(
             }
             true
         })?;
-        let elapsed = start.elapsed().as_secs_f64();
-        let (decode_tps, total_tps) =
-            bench_sample_rates(result.completion_tokens, elapsed, ttft);
+        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
         ttft_sum += ttft;
-        decode_tps_sum += decode_tps;
-        total_tps_sum += total_tps;
-        total_ms_sum += elapsed * 1000.0;
-        prompt_token_sum += u64::from(result.prompt_tokens);
-        completion_token_sum += u64::from(result.completion_tokens);
+        tps_sum += decode_tok_per_sec(result.completion_tokens, ttft, total_ms);
+        total_ms_sum += total_ms;
+        last_tokens = result.completion_tokens;
         proposed_sum += u64::from(result.spec_drafts_proposed);
         accepted_sum += u64::from(result.spec_drafts_accepted);
         cycles_sum += u64::from(result.spec_cycles);
@@ -537,6 +525,7 @@ fn bench_speculative_ngram(
             mem_peak = sample;
         }
     }
+
     let acceptance = if proposed_sum == 0 {
         0.0
     } else {
@@ -547,14 +536,13 @@ fn bench_speculative_ngram(
     } else {
         proposed_sum as f64 / cycles_sum as f64
     };
+
     Ok(BenchResult {
         format_name: "GGUF+NGRAM",
-        prompt_tokens: average_tokens(prompt_token_sum, runs),
-        completion_tokens: average_tokens(completion_token_sum, runs),
         ttft_ms: ttft_sum / runs as f64,
-        decode_tokens_per_sec: decode_tps_sum / runs as f64,
-        total_tokens_per_sec: total_tps_sum / runs as f64,
+        tok_per_sec: tps_sum / runs as f64,
         total_ms: total_ms_sum / runs as f64,
+        completion_tokens: last_tokens,
         mem_peak_mb: mem_peak,
         spec_acceptance: acceptance,
         spec_proposed_per_cycle: per_cycle,
@@ -908,7 +896,7 @@ async fn main() -> anyhow::Result<()> {
                     "spec acceptance: {:.1}%  drafts/cycle: {:.2}  spec-vs-base tps: {:.2}x",
                     rs.spec_acceptance * 100.0,
                     rs.spec_proposed_per_cycle,
-                    rs.total_tokens_per_sec / r1.total_tokens_per_sec,
+                    rs.tok_per_sec / r1.tok_per_sec,
                 );
             } else if n_gram_draft > 0 {
                 let rs = bench_speculative_ngram(
@@ -920,7 +908,7 @@ async fn main() -> anyhow::Result<()> {
                     "ngram acceptance: {:.1}%  drafts/cycle: {:.2}  ngram-vs-base tps: {:.2}x",
                     rs.spec_acceptance * 100.0,
                     rs.spec_proposed_per_cycle,
-                    rs.total_tokens_per_sec / r1.total_tokens_per_sec,
+                    rs.tok_per_sec / r1.tok_per_sec,
                 );
             }
         }
