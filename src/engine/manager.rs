@@ -98,7 +98,6 @@ pub struct ModelManager {
     default_n_ctx: u32,
     default_gpu_layers: u32,
     memory_budget: u64,
-    clamp_budget_to_live: bool,
     kv_cache: Option<KvCache>,
     ram_cache: Option<RamCache>,
     metrics: Arc<Metrics>,
@@ -175,10 +174,10 @@ impl ModelManager {
             }
         });
 
-        let (memory_budget, clamp_budget_to_live) = if memory_budget == 0 {
-            (sysinfo::System::new_all().total_memory(), false)
+        let memory_budget = if memory_budget == 0 {
+            sysinfo::System::new_all().total_memory()
         } else {
-            (memory_budget, true)
+            memory_budget
         };
 
         Ok(Self {
@@ -187,7 +186,6 @@ impl ModelManager {
             default_n_ctx: n_ctx,
             default_gpu_layers,
             memory_budget,
-            clamp_budget_to_live,
             kv_cache: None,
             ram_cache: None,
             metrics: Arc::new(Metrics::new()),
@@ -207,7 +205,6 @@ impl ModelManager {
             default_n_ctx: 2048,
             default_gpu_layers: 0,
             memory_budget,
-            clamp_budget_to_live: memory_budget > 0,
             kv_cache: None,
             ram_cache: None,
             metrics: Arc::new(Metrics::new()),
@@ -243,13 +240,8 @@ impl ModelManager {
             .sum()
     }
 
-    /// Budget for next load. Live budgets clamp to current RAM.
     fn effective_budget(&self) -> u64 {
-        if !self.clamp_budget_to_live {
-            return self.memory_budget;
-        }
-        let mem = crate::scheduler::budget::MemoryBudget::detect(None);
-        std::cmp::min(self.memory_budget, mem.available_ram)
+        self.memory_budget
     }
 
     /// Evict by (priority, LRU) until `needed` bytes fit. Returns reload specs
@@ -392,11 +384,7 @@ impl ModelManager {
         // Once weights are mmap'd / uploaded to Metal, available memory drops,
         // so the snapshot has to happen here, not inside the backend.
         let mem = crate::scheduler::budget::MemoryBudget::detect(None);
-        let load_budget = if !self.clamp_budget_to_live {
-            self.memory_budget
-        } else {
-            std::cmp::min(self.memory_budget, mem.available_ram)
-        };
+        let load_budget = std::cmp::min(self.memory_budget, mem.available_ram);
         let load_budget = load_budget.saturating_sub(planned_scheduler_bytes);
 
         let layers = gpu_layers.unwrap_or(self.default_gpu_layers);
@@ -1327,18 +1315,8 @@ mod tests {
     }
 
     #[test]
-    fn effective_budget_unclamped_when_total_ram_mode() {
-        let mut mgr = test_manager(1_000_000);
-        mgr.clamp_budget_to_live = false;
-        let b = mgr.effective_budget();
-        assert_eq!(b, 1_000_000, "unclamped mode returns stored budget directly");
-    }
-
-    #[test]
-    fn effective_budget_clamped_when_explicit() {
-        let mgr = test_manager(u64::MAX);
-        assert!(mgr.clamp_budget_to_live);
-        let b = mgr.effective_budget();
-        assert!(b < u64::MAX, "clamped mode should cap to available RAM");
+    fn effective_budget_returns_stored_value() {
+        let mgr = test_manager(8_000_000_000);
+        assert_eq!(mgr.effective_budget(), 8_000_000_000);
     }
 }
