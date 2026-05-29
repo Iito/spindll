@@ -165,9 +165,37 @@ The gRPC server and core engine are always compiled -- no feature flag needed fo
 
 ## Prerequisites
 
+### Build requirements
+
 - [Rust toolchain](https://rustup.rs/) (stable, edition 2024)
 - CMake (for llama.cpp compilation)
 - Swift toolchain ≥ 5.9 and Xcode command-line tools (only when building with `--features mlx` on Apple Silicon)
+
+### Linux build (bare Ubuntu 24.04 or equivalent)
+
+On a fresh Ubuntu install, install these additional system packages:
+
+```bash
+sudo apt install -y \
+  build-essential pkg-config cmake \
+  protobuf-compiler \
+  libssl-dev \
+  clang libclang-dev
+```
+
+GitHub Actions runners come with these pre-installed, so CI succeeds without explicit setup. Bare Ubuntu requires the full list.
+
+### End-user runtime
+
+The release binary links dynamically against system libraries. On Linux (glibc), users need:
+
+```bash
+sudo apt install -y libssl3 libgomp1
+```
+
+(These are pre-installed on Ubuntu/Debian/Fedora desktop; minimal server images require the install.)
+
+macOS release binaries are self-contained; no runtime dependencies.
 
 ## License
 
