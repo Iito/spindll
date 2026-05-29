@@ -10,6 +10,10 @@ All notable changes to this project will be documented in this file.
 
 - **Memory budget live re-evaluation** — stale memory budget snapshot no longer prevents model loads after external processes free RAM. The budget is now re-evaluated on each load attempt, respecting explicit `--budget` flags without clamping to stale available memory.
 
+### Documentation
+
+- **Linux build and runtime dependencies** — documented complete dev build requirements for bare Ubuntu (libssl-dev, clang, libclang-dev, etc.) and end-user runtime dependencies (libssl3, libgomp1) to address CI/bare-Ubuntu parity gaps.
+
 ## [0.5.0] - 2026-05-23
 
 ### Added
