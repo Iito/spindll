@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-05-30
+
+### Fixed
+
+- **Memory budget live re-evaluation** — stale memory budget snapshot no longer prevents model loads after external processes free RAM. The budget is now re-evaluated on each load attempt, respecting explicit `--budget` flags without clamping to stale available memory.
+
 ## [0.5.0] - 2026-05-23
 
 ### Added
