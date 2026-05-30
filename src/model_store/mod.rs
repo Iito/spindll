@@ -167,6 +167,7 @@ impl ModelStore {
             metadata_read: true,
             format: registry::ModelFormat::Mlx,
             base_model,
+            source: registry::ModelSource::HfSourceDownloaded,
         });
         reg.save(&self.registry_path())?;
 
@@ -228,6 +229,11 @@ impl ModelStore {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
+        let source = if is_hf {
+            registry::ModelSource::HfSourceDownloaded
+        } else {
+            registry::ModelSource::OllamaSourceDownloaded
+        };
         let mut reg = registry::Registry::load(&self.registry_path())?;
         reg.add(key, registry::ModelEntry {
             repo: model.to_string(),
@@ -246,6 +252,7 @@ impl ModelStore {
             metadata_read: true,
             format,
             base_model,
+            source,
         });
         reg.save(&self.registry_path())?;
 
@@ -459,6 +466,7 @@ impl ModelStore {
                         metadata_read: true,
                         format: registry::ModelFormat::Gguf,
                         base_model,
+                        source: registry::ModelSource::OllamaImported,
                     },
                 );
                 println!("imported {name}:{tag} ({:.1} GB)", layer.size as f64 / 1_073_741_824.0);
@@ -472,22 +480,268 @@ impl ModelStore {
         Ok(imported)
     }
 
-    /// Remove a model from the registry and delete its file or directory on disk.
-    pub fn remove(&self, model: &str) -> anyhow::Result<()> {
-        let mut reg = registry::Registry::load(&self.registry_path())?;
-        let entry = reg.remove(model)
-            .ok_or_else(|| anyhow::anyhow!("model '{}' not found", model))?;
+    /// Import all models from HuggingFace's local cache.
+    pub fn import_from_hf(&self) -> anyhow::Result<u32> {
+        self.ensure_dirs()?;
+        let hf_cache = import::hf_cache_dir();
+        let models = import::discover_hf_models(&hf_cache)?;
 
-        if entry.path.exists() {
-            // MLX = dir, GGUF = file.
-            match entry.format {
-                registry::ModelFormat::Mlx => std::fs::remove_dir_all(&entry.path)?,
-                registry::ModelFormat::Gguf => std::fs::remove_file(&entry.path)?,
+        if models.is_empty() {
+            println!("no huggingface models found in cache");
+            return Ok(0);
+        }
+
+        let mut reg = registry::Registry::load(&self.registry_path())?;
+        let mut imported = 0u32;
+
+        for (repo_id, snapshot_path) in models {
+            // Find GGUF or MLX models in this snapshot
+            let gguf_files: Vec<_> = std::fs::read_dir(&snapshot_path)?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().map_or(false, |ext| ext == "gguf"))
+                .collect();
+
+            let is_mlx_dir = snapshot_path.join("model.safetensors").exists()
+                && snapshot_path.join("config.json").exists();
+
+            if !gguf_files.is_empty() {
+                // GGUF model with potentially multiple quants
+                for gguf_entry in gguf_files {
+                    let gguf_path = gguf_entry.path();
+                    let filename = gguf_entry.file_name().to_string_lossy().to_string();
+                    let dest_dir = self.model_dir(&repo_id);
+                    std::fs::create_dir_all(&dest_dir)?;
+                    let dest = dest_dir.join(&filename);
+
+                    if !dest.exists() {
+                        #[cfg(unix)]
+                        std::os::unix::fs::symlink(&gguf_path, &dest)?;
+                        #[cfg(windows)]
+                        if std::fs::hard_link(&gguf_path, &dest).is_err() {
+                            std::fs::copy(&gguf_path, &dest)?;
+                        }
+                    }
+
+                    let key = format!("{}/{}", repo_id, filename);
+                    if !reg.models.contains_key(&key) {
+                        let (gguf_name, gguf_desc, gguf_arch, gguf_ctx) =
+                            registry::read_gguf_metadata(&dest);
+                        let base_model = derive_base_model(&gguf_name, &repo_id);
+                        let size = std::fs::metadata(&gguf_path)?.len();
+
+                        reg.add(
+                            key,
+                            registry::ModelEntry {
+                                repo: repo_id.clone(),
+                                filename: filename.clone(),
+                                path: dest,
+                                size_bytes: size,
+                                downloaded_at: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs(),
+                                digest: String::new(),
+                                model_name: gguf_name,
+                                description: gguf_desc,
+                                architecture: gguf_arch,
+                                context_length: gguf_ctx,
+                                metadata_read: true,
+                                format: registry::ModelFormat::Gguf,
+                                base_model,
+                                source: registry::ModelSource::HfImported,
+                            },
+                        );
+                        println!("imported {}/{}", repo_id, filename);
+                        imported += 1;
+                    }
+                }
+            } else if is_mlx_dir {
+                // MLX model
+                let dest_dir = self.model_dir(&repo_id);
+                if !dest_dir.exists() {
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&snapshot_path, &dest_dir)?;
+                    #[cfg(windows)]
+                    if std::fs::hard_link(&snapshot_path, &dest_dir).is_err() {
+                        std::fs::copy(&snapshot_path, &dest_dir)?;
+                    }
+                }
+
+                let key = repo_id.clone();
+                if !reg.models.contains_key(&key) {
+                    let size = std::fs::metadata(&snapshot_path)?.len();
+
+                    reg.add(
+                        key,
+                        registry::ModelEntry {
+                            repo: repo_id.clone(),
+                            filename: String::new(),
+                            path: dest_dir,
+                            size_bytes: size,
+                            downloaded_at: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs(),
+                            digest: String::new(),
+                            model_name: repo_id.clone(),
+                            description: String::new(),
+                            architecture: String::new(),
+                            context_length: 0,
+                            metadata_read: false,
+                            format: registry::ModelFormat::Mlx,
+                            base_model: repo_id.clone(),
+                            source: registry::ModelSource::HfImported,
+                        },
+                    );
+                    println!("imported mlx model: {}", repo_id);
+                    imported += 1;
+                }
             }
         }
 
         reg.save(&self.registry_path())?;
-        println!("deleted {}", model);
+        Ok(imported)
+    }
+
+    /// Import a model from an arbitrary file path.
+    pub fn import_from_path(&self, path_str: &str) -> anyhow::Result<()> {
+        self.ensure_dirs()?;
+        let path = std::fs::canonicalize(path_str)
+            .map_err(|_| anyhow::anyhow!("path does not exist: {}", path_str))?;
+
+        if !path.is_file() {
+            anyhow::bail!("not a file: {}", path.display());
+        }
+
+        // Determine format by extension
+        let extension = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+
+        let format = if extension == "gguf" {
+            // Validate GGUF
+            registry::read_gguf_metadata(&path);
+            registry::ModelFormat::Gguf
+        } else if path.is_dir() {
+            registry::ModelFormat::Mlx
+        } else {
+            anyhow::bail!(
+                "unknown format: {} (expected .gguf file or MLX directory)",
+                extension
+            );
+        };
+
+        // Create a friendly key from the filename
+        let filename = path.file_name().unwrap().to_string_lossy();
+        let key = format!("manual/{}", filename);
+
+        let dest_dir = self.model_dir("manual");
+        std::fs::create_dir_all(&dest_dir)?;
+        let dest = dest_dir.join(filename.as_ref());
+
+        // Create symlink if not already present
+        if !dest.exists() {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&path, &dest)?;
+            #[cfg(windows)]
+            if std::fs::hard_link(&path, &dest).is_err() {
+                std::fs::copy(&path, &dest)?;
+            }
+        }
+
+        // Read metadata
+        let (model_name, description, architecture, context_length) =
+            registry::read_gguf_metadata(&dest);
+        let base_model = derive_base_model(&model_name, &filename);
+        let size = std::fs::metadata(&path)?.len();
+
+        let mut reg = registry::Registry::load(&self.registry_path())?;
+        if !reg.models.contains_key(&key) {
+            reg.add(
+                key,
+                registry::ModelEntry {
+                    repo: "manual".to_string(),
+                    filename: filename.to_string(),
+                    path: dest,
+                    size_bytes: size,
+                    downloaded_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    digest: String::new(),
+                    model_name,
+                    description,
+                    architecture,
+                    context_length,
+                    metadata_read: true,
+                    format,
+                    base_model,
+                    source: registry::ModelSource::ManuallyImported,
+                },
+            );
+            reg.save(&self.registry_path())?;
+        } else {
+            println!("model already imported");
+        }
+
+        Ok(())
+    }
+
+    /// Remove a model from the registry with source-aware cleanup.
+    ///
+    /// - OllamaSourceDownloaded / HfSourceDownloaded: auto-delete (Spindll owns the file)
+    /// - OllamaImported / HfImported / ManuallyImported: prompt for confirmation (external ownership)
+    /// - With purge=true: skip prompts, delete symlinks only for external sources
+    pub fn remove(&self, model: &str, purge: bool) -> anyhow::Result<()> {
+        let mut reg = registry::Registry::load(&self.registry_path())?;
+        let entry = reg.models.remove(model)
+            .ok_or_else(|| anyhow::anyhow!("model '{}' not found", model))?;
+
+        let should_delete = match &entry.source {
+            registry::ModelSource::OllamaSourceDownloaded
+            | registry::ModelSource::HfSourceDownloaded => true,
+            registry::ModelSource::OllamaImported
+            | registry::ModelSource::HfImported
+            | registry::ModelSource::ManuallyImported => {
+                if purge {
+                    true
+                } else {
+                    eprintln!(
+                        "warning: '{}' is managed externally ({:?})",
+                        model, entry.source
+                    );
+                    eprint!("delete symlink? (y/N) ");
+                    use std::io::Write;
+                    std::io::stdout().flush()?;
+
+                    let mut response = String::new();
+                    std::io::stdin().read_line(&mut response)?;
+                    response.trim().eq_ignore_ascii_case("y")
+                        || response.trim().eq_ignore_ascii_case("yes")
+                }
+            }
+        };
+
+        if should_delete {
+            if entry.path.exists() {
+                // MLX = dir, GGUF = file.
+                match entry.format {
+                    registry::ModelFormat::Mlx => std::fs::remove_dir_all(&entry.path)?,
+                    registry::ModelFormat::Gguf => std::fs::remove_file(&entry.path)?,
+                }
+            }
+        } else {
+            // User said no, put the entry back in the registry
+            reg.models.insert(model.to_string(), entry);
+        }
+
+        reg.save(&self.registry_path())?;
+        if should_delete {
+            println!("deleted {}", model);
+        } else {
+            println!("kept {}", model);
+        }
         Ok(())
     }
 }

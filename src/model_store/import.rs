@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 const OLLAMA_MODELS_DIR: &str = ".ollama/models";
 const MANIFESTS_DIR: &str = "manifests/registry.ollama.ai/library";
 const BLOBS_DIR: &str = "blobs";
+const HF_CACHE_DIR: &str = ".cache/huggingface/hub";
 
 /// Parsed Ollama manifest describing a model's layers (blobs).
 #[derive(Debug, Deserialize)]
@@ -73,6 +74,59 @@ pub fn discover_models(ollama_dir: &Path) -> anyhow::Result<Vec<(String, String,
             let tag_entry = tag_entry?;
             let tag = tag_entry.file_name().to_string_lossy().to_string();
             models.push((model_name.clone(), tag, tag_entry.path()));
+        }
+    }
+
+    Ok(models)
+}
+
+/// Return the path to HuggingFace's cache directory.
+pub fn hf_cache_dir() -> PathBuf {
+    let home = std::env::var("HOME").expect("HOME not set");
+    PathBuf::from(home).join(HF_CACHE_DIR)
+}
+
+/// Discover all GGUF and MLX models in the HuggingFace cache.
+/// Returns (repo_id, model_path) tuples where repo_id is like "owner/repo".
+pub fn discover_hf_models(hf_cache_dir: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    if !hf_cache_dir.exists() {
+        anyhow::bail!("huggingface cache not found at {}", hf_cache_dir.display());
+    }
+
+    let mut models = Vec::new();
+
+    for entry in std::fs::read_dir(hf_cache_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        // HF cache uses names like "models--owner--repo"
+        if !name.starts_with("models--") {
+            continue;
+        }
+
+        // Convert "models--owner--repo" to "owner/repo"
+        let repo_id = name
+            .strip_prefix("models--")
+            .unwrap()
+            .replace("--", "/");
+
+        let path = entry.path();
+        let snapshots = path.join("snapshots");
+        if !snapshots.exists() {
+            continue;
+        }
+
+        // Find the latest snapshot (just pick the first one for now)
+        if let Ok(snapshots_iter) = std::fs::read_dir(&snapshots) {
+            for snapshot_entry in snapshots_iter {
+                if let Ok(snapshot_entry) = snapshot_entry {
+                    let snapshot_path = snapshot_entry.path();
+                    if snapshot_entry.file_type()?.is_dir() {
+                        models.push((repo_id.clone(), snapshot_path));
+                        break; // Use only the first snapshot
+                    }
+                }
+            }
         }
     }
 

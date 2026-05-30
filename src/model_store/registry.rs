@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-pub const CURRENT_VERSION: u32 = 1;
+pub const CURRENT_VERSION: u32 = 2;
 
 /// On-disk format of a model entry.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -13,6 +13,28 @@ pub enum ModelFormat {
     Gguf,
     /// Directory of safetensors + config.json (MLX Swift backend).
     Mlx,
+}
+
+/// How the model entered Spindll's registry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSource {
+    /// Downloaded from Ollama registry via `spindll pull "ollama/model:tag"`.
+    OllamaSourceDownloaded,
+    /// Downloaded from HuggingFace via `spindll pull "owner/repo"`.
+    HfSourceDownloaded,
+    /// Imported from local Ollama cache via `spindll import --from-ollama`.
+    OllamaImported,
+    /// Imported from local HuggingFace cache via `spindll import --from-hf`.
+    HfImported,
+    /// Imported from arbitrary path via `spindll import "/path/to/model"`.
+    ManuallyImported,
+}
+
+impl Default for ModelSource {
+    fn default() -> Self {
+        Self::OllamaSourceDownloaded
+    }
 }
 
 /// Metadata for a single model tracked in the registry.
@@ -54,6 +76,10 @@ pub struct ModelEntry {
     /// used for cross-format matching.
     #[serde(default)]
     pub base_model: String,
+    /// How the model entered Spindll (pull vs import source).
+    /// Defaults to OllamaSourceDownloaded for backward compatibility.
+    #[serde(default)]
+    pub source: ModelSource,
 }
 
 /// Sum the sizes of all files in a directory (non-recursive, follows symlinks).
@@ -177,7 +203,55 @@ impl Registry {
             changed = true;
         }
 
+        if self.version < 2 {
+            self.infer_model_sources();
+            self.version = 2;
+            changed = true;
+        }
+
         changed
+    }
+
+    /// Infer model sources for registry v0->v1 upgrade.
+    /// Detects whether models were downloaded by Spindll or imported from external sources.
+    fn infer_model_sources(&mut self) {
+        let home = std::env::var("HOME").ok();
+        let ollama_blobs = home.as_ref().map(|h| {
+            std::path::PathBuf::from(h).join(".ollama/models/blobs")
+        });
+        let hf_cache = home.as_ref().map(|h| {
+            std::path::PathBuf::from(h).join(".cache/huggingface/hub")
+        });
+
+        for entry in self.models.values_mut() {
+            // Only set source if it's still at default
+            if entry.source == ModelSource::OllamaSourceDownloaded {
+                // Check if it's a symlink to external location
+                if let Ok(target) = std::fs::read_link(&entry.path) {
+                    // Check Ollama cache
+                    if let Some(ref blobs) = ollama_blobs {
+                        if target.starts_with(blobs) {
+                            entry.source = ModelSource::OllamaImported;
+                            continue;
+                        }
+                    }
+                    // Check HuggingFace cache
+                    if let Some(ref hf) = hf_cache {
+                        if target.starts_with(hf) {
+                            entry.source = ModelSource::HfImported;
+                            continue;
+                        }
+                    }
+                }
+
+                // Infer from repo name for non-symlinks
+                if entry.repo.starts_with("ollama/") {
+                    entry.source = ModelSource::OllamaSourceDownloaded;
+                } else if entry.repo.contains('/') {
+                    entry.source = ModelSource::HfSourceDownloaded;
+                }
+            }
+        }
     }
 
     /// Insert or replace a model entry under the given key.
@@ -229,7 +303,7 @@ mod tests {
     fn load_v0_migrates_to_current() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("registry.json");
-        // v0: no version field
+        // v0: no version field, no source field
         std::fs::write(&path, r#"{"models":{}}"#).unwrap();
 
         let reg = Registry::load(&path).unwrap();
@@ -284,6 +358,7 @@ mod tests {
             metadata_read: false,
             format: ModelFormat::Gguf,
             base_model: String::new(),
+            source: ModelSource::OllamaSourceDownloaded,
         });
 
         let result = reg.save(&path);
@@ -316,6 +391,7 @@ mod tests {
             metadata_read: true,
             format: ModelFormat::Gguf,
             base_model: "Test-Model-7B".into(),
+            source: ModelSource::OllamaSourceDownloaded,
         });
         reg.save(&path).unwrap();
 

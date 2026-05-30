@@ -44,11 +44,11 @@ Models are loaded automatically on first request, or explicitly via the `Load` R
 spindll search <query> [--limit N]     # search HuggingFace + Ollama, ranked by hardware
 spindll pull <model> [flags]          # pull from Ollama registry or HuggingFace
 spindll list                          # show local models with metadata
-spindll rm <model>                    # delete a local model
+spindll rm <model> [flags]            # delete a local model (prompts for external sources)
 spindll run <model> "prompt" [flags]   # one-shot inference (no server)
 spindll bench <model> [other]         # benchmark one or two models (debug builds only)
 spindll serve [options]               # start gRPC + HTTP server
-spindll import --from-ollama          # migrate existing Ollama models
+spindll import [OPTIONS]              # import models (from Ollama, HuggingFace cache, or file path)
 spindll status                        # query a running server
 ```
 
@@ -61,6 +61,23 @@ Model names follow Ollama conventions (`llama3.1:8b`, `qwen2:0.5b`) or HuggingFa
                            this flag, the picker prefers q4_k_m by default.
 --gguf                     Force GGUF, skip MLX resolution on Apple Silicon
 --mlx                      Force MLX, error if no MLX equivalent is found
+```
+
+### Import options
+
+```
+--from-ollama              Auto-discover and import models from local Ollama cache
+--from-hf                  Auto-discover and import models from local HuggingFace cache
+<PATH>                     Import a specific GGUF or MLX model from arbitrary path
+                           (validates the file before importing via symlink)
+```
+
+### Rm options
+
+```
+--purge                    Skip confirmation prompts when removing externally-imported
+                           models (models from Ollama cache, HF cache, or manual paths).
+                           Spindll-downloaded models always delete without prompting.
 ```
 
 ### Run options
