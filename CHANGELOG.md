@@ -11,6 +11,10 @@ All notable changes to this project will be documented in this file.
   - `GET /v1/models/{id}` endpoint for per-model config queries
   - `GET /v1/status` endpoint for server status with model inventory
 
+### Refactored
+
+- **Budget calculation clarity** — extracted `MemoryBudget::load_budget_with_scheduler()` method to clarify the interaction between configured budgets, available RAM, and scheduler overhead. Added regression tests for default-mode clamping behavior (PR #47 follow-up).
+
 ## [0.6.0] - 2026-05-30
 
 ### Added
