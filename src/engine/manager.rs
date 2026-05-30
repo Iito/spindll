@@ -388,8 +388,7 @@ impl ModelManager {
         // Once weights are mmap'd / uploaded to Metal, available memory drops,
         // so the snapshot has to happen here, not inside the backend.
         let mem = crate::scheduler::budget::MemoryBudget::detect(None);
-        let load_budget = std::cmp::min(self.memory_budget, mem.available_ram);
-        let load_budget = load_budget.saturating_sub(planned_scheduler_bytes);
+        let load_budget = mem.load_budget_with_scheduler(planned_scheduler_bytes);
 
         let layers = gpu_layers.unwrap_or(self.default_gpu_layers);
 
