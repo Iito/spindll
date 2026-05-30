@@ -10,6 +10,7 @@ pub mod registry;
 pub mod import;
 pub mod mlx_resolve;
 pub mod ollama_pull;
+pub mod search;
 
 use std::path::PathBuf;
 

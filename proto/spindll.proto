@@ -141,6 +141,7 @@ message LoadRequest {
   int32 gpu_layers = 2;  // -1 = auto
   EvictionPriority priority = 3;
   uint32 idle_reload_secs = 4;  // 0 = disabled
+  string device = 5;  // "auto", "cpu", "metal", "cuda:N", "vulkan:N", "mlx"
 }
 
 // Low evicts first, LRU tiebreak within tier.
@@ -200,6 +201,7 @@ message LoadedModel {
   int32 gpu_layers = 3;
   string digest = 4;
   uint32 context_length = 5;
+  string device = 6;  // device this model is loaded on (e.g. "cuda:0", "metal", "mlx")
 }
 
 message MemoryInfo {

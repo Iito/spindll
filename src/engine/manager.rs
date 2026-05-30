@@ -13,9 +13,11 @@ use tokio::task::JoinHandle;
 use crate::backend::llamacpp::LlamaCppModel;
 use crate::backend::{BackendLoadParams, BackendModel, InferenceBackend};
 use crate::model_store::registry::ModelFormat;
+use super::device::DeviceTarget;
 
 use super::batch::{BatchEvent, BatchRequest, BatchScheduler};
 use super::kv_cache::KvCache;
+use super::kv_ram_cache::KvRamCache;
 use super::metrics::Metrics;
 use super::ram_cache::RamCache;
 use super::streaming::{GenerateParams, GenerateResult, generate_streaming_cached};
@@ -47,6 +49,8 @@ pub struct LoadOptions {
     pub priority: EvictionPriority,
     /// Reload this long after eviction under VRAM pressure. `None` disables.
     pub idle_reload: Option<Duration>,
+    /// Target device for this model (e.g. cuda:0, metal, mlx, cpu).
+    pub device: DeviceTarget,
 }
 
 /// A model that has been loaded into memory and is ready for inference.
@@ -77,6 +81,8 @@ pub struct LoadedModel {
     pub batch_tx: Option<std::sync::mpsc::Sender<BatchRequest>>,
     pub priority: EvictionPriority,
     pub idle_reload: Option<Duration>,
+    /// Device this model was loaded onto (for status reporting).
+    pub device: String,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +91,7 @@ struct PendingReload {
     path: PathBuf,
     digest: String,
     gpu_layers: Option<u32>,
+    device: DeviceTarget,
     priority: EvictionPriority,
     idle_reload: Duration,
 }
@@ -97,8 +104,10 @@ pub struct ModelManager {
     models: RwLock<HashMap<String, LoadedModel>>,
     default_n_ctx: u32,
     default_gpu_layers: u32,
+    default_device: DeviceTarget,
     memory_budget: u64,
     kv_cache: Option<KvCache>,
+    kv_ram_cache: Option<KvRamCache>,
     ram_cache: Option<RamCache>,
     metrics: Arc<Metrics>,
     batch_slots: usize,
@@ -185,8 +194,10 @@ impl ModelManager {
             models: RwLock::new(HashMap::new()),
             default_n_ctx: n_ctx,
             default_gpu_layers,
+            default_device: DeviceTarget::Auto,
             memory_budget,
             kv_cache: None,
+            kv_ram_cache: None,
             ram_cache: None,
             metrics: Arc::new(Metrics::new()),
             batch_slots: 0,
@@ -197,6 +208,10 @@ impl ModelManager {
         })
     }
 
+    pub fn set_default_device(&mut self, device: DeviceTarget) {
+        self.default_device = device;
+    }
+
     #[cfg(test)]
     pub fn with_backends(backends: Vec<Box<dyn InferenceBackend>>, memory_budget: u64) -> Self {
         Self {
@@ -204,8 +219,10 @@ impl ModelManager {
             models: RwLock::new(HashMap::new()),
             default_n_ctx: 2048,
             default_gpu_layers: 0,
+            default_device: DeviceTarget::Auto,
             memory_budget,
             kv_cache: None,
+            kv_ram_cache: None,
             ram_cache: None,
             metrics: Arc::new(Metrics::new()),
             batch_slots: 0,
@@ -287,6 +304,7 @@ impl ModelManager {
                         path: model.file_path.clone(),
                         digest: model.digest.clone(),
                         gpu_layers: model.requested_gpu_layers,
+                        device: model.device.parse().unwrap_or_default(),
                         priority: model.priority,
                         idle_reload: d,
                     });
@@ -295,16 +313,28 @@ impl ModelManager {
         }
     }
 
-    fn backend_for_format(&self, format: &ModelFormat) -> anyhow::Result<&dyn InferenceBackend> {
-        let target = match format {
-            ModelFormat::Gguf => "llamacpp",
-            ModelFormat::Mlx => "mlx",
+    fn backend_for_device(
+        &self,
+        device: &DeviceTarget,
+        format: &ModelFormat,
+    ) -> anyhow::Result<&dyn InferenceBackend> {
+        let target = match device {
+            DeviceTarget::Mlx => "mlx",
+            DeviceTarget::Cuda(_) | DeviceTarget::Vulkan(_) | DeviceTarget::Cpu => "llamacpp",
+            DeviceTarget::Metal => match format {
+                ModelFormat::Mlx => "mlx",
+                ModelFormat::Gguf => "llamacpp",
+            },
+            DeviceTarget::Auto => match format {
+                ModelFormat::Gguf => "llamacpp",
+                ModelFormat::Mlx => "mlx",
+            },
         };
         self.backends
             .iter()
             .find(|b| b.name() == target)
             .map(|b| b.as_ref())
-            .ok_or_else(|| anyhow::anyhow!("no backend available for {target} format"))
+            .ok_or_else(|| anyhow::anyhow!("no {target} backend available for device {device}"))
     }
 
     fn infer_format(path: &Path) -> ModelFormat {
@@ -352,9 +382,16 @@ impl ModelManager {
         opts: LoadOptions,
     ) -> anyhow::Result<()> {
         self.cancel_watcher(name);
-        let LoadOptions { gpu_layers, digest, priority, idle_reload } = opts;
+        let LoadOptions { gpu_layers, digest, priority, idle_reload, device } = opts;
+        let device = if device == DeviceTarget::Auto {
+            self.default_device.clone()
+        } else {
+            device
+        };
         let format = Self::infer_format(path);
-        let backend = self.backend_for_format(&format)?;
+        device.validate_for_format(&format)?;
+
+        let backend = self.backend_for_device(&device, &format)?;
         let from_ram_cache = self
             .ram_cache
             .as_ref()
@@ -387,12 +424,17 @@ impl ModelManager {
         let load_budget = std::cmp::min(self.memory_budget, mem.available_ram);
         let load_budget = load_budget.saturating_sub(planned_scheduler_bytes);
 
-        let layers = gpu_layers.unwrap_or(self.default_gpu_layers);
+        let layers = if device.force_cpu() {
+            0
+        } else {
+            gpu_layers.unwrap_or(self.default_gpu_layers)
+        };
 
         let load_params = BackendLoadParams {
             n_ctx: self.default_n_ctx,
             n_gpu_layers: Some(layers),
             memory_budget: load_budget,
+            main_gpu: device.main_gpu(),
         };
 
         let model = backend.load_model(path, load_params)?;
@@ -407,14 +449,20 @@ impl ModelManager {
         let n_ctx_train = model.n_ctx_train();
         let size_bytes = model.size_bytes();
 
-        // Scheduler needs its own GGUF model copy.
+        // Scheduler needs its own GGUF model copy pinned to the same device.
         let batch_tx = if self.batch_slots > 0 && model.supports_batching() {
             let (tx, rx) = std::sync::mpsc::channel::<BatchRequest>();
             let max_seq = self.batch_slots;
             let model_name = name.to_string();
 
             let sched_backend = crate::backend::llamacpp::shared_backend();
-            let sched_params = LlamaModelParams::default().with_n_gpu_layers(layers);
+            let mut sched_params = LlamaModelParams::default().with_n_gpu_layers(layers);
+            if let Some(gpu_id) = device.main_gpu() {
+                use llama_cpp_2::model::params::LlamaSplitMode;
+                sched_params = sched_params
+                    .with_main_gpu(gpu_id)
+                    .with_split_mode(LlamaSplitMode::None);
+            }
             let sched_model = LlamaModel::load_from_file(sched_backend, path, &sched_params)
                 .map_err(|e| anyhow::anyhow!("failed to load scheduler model: {e}"))?;
 
@@ -434,6 +482,7 @@ impl ModelManager {
             None
         };
 
+        let device_label = device.to_string();
         let scheduler_size_bytes = if batch_tx.is_some() { size_bytes } else { 0 };
         let loaded = LoadedModel {
             model,
@@ -450,6 +499,7 @@ impl ModelManager {
             batch_tx,
             priority,
             idle_reload,
+            device: device_label,
         };
 
         self.models.write().unwrap().insert(name.to_string(), loaded);
@@ -505,8 +555,8 @@ impl ModelManager {
         self.models.read().unwrap().contains_key(name)
     }
 
-    /// List all loaded models as `(name, memory_bytes, gpu_layers, digest, n_ctx, n_ctx_train)` tuples.
-    pub fn loaded_models(&self) -> Vec<(String, u64, u32, String, u32, u32)> {
+    /// List all loaded models as `(name, memory_bytes, gpu_layers, digest, n_ctx, n_ctx_train, device)` tuples.
+    pub fn loaded_models(&self) -> Vec<(String, u64, u32, String, u32, u32, String)> {
         self.models
             .read()
             .unwrap()
@@ -519,6 +569,7 @@ impl ModelManager {
                     m.digest.clone(),
                     m.n_ctx,
                     m.n_ctx_train,
+                    m.device.clone(),
                 )
             })
             .collect()
@@ -535,8 +586,26 @@ impl ModelManager {
     }
 
     /// Enable the disk-backed KV cache with the given max size in bytes.
+    /// The in-memory RAM tier is independent — callers must enable it
+    /// explicitly via [`Self::enable_kv_ram_cache`] so `--no-kv-ram-cache`
+    /// can fully disable it.
     pub fn enable_kv_cache(&mut self, max_bytes: u64) {
         self.kv_cache = Some(KvCache::new(max_bytes));
+    }
+
+    /// Enable the in-memory KV state cache with the given max size in bytes.
+    pub fn enable_kv_ram_cache(&mut self, max_bytes: u64) {
+        self.kv_ram_cache = Some(KvRamCache::new(max_bytes));
+    }
+
+    /// Disable the in-memory KV state cache.
+    pub fn disable_kv_ram_cache(&mut self) {
+        self.kv_ram_cache = None;
+    }
+
+    /// Returns a reference to the KV RAM cache, if enabled.
+    pub fn kv_ram_cache(&self) -> Option<&KvRamCache> {
+        self.kv_ram_cache.as_ref()
     }
 
     /// Enable the KV cache with a custom directory.
@@ -713,6 +782,7 @@ impl ModelManager {
                     model_name,
                     &loaded.digest,
                     cache,
+                    self.kv_ram_cache.as_ref(),
                     encryption_key,
                     on_token,
                 );
@@ -821,6 +891,7 @@ impl ModelManager {
                     model_name,
                     &loaded.digest,
                     cache,
+                    self.kv_ram_cache.as_ref(),
                     encryption_key,
                     on_token,
                 );
@@ -846,6 +917,43 @@ impl ModelManager {
             .ok_or_else(|| anyhow::anyhow!("model '{}' not loaded", model_name))?;
         *loaded.last_used.write().unwrap() = Instant::now();
         loaded.model.apply_chat_template(messages)
+    }
+
+    /// Compute an embedding vector for a text string.
+    #[tracing::instrument(skip(self, text), fields(model = model_name))]
+    pub fn embed(
+        &self,
+        model_name: &str,
+        text: &str,
+    ) -> anyhow::Result<crate::backend::EmbedResult> {
+        let _active = ActiveGuard::new(&self.active_requests);
+        let models = self.models.read().unwrap();
+        let loaded = models
+            .get(model_name)
+            .ok_or_else(|| anyhow::anyhow!("model '{}' not loaded", model_name))?;
+        *loaded.last_used.write().unwrap() = Instant::now();
+        self.record_activity();
+
+        let start = Instant::now();
+        let result = loaded.model.embed(text);
+        let elapsed_us = start.elapsed().as_micros() as u64;
+
+        match &result {
+            Ok(r) => {
+                tracing::info!(
+                    prompt_tokens = r.prompt_tokens,
+                    embedding_dim = r.embedding.len(),
+                    elapsed_ms = elapsed_us / 1000,
+                    "embedding complete"
+                );
+                self.metrics.record_embed(r.prompt_tokens as u64, elapsed_us);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, elapsed_ms = elapsed_us / 1000, "embedding failed");
+                self.metrics.record_embed_error();
+            }
+        }
+        result
     }
 }
 
@@ -895,6 +1003,7 @@ async fn reload_watcher(weak: Weak<ModelManager>, spec: PendingReload) {
             digest: spec.digest.clone(),
             priority: spec.priority,
             idle_reload: Some(spec.idle_reload),
+            device: spec.device.clone(),
         };
         let mgr_blocking = mgr.clone();
         let path = spec.path.clone();
@@ -1086,8 +1195,12 @@ mod tests {
 
         // Push last_activity into the past so the idle check passes
         *mgr.last_activity.write().unwrap() = Instant::now() - Duration::from_millis(200);
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
+        // Poll until the idle watcher reloads "a" (generous timeout for slow CI)
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !mgr.is_loaded("a") && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(mgr.is_loaded("a"), "model should be reloaded by idle watcher");
     }
 
@@ -1152,6 +1265,7 @@ mod tests {
         assert!(!mgr.is_loaded("a"), "reload must not fire without into_arc()");
     }
 
+    #[test]
     fn evict_for_skips_high_when_low_present() {
         let dir = tempfile::tempdir().unwrap();
         // Each model costs 100 (file) + 1*2048 (kv) = 2148 in total_loaded_bytes.
@@ -1234,6 +1348,19 @@ mod tests {
             false // cancel immediately
         });
         assert!(token_count <= 1, "expected at most 1 token, got {token_count}");
+    }
+
+    #[test]
+    #[ignore]
+    fn gguf_embed_produces_normalized_vector() {
+        let path = real_gguf_path().expect("GGUF model not found");
+        let mgr = ModelManager::new(512, None, 0).unwrap();
+        mgr.load_model("test", &path, None).unwrap();
+        let result = mgr.embed("test", "Hello world").unwrap();
+        assert!(!result.embedding.is_empty(), "embedding should not be empty");
+        assert!(result.prompt_tokens > 0);
+        let norm: f32 = result.embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 0.01, "embedding should be L2-normalized, got norm={norm}");
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]

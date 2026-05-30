@@ -42,6 +42,7 @@ pub fn router(manager: Arc<ModelManager>, store: Arc<ModelStore>) -> Router {
         .route("/v1/models", get(oai_models))
         .route("/v1/chat/completions", post(oai_chat_completions))
         .route("/v1/completions", post(oai_completions))
+        .route("/v1/embeddings", post(oai_embeddings))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -103,7 +104,7 @@ async fn models(State(state): State<AppState>) -> impl IntoResponse {
         .manager
         .loaded_models()
         .into_iter()
-        .map(|(name, _, _, _, n_ctx, n_ctx_train)| (name, (n_ctx, n_ctx_train)))
+        .map(|(name, _, _, _, n_ctx, n_ctx_train, _)| (name, (n_ctx, n_ctx_train)))
         .collect();
 
     let list: Vec<ModelInfo> = reg
@@ -253,6 +254,8 @@ struct LoadRequest {
     model: String,
     #[serde(default)]
     gpu_layers: Option<i32>,
+    #[serde(default)]
+    device: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -280,8 +283,24 @@ async fn load(
     };
     let digest = state.store.resolve_model_digest(&req.model).unwrap_or_default();
     let gpu_layers = req.gpu_layers.and_then(|l| if l < 0 { None } else { Some(l as u32) });
+    let device: crate::engine::DeviceTarget = match req.device.as_deref().unwrap_or("auto").parse() {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
 
-    match state.manager.load_model_with_digest(&req.model, &path, gpu_layers, digest) {
+    let opts = crate::engine::LoadOptions {
+        gpu_layers,
+        digest,
+        device,
+        ..Default::default()
+    };
+    match state.manager.load_model_with_options(&req.model, &path, opts) {
         Ok(()) => Json(LoadResponse { already_loaded: false }).into_response(),
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -388,6 +407,14 @@ struct OaiChatRequest {
     #[serde(default)]
     #[allow(dead_code)]
     tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Deserialize)]
+struct StreamOptions {
+    #[serde(default)]
+    include_usage: bool,
 }
 
 fn default_true() -> bool {
@@ -613,6 +640,7 @@ async fn oai_chat_completions(
     let mgr = state.manager.clone();
     let store = state.store.clone();
     let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+    let include_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
 
     if req.stream {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
@@ -647,7 +675,7 @@ async fn oai_chat_completions(
                 });
 
                 match result {
-                    Ok(_) => {
+                    Ok(ref stats) => {
                         let (tool_calls, remaining) = parse_tool_calls(&output);
                         if !tool_calls.is_empty() {
                             // Send tool calls as a single chunk
@@ -684,6 +712,21 @@ async fn oai_chat_completions(
                             "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]
                         });
                         let _ = tx.blocking_send(Ok(sse_data(&done_chunk)));
+                        if include_usage {
+                            let usage_chunk = serde_json::json!({
+                                "id": &completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": &req.model,
+                                "choices": [],
+                                "usage": {
+                                    "prompt_tokens": stats.prompt_tokens,
+                                    "completion_tokens": stats.completion_tokens,
+                                    "total_tokens": stats.prompt_tokens + stats.completion_tokens,
+                                }
+                            });
+                            let _ = tx.blocking_send(Ok(sse_data(&usage_chunk)));
+                        }
                         let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
                     }
                     Err(e) => {
@@ -708,7 +751,7 @@ async fn oai_chat_completions(
                 });
 
                 match result {
-                    Ok(_) => {
+                    Ok(ref stats) => {
                         let done_chunk = serde_json::json!({
                             "id": &completion_id,
                             "object": "chat.completion.chunk",
@@ -721,6 +764,21 @@ async fn oai_chat_completions(
                             }]
                         });
                         let _ = tx.blocking_send(Ok(sse_data(&done_chunk)));
+                        if include_usage {
+                            let usage_chunk = serde_json::json!({
+                                "id": &completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": &req.model,
+                                "choices": [],
+                                "usage": {
+                                    "prompt_tokens": stats.prompt_tokens,
+                                    "completion_tokens": stats.completion_tokens,
+                                    "total_tokens": stats.prompt_tokens + stats.completion_tokens,
+                                }
+                            });
+                            let _ = tx.blocking_send(Ok(sse_data(&usage_chunk)));
+                        }
                         let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
                     }
                     Err(e) => {
@@ -962,6 +1020,224 @@ async fn oai_completions(
     }
 }
 
+// -- POST /v1/embeddings ----------------------------------------------------
+
+#[derive(Deserialize)]
+struct OaiEmbeddingRequest {
+    model: String,
+    input: EmbeddingInput,
+    #[serde(default)]
+    #[allow(dead_code)]
+    user: Option<String>,
+    #[serde(default)]
+    encoding_format: Option<String>,
+    /// OpenAI lets clients ask for a reduced output dimensionality.
+    /// We don't support truncation yet — reject when supplied so callers
+    /// don't silently get full-dimension embeddings.
+    #[serde(default)]
+    dimensions: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EmbeddingInput {
+    Single(String),
+    Batch(Vec<String>),
+    /// OpenAI-spec token-id inputs: `list[int]` (single) and `list[list[int]]`
+    /// (batch). The order matters here — serde tries variants top-down, so
+    /// these have to come after the string forms to avoid coercion. The
+    /// payload is not used (rejected with 400 below) but is parsed so we
+    /// return a structured error instead of a generic JSON decode failure.
+    #[allow(dead_code)]
+    TokenIds(Vec<i32>),
+    #[allow(dead_code)]
+    TokenIdsBatch(Vec<Vec<i32>>),
+}
+
+/// Hard cap on a single embedding input length, in characters/tokens, to bound
+/// server-side memory before tokenization or matmul.
+const MAX_EMBED_INPUT_LEN: usize = 32_768;
+const MAX_EMBED_BATCH: usize = 2048;
+
+/// Encode an embedding vector as base64'd little-endian f32 (OpenAI spec).
+/// Stdlib-only implementation to avoid adding a base64 crate dependency for
+/// a single encode site.
+fn encode_embedding_base64(v: &[f32]) -> String {
+    const A: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bytes = Vec::with_capacity(v.len() * 4);
+    for f in v {
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | bytes[i + 2] as u32;
+        out.push(A[((n >> 18) & 0x3f) as usize] as char);
+        out.push(A[((n >> 12) & 0x3f) as usize] as char);
+        out.push(A[((n >> 6) & 0x3f) as usize] as char);
+        out.push(A[(n & 0x3f) as usize] as char);
+        i += 3;
+    }
+    let rem = bytes.len() - i;
+    if rem == 1 {
+        let n = (bytes[i] as u32) << 16;
+        out.push(A[((n >> 18) & 0x3f) as usize] as char);
+        out.push(A[((n >> 12) & 0x3f) as usize] as char);
+        out.push('=');
+        out.push('=');
+    } else if rem == 2 {
+        let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
+        out.push(A[((n >> 18) & 0x3f) as usize] as char);
+        out.push(A[((n >> 12) & 0x3f) as usize] as char);
+        out.push(A[((n >> 6) & 0x3f) as usize] as char);
+        out.push('=');
+    }
+    out
+}
+
+async fn oai_embeddings(
+    State(state): State<AppState>,
+    Json(req): Json<OaiEmbeddingRequest>,
+) -> impl IntoResponse {
+    // encoding_format: only "float" and "base64" are valid per OpenAI spec.
+    let want_base64 = match req.encoding_format.as_deref() {
+        None | Some("float") => false,
+        Some("base64") => true,
+        Some(other) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(oai_error(&format!(
+                    "encoding_format '{other}' not supported (use 'float' or 'base64')"
+                ))),
+            )
+                .into_response();
+        }
+    };
+
+    if req.dimensions.is_some() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(oai_error(
+                "the `dimensions` parameter is not supported by this backend",
+            )),
+        )
+            .into_response();
+    }
+
+    // Normalise all four input shapes into Vec<String>. Token-id inputs
+    // currently can't bypass the tokenizer (no token-array embed path on
+    // backends yet) — reject so clients don't get a confusing tokenisation.
+    let texts: Vec<String> = match req.input {
+        EmbeddingInput::Single(s) => vec![s],
+        EmbeddingInput::Batch(v) => v,
+        EmbeddingInput::TokenIds(_) | EmbeddingInput::TokenIdsBatch(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(oai_error(
+                    "token-id input is not yet supported; pass a string or array of strings",
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    if texts.is_empty() || texts.iter().any(|t| t.is_empty()) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(oai_error(
+                "input must be a non-empty string or array of non-empty strings",
+            )),
+        )
+            .into_response();
+    }
+
+    if texts.len() > MAX_EMBED_BATCH {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(oai_error(&format!(
+                "input array exceeds {MAX_EMBED_BATCH}-item limit ({} items)",
+                texts.len()
+            ))),
+        )
+            .into_response();
+    }
+
+    if let Some(over) = texts.iter().find(|t| t.len() > MAX_EMBED_INPUT_LEN) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(oai_error(&format!(
+                "input exceeds {MAX_EMBED_INPUT_LEN}-char limit ({} chars)",
+                over.len()
+            ))),
+        )
+            .into_response();
+    }
+
+    let model_id = req.model.clone();
+    let mgr = state.manager.clone();
+    let store = state.store.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        auto_load(&mgr, &store, &req.model)?;
+
+        let mut data = Vec::with_capacity(texts.len());
+        let mut total_tokens = 0u32;
+
+        for (i, text) in texts.iter().enumerate() {
+            let r = mgr.embed(&req.model, text)?;
+            total_tokens += r.prompt_tokens;
+            let embedding_val = if want_base64 {
+                serde_json::Value::String(encode_embedding_base64(&r.embedding))
+            } else {
+                serde_json::json!(r.embedding)
+            };
+            data.push(serde_json::json!({
+                "object": "embedding",
+                "index": i,
+                "embedding": embedding_val,
+            }));
+        }
+
+        Ok::<_, anyhow::Error>((data, total_tokens))
+    })
+    .await;
+
+    match result {
+        Ok(Ok((data, total_tokens))) => {
+            Json(serde_json::json!({
+                "object": "list",
+                "data": data,
+                "model": model_id,
+                "usage": {
+                    "prompt_tokens": total_tokens,
+                    "total_tokens": total_tokens,
+                }
+            }))
+            .into_response()
+        }
+        // Surface "model not loaded" / "embeddings not supported" as 400 so
+        // clients can distinguish capability errors from infra failures.
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            let status = if msg.contains("not loaded")
+                || msg.contains("does not support")
+                || msg.contains("not supported")
+            {
+                axum::http::StatusCode::BAD_REQUEST
+            } else {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(oai_error(&msg))).into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(oai_error(&e.to_string())),
+        )
+            .into_response(),
+    }
+}
+
 fn oai_error(msg: &str) -> serde_json::Value {
     serde_json::json!({
         "error": {
@@ -989,7 +1265,7 @@ fn auto_load(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackendLoadParams, BackendModel, InferenceBackend};
+    use crate::backend::{BackendLoadParams, BackendModel, EmbedResult, InferenceBackend};
     use crate::engine::streaming::{GenerateParams as EngineParams, GenerateResult};
     use crate::model_store::registry::{ModelEntry, ModelFormat};
     use axum::body::Body;
@@ -1016,6 +1292,12 @@ mod tests {
         fn size_bytes(&self) -> u64 { 100 }
         fn kv_bytes_per_token(&self) -> u64 { 1 }
         fn as_any(&self) -> &dyn std::any::Any { self }
+        fn embed(&self, _text: &str) -> anyhow::Result<EmbedResult> {
+            Ok(EmbedResult {
+                embedding: vec![0.6, 0.8],
+                prompt_tokens: 3,
+            })
+        }
     }
 
     fn setup_store_and_manager(dir: &std::path::Path) -> (Arc<ModelStore>, Arc<ModelManager>) {
@@ -1105,5 +1387,154 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["object"], "chat.completion");
         assert!(json["choices"][0]["message"]["content"].as_str().unwrap().contains("Hello"));
+    }
+
+    #[tokio::test]
+    async fn oai_embeddings_single_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        let app = router(mgr, store);
+
+        let body = serde_json::json!({
+            "model": "test-org/test-model",
+            "input": "hello world"
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["object"], "list");
+        assert_eq!(json["data"][0]["object"], "embedding");
+        assert_eq!(json["data"][0]["index"], 0);
+        let emb = json["data"][0]["embedding"].as_array().unwrap();
+        assert_eq!(emb.len(), 2);
+        assert_eq!(json["usage"]["prompt_tokens"], 3);
+    }
+
+    #[tokio::test]
+    async fn oai_embeddings_batch_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        let app = router(mgr, store);
+
+        let body = serde_json::json!({
+            "model": "test-org/test-model",
+            "input": ["hello", "world"]
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["data"].as_array().unwrap().len(), 2);
+        assert_eq!(json["data"][1]["index"], 1);
+        assert_eq!(json["usage"]["prompt_tokens"], 6);
+    }
+
+    #[tokio::test]
+    async fn oai_embeddings_rejects_empty_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        let app = router(mgr, store);
+
+        let body = serde_json::json!({
+            "model": "test-org/test-model",
+            "input": ""
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn oai_embeddings_rejects_too_many_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        let app = router(mgr, store);
+
+        let body = serde_json::json!({
+            "model": "test-org/test-model",
+            "input": vec!["x"; MAX_EMBED_BATCH + 1],
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn oai_embeddings_rejects_unknown_encoding_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        let app = router(mgr, store);
+
+        let body = serde_json::json!({
+            "model": "test-org/test-model",
+            "input": "hello",
+            "encoding_format": "binary"  // not "float" or "base64"
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn oai_embeddings_rejects_dimensions_param() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        let app = router(mgr, store);
+
+        let body = serde_json::json!({
+            "model": "test-org/test-model",
+            "input": "hello",
+            "dimensions": 256,
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 400);
     }
 }

@@ -11,6 +11,10 @@ pub struct BackendLoadParams {
     /// model's weights are mmap'd. 0 = unlimited. Backends that auto-size
     /// n_ctx use this as the budget ceiling.
     pub memory_budget: u64,
+    /// Target GPU device index for multi-GPU systems. When `Some`, the
+    /// backend pins the model to this device and disables cross-GPU layer
+    /// splitting (split_mode = None). `None` = default device selection.
+    pub main_gpu: Option<i32>,
 }
 
 pub trait InferenceBackend: Send + Sync {
@@ -68,4 +72,13 @@ pub trait BackendModel: Send + Sync {
     fn kv_bytes_per_token(&self) -> u64;
 
     fn as_any(&self) -> &dyn std::any::Any;
+
+    fn embed(&self, _text: &str) -> anyhow::Result<EmbedResult> {
+        anyhow::bail!("embeddings not supported by this backend")
+    }
+}
+
+pub struct EmbedResult {
+    pub embedding: Vec<f32>,
+    pub prompt_tokens: u32,
 }

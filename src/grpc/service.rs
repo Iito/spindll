@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use crate::engine::{EvictionPriority, GenerateParams, LoadOptions, ModelManager};
+use crate::engine::{DeviceTarget, EvictionPriority, GenerateParams, LoadOptions, ModelManager};
 use crate::model_store::ModelStore;
 use crate::proto::spindll_server::Spindll;
 use crate::proto::*;
@@ -296,11 +296,14 @@ impl Spindll for SpindllService {
             Some(std::time::Duration::from_secs(req.idle_reload_secs as u64))
         };
 
+        let device: DeviceTarget = req.device.parse()
+            .map_err(|e: anyhow::Error| Status::invalid_argument(e.to_string()))?;
+
         self.manager
             .load_model_with_options(
                 &req.model,
                 &model_path,
-                LoadOptions { gpu_layers, digest, priority, idle_reload },
+                LoadOptions { gpu_layers, digest, priority, idle_reload, device },
             )
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -389,12 +392,13 @@ impl Spindll for SpindllService {
         let mem = crate::scheduler::budget::MemoryBudget::detect(None);
 
         let models = self.manager.loaded_models().iter()
-            .map(|(name, size, layers, digest, n_ctx, _)| LoadedModel {
+            .map(|(name, size, layers, digest, n_ctx, _, device)| LoadedModel {
                 name: name.clone(),
                 memory_used: *size,
                 gpu_layers: *layers as i32,
                 digest: digest.clone(),
                 context_length: *n_ctx,
+                device: device.clone(),
             })
             .collect();
 
