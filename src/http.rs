@@ -1249,7 +1249,7 @@ mod tests {
     use super::*;
     use crate::backend::{BackendLoadParams, BackendModel, EmbedResult, InferenceBackend};
     use crate::engine::streaming::{GenerateParams as EngineParams, GenerateResult};
-    use crate::model_store::registry::{ModelEntry, ModelFormat};
+    use crate::model_store::registry::{ModelEntry, ModelFormat, ModelSource};
     use axum::body::Body;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
@@ -1306,6 +1306,7 @@ mod tests {
             metadata_read: true,
             format: ModelFormat::Gguf,
             base_model: String::new(),
+            source: ModelSource::HfSourceDownloaded,
         });
         reg.save(&store.registry_path()).unwrap();
 

@@ -445,7 +445,7 @@ mod tests {
     use super::*;
     use crate::backend::{BackendLoadParams, BackendModel, InferenceBackend};
     use crate::engine::streaming::{GenerateParams as EngineParams, GenerateResult};
-    use crate::model_store::registry::{ModelEntry, ModelFormat, Registry};
+    use crate::model_store::registry::{ModelEntry, ModelFormat, ModelSource, Registry};
     use crate::proto::spindll_server::Spindll as _; // trait needed for .list()
 
     struct FakeBackend;
@@ -486,6 +486,7 @@ mod tests {
             metadata_read: true,
             format: ModelFormat::Gguf,
             base_model: String::new(),
+            source: ModelSource::HfSourceDownloaded,
         });
         reg.add("mlx-community/Llama-3.1-8B-4bit".into(), ModelEntry {
             repo: "mlx-community/Llama-3.1-8B-4bit".into(),
@@ -501,6 +502,7 @@ mod tests {
             metadata_read: true,
             format: ModelFormat::Mlx,
             base_model: "llama3.1-8b".into(),
+            source: ModelSource::HfSourceDownloaded,
         });
         reg.save(&store.registry_path()).unwrap();
 
