@@ -96,6 +96,14 @@ enum Commands {
         /// Prompt text
         prompt: String,
 
+        /// System prompt (default: "You are a helpful assistant.")
+        #[arg(long)]
+        system: Option<String>,
+
+        /// Max tokens to generate (default: 512 from library)
+        #[arg(long)]
+        max_tokens: Option<u32>,
+
         /// Context size for the model (default 2048)
         #[arg(long, default_value = "2048")]
         ctx_size: u32,
@@ -519,6 +527,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run {
             model,
             prompt,
+            system,
+            max_tokens,
             ctx_size,
             budget,
             kv_cache,
@@ -539,8 +549,18 @@ async fn main() -> anyhow::Result<()> {
 
             manager.load_model_with_digest(&model, &model_path, None, digest)?;
 
-            let params = spindll::engine::GenerateParams::default();
-            manager.generate(&model, &prompt, &params, None, |token| {
+            let system_prompt = system.unwrap_or_else(|| "You are a helpful assistant.".to_string());
+            let messages = vec![
+                ("system".to_string(), system_prompt),
+                ("user".to_string(), prompt.clone()),
+            ];
+
+            let mut params = spindll::engine::GenerateParams::default();
+            if let Some(max) = max_tokens {
+                params.max_tokens = max;
+            }
+
+            manager.generate_chat(&model, &messages, &params, None, |token| {
                 use std::io::Write;
                 print!("{token}");
                 std::io::stdout().flush().ok();
