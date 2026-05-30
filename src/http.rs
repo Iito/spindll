@@ -40,9 +40,11 @@ pub fn router(manager: Arc<ModelManager>, store: Arc<ModelStore>) -> Router {
         .route("/pull", post(pull))
         // OpenAI-compatible API
         .route("/v1/models", get(oai_models))
+        .route("/v1/models/{id}", get(oai_model_config))
         .route("/v1/chat/completions", post(oai_chat_completions))
         .route("/v1/completions", post(oai_completions))
         .route("/v1/embeddings", post(oai_embeddings))
+        .route("/v1/status", get(oai_status))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -348,21 +350,141 @@ async fn oai_models(State(state): State<AppState>) -> impl IntoResponse {
         let _ = reg.save(&state.store.registry_path());
     }
 
-    let data: Vec<serde_json::Value> = reg
+    let data: Vec<OaiModelInfo> = reg
         .models
-        .keys()
-        .map(|key| {
-            serde_json::json!({
-                "id": key,
-                "object": "model",
-                "owned_by": "spindll",
-            })
+        .iter()
+        .map(|(key, entry)| {
+            let format_str = match entry.format {
+                crate::model_store::registry::ModelFormat::Gguf => "gguf",
+                crate::model_store::registry::ModelFormat::Mlx => "mlx",
+            };
+            OaiModelInfo {
+                id: key.clone(),
+                object: "model".to_string(),
+                owned_by: "spindll".to_string(),
+                created: entry.downloaded_at,
+                architecture: if entry.architecture.is_empty() { None } else { Some(entry.architecture.clone()) },
+                context_length: if entry.context_length == 0 { None } else { Some(entry.context_length) },
+                format: Some(format_str.to_string()),
+                size_bytes: Some(entry.size_bytes),
+                capabilities: Some(ModelCapabilities {
+                    chat: true,
+                    completions: true,
+                    embeddings: entry.format == crate::model_store::registry::ModelFormat::Gguf || entry.format == crate::model_store::registry::ModelFormat::Mlx,
+                }),
+            }
         })
         .collect();
 
     Json(serde_json::json!({
         "object": "list",
         "data": data,
+    }))
+    .into_response()
+}
+
+// -- /v1/models enhanced ------------------------------------------------------
+
+#[derive(Serialize)]
+struct OaiModelInfo {
+    id: String,
+    object: String,
+    owned_by: String,
+    created: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    architecture: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_length: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capabilities: Option<ModelCapabilities>,
+}
+
+#[derive(Serialize)]
+struct ModelCapabilities {
+    chat: bool,
+    completions: bool,
+    embeddings: bool,
+}
+
+async fn oai_model_config(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let mut reg = match Registry::load(&state.store.registry_path()) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": {"message": e.to_string(), "type": "server_error"}})),
+            )
+                .into_response();
+        }
+    };
+    if reg.backfill_metadata() {
+        let _ = reg.save(&state.store.registry_path());
+    }
+
+    match reg.models.get(&id) {
+        Some(entry) => {
+            let format_str = match entry.format {
+                crate::model_store::registry::ModelFormat::Gguf => "gguf",
+                crate::model_store::registry::ModelFormat::Mlx => "mlx",
+            };
+            let model_info = OaiModelInfo {
+                id: id.clone(),
+                object: "model".to_string(),
+                owned_by: "spindll".to_string(),
+                created: entry.downloaded_at,
+                architecture: if entry.architecture.is_empty() { None } else { Some(entry.architecture.clone()) },
+                context_length: if entry.context_length == 0 { None } else { Some(entry.context_length) },
+                format: Some(format_str.to_string()),
+                size_bytes: Some(entry.size_bytes),
+                capabilities: Some(ModelCapabilities {
+                    chat: true,
+                    completions: true,
+                    embeddings: true,
+                }),
+            };
+            Json(model_info).into_response()
+        }
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": {"message": "model not found", "type": "invalid_request_error"}})),
+        )
+            .into_response(),
+    }
+}
+
+async fn oai_status(State(state): State<AppState>) -> impl IntoResponse {
+    let mut reg = match Registry::load(&state.store.registry_path()) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": {"message": e.to_string(), "type": "server_error"}})),
+            )
+                .into_response();
+        }
+    };
+    if reg.backfill_metadata() {
+        let _ = reg.save(&state.store.registry_path());
+    }
+
+    let loaded_models: Vec<String> = state.manager.loaded_models().iter().map(|(name, _, _, _, _, _)| name.clone()).collect();
+    let total_models = reg.models.len();
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "version": "0.6.0",
+        "models": {
+            "total": total_models,
+            "loaded": loaded_models.len(),
+            "loaded_models": loaded_models,
+        }
     }))
     .into_response()
 }
