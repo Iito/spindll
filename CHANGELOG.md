@@ -10,10 +10,12 @@ All notable changes to this project will be documented in this file.
   - `GET /v1/models` now includes architecture, context_length, format, size_bytes, capabilities, created timestamp
   - `GET /v1/models/{id}` endpoint for per-model config queries
   - `GET /v1/status` endpoint for server status with model inventory
+- **Run command chat template and system prompt** — `spindll run` now uses the model's chat template (via `generate_chat`) and injects a default system prompt ("You are a helpful assistant."). Add `--system` flag to override, `--max-tokens` to control output length.
 
 ### Refactored
 
 - **Budget calculation clarity** — extracted `MemoryBudget::load_budget_with_scheduler()` method to clarify the interaction between configured budgets, available RAM, and scheduler overhead. Added regression tests for default-mode clamping behavior (PR #47 follow-up).
+- **Max-tokens default handling** — `--max-tokens` in run command is optional (no clap default) to avoid duplicating `GenerateParams::default().max_tokens` (512). Falls back to library default when not provided (PR #46 follow-up).
 
 ## [0.6.0] - 2026-05-30
 
