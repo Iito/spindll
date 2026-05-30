@@ -825,7 +825,7 @@ fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_store::registry::{ModelEntry, ModelFormat, Registry};
+    use crate::model_store::registry::{ModelEntry, ModelFormat, ModelSource, Registry};
 
     fn write_entry(path: &std::path::Path, key: &str, entry: ModelEntry) {
         let mut reg = Registry::load(path).unwrap();
@@ -848,6 +848,7 @@ mod tests {
             metadata_read: true,
             format: ModelFormat::Mlx,
             base_model: base_model.to_string(),
+            source: registry::ModelSource::HfSourceDownloaded,
         }
     }
 
@@ -889,7 +890,7 @@ mod tests {
             entry,
         );
 
-        store.remove("mlx-community/test-4bit").expect("remove should succeed for MLX dir");
+        store.remove("mlx-community/test-4bit", false).expect("remove should succeed for MLX dir");
         assert!(!model_dir.exists(), "MLX dir should be deleted");
         let reg = Registry::load(&store.registry_path()).unwrap();
         assert!(!reg.models.contains_key("mlx-community/test-4bit"));
@@ -944,6 +945,7 @@ mod tests {
             metadata_read: true,
             format: ModelFormat::Gguf,
             base_model: String::new(),
+            source: registry::ModelSource::HfSourceDownloaded,
         }
     }
 
