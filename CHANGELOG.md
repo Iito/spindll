@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **AnythingLLM native provider support** — enhanced OpenAI API with per-model metadata:
+  - `GET /v1/models` now includes architecture, context_length, format, size_bytes, capabilities, created timestamp
+  - `GET /v1/models/{id}` endpoint for per-model config queries
+  - `GET /v1/status` endpoint for server status with model inventory
+
 ## [0.6.0] - 2026-05-30
 
 ### Added
