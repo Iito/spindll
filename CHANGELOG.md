@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-30
+
+### Added
+
+- **Model source tracking** — registry tracks how each model entered Spindll (downloaded from Ollama/HuggingFace, imported from local Ollama/HF cache, or manually imported). Five source types enable multi-engine compatibility.
+- **Extended import command** — `spindll import --from-hf` discovers models in local HuggingFace cache; `spindll import "/path/to/model"` validates and symlinks arbitrary GGUF/MLX files.
+- **Smart model cleanup** — `spindll rm` auto-deletes models Spindll owns, prompts for externally-managed models. `--purge` flag skips confirmation; users can respond "no" to keep models registered.
+- **Registry v2 migration** — auto-detects and infers source types for existing models on first load, ensuring backward compatibility with 0.5.1 registries.
+- **Embeddings support** — `POST /v1/embeddings` OpenAI-compatible endpoint; MLX and GGUF embedding extraction with input validation and rate limiting.
+- **MLX prompt cache disk tier** — extends prompt cache beyond RAM with adaptive quantization; longest-prefix-match reuse (not exact match); freshest cache kept near-lossless.
+- **Search command** — `spindll search <query>` across HuggingFace + Ollama with hardware-aware ranking, quant-aware sizing, FITS column, and `--format`/`--sort` flags.
+- **Device/GPU selection** — `--device` flag for serve/run commands; device-aware backend selection and per-model GPU pinning.
+- **Improved benchmarking** — before-after merge gate mode, separate decode tok/s from total tok/s, auto-detect platform features.
+
+### Fixed
+
+- **KV cache hardening** — fixed cross-tenant RAM leak, sampling crashes (hit and miss paths), hardened restore paths.
+- **Embeddings refinements** — array-len cap, right-size n_batch, OpenAI compat fixes, separate error counters.
+- **Search ranking** — rank by total system RAM on dedicated GPU, current available on shared; backfill HF model sizes from API and safetensors metadata.
+
 ## [0.5.1] - 2026-05-30
 
 ### Fixed
