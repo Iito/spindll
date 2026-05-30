@@ -35,6 +35,10 @@ enum Commands {
     Rm {
         /// Model name to delete
         model: String,
+
+        /// Skip confirmation prompts when removing externally-imported models
+        #[arg(long)]
+        purge: bool,
     },
 
     /// Start the gRPC server (models loaded dynamically via Load RPC)
@@ -119,11 +123,18 @@ enum Commands {
         prompt: Option<String>,
     },
 
-    /// Import models from Ollama
+    /// Import models from Ollama, HuggingFace cache, or local file
     Import {
-        /// Source to import from
-        #[arg(long = "from-ollama")]
+        /// Path to a GGUF or MLX model to import
+        path: Option<String>,
+
+        /// Import from local Ollama cache
+        #[arg(long)]
         from_ollama: bool,
+
+        /// Import from local HuggingFace cache
+        #[arg(long)]
+        from_hf: bool,
     },
 
     /// Show server status
@@ -388,9 +399,9 @@ async fn main() -> anyhow::Result<()> {
             let store = spindll::model_store::ModelStore::new(None);
             store.list()?;
         }
-        Commands::Rm { model } => {
+        Commands::Rm { model, purge } => {
             let store = spindll::model_store::ModelStore::new(None);
-            store.remove(&model)?;
+            store.remove(&model, purge)?;
         }
         Commands::Serve {
             port,
@@ -573,13 +584,31 @@ async fn main() -> anyhow::Result<()> {
                 fl, tps_pct, ttft_pct, sl,
             );
         }
-        Commands::Import { from_ollama } => {
-            if from_ollama {
-                let store = spindll::model_store::ModelStore::new(None);
-                let count = store.import_from_ollama()?;
-                println!("imported {count} model(s) from ollama");
-            } else {
-                anyhow::bail!("specify --from-ollama");
+        Commands::Import { path, from_ollama, from_hf } => {
+            let store = spindll::model_store::ModelStore::new(None);
+
+            match (path, from_ollama, from_hf) {
+                (Some(p), false, false) => {
+                    store.import_from_path(&p)?;
+                    println!("imported model from {p}");
+                }
+                (None, true, false) => {
+                    let count = store.import_from_ollama()?;
+                    println!("imported {count} model(s) from ollama");
+                }
+                (None, false, true) => {
+                    let count = store.import_from_hf()?;
+                    println!("imported {count} model(s) from huggingface cache");
+                }
+                (Some(_), true, _) | (Some(_), _, true) => {
+                    anyhow::bail!("cannot specify both a path and --from-ollama/--from-hf");
+                }
+                (None, false, false) => {
+                    anyhow::bail!("specify either a path, --from-ollama, or --from-hf");
+                }
+                _ => {
+                    anyhow::bail!("--from-ollama and --from-hf are mutually exclusive");
+                }
             }
         }
         Commands::Status { port } => {

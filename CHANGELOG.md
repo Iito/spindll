@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Model source tracking** — registry tracks how each model entered Spindll (downloaded from Ollama/HuggingFace, imported from local Ollama/HF cache, or manually imported). Five source types enable multi-engine compatibility.
+- **Extended import command** — `spindll import --from-hf` discovers models in local HuggingFace cache; `spindll import "/path/to/model"` validates and symlinks arbitrary GGUF/MLX files.
+- **Smart model cleanup** — `spindll rm` auto-deletes models Spindll owns, prompts for externally-managed models. `--purge` flag skips confirmation; users can respond "no" to keep models registered.
+- **Registry v2 migration** — auto-detects and infers source types for existing models on first load, ensuring backward compatibility with 0.5.1 registries.
+
 ## [0.5.1] - 2026-05-30
 
 ### Fixed

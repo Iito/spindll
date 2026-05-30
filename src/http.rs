@@ -140,7 +140,7 @@ async fn model_delete(
     // Unload from memory first if loaded.
     let _ = state.manager.unload_model(&id);
 
-    match state.store.remove(&id) {
+    match state.store.remove(&id, false) {
         Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
         Err(e) => (
             axum::http::StatusCode::NOT_FOUND,
