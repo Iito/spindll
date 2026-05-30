@@ -83,7 +83,7 @@ pub struct ModelEntry {
 }
 
 /// Sum the sizes of all files in a directory (non-recursive, follows symlinks).
-fn dir_size(dir: &std::path::Path) -> std::io::Result<u64> {
+pub(crate) fn dir_size(dir: &std::path::Path) -> std::io::Result<u64> {
     let mut total = 0u64;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;

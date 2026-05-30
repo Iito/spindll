@@ -569,7 +569,7 @@ impl ModelStore {
 
                 let key = repo_id.clone();
                 if !reg.models.contains_key(&key) {
-                    let size = std::fs::metadata(&snapshot_path)?.len();
+                    let size = registry::dir_size(&snapshot_path)?;
 
                     reg.add(
                         key,
@@ -603,44 +603,46 @@ impl ModelStore {
         Ok(imported)
     }
 
-    /// Import a model from an arbitrary file path.
+    /// Import a model from an arbitrary path: a `.gguf` file or an MLX
+    /// directory containing `config.json` + `model.safetensors`.
     pub fn import_from_path(&self, path_str: &str) -> anyhow::Result<()> {
         self.ensure_dirs()?;
         let path = std::fs::canonicalize(path_str)
             .map_err(|_| anyhow::anyhow!("path does not exist: {}", path_str))?;
 
-        if !path.is_file() {
-            anyhow::bail!("not a file: {}", path.display());
-        }
+        let is_gguf = path.is_file()
+            && path
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("gguf"))
+                .unwrap_or(false);
+        let is_mlx_dir = path.is_dir()
+            && path.join("config.json").exists()
+            && path.join("model.safetensors").exists();
 
-        // Determine format by extension
-        let extension = path
-            .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-
-        let format = if extension == "gguf" {
-            // Validate GGUF
-            registry::read_gguf_metadata(&path);
+        let format = if is_gguf {
+            registry::read_gguf_metadata(&path); // validate it parses as GGUF
             registry::ModelFormat::Gguf
-        } else if path.is_dir() {
+        } else if is_mlx_dir {
             registry::ModelFormat::Mlx
         } else {
             anyhow::bail!(
-                "unknown format: {} (expected .gguf file or MLX directory)",
-                extension
+                "unsupported model at {}: expected a .gguf file or an MLX directory (config.json + model.safetensors)",
+                path.display()
             );
         };
 
-        // Create a friendly key from the filename
-        let filename = path.file_name().unwrap().to_string_lossy();
+        let filename = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("path has no file name: {}", path.display()))?
+            .to_string_lossy();
         let key = format!("manual/{}", filename);
 
         let dest_dir = self.model_dir("manual");
         std::fs::create_dir_all(&dest_dir)?;
         let dest = dest_dir.join(filename.as_ref());
 
-        // Create symlink if not already present
+        // Symlink the source into the manual namespace. On unix this covers
+        // both a GGUF file and an MLX directory; windows falls back to a copy.
         if !dest.exists() {
             #[cfg(unix)]
             std::os::unix::fs::symlink(&path, &dest)?;
@@ -650,41 +652,46 @@ impl ModelStore {
             }
         }
 
-        // Read metadata
-        let (model_name, description, architecture, context_length) =
-            registry::read_gguf_metadata(&dest);
+        let (model_name, description, architecture, context_length, size) = match format {
+            registry::ModelFormat::Gguf => {
+                let (name, desc, arch, ctx) = registry::read_gguf_metadata(&dest);
+                (name, desc, arch, ctx, std::fs::metadata(&path)?.len())
+            }
+            registry::ModelFormat::Mlx => {
+                let (arch, name) = download::read_mlx_metadata(&path);
+                (name, String::new(), arch, 0, registry::dir_size(&path)?)
+            }
+        };
         let base_model = derive_base_model(&model_name, &filename);
-        let size = std::fs::metadata(&path)?.len();
 
         let mut reg = registry::Registry::load(&self.registry_path())?;
-        if !reg.models.contains_key(&key) {
-            reg.add(
-                key,
-                registry::ModelEntry {
-                    repo: "manual".to_string(),
-                    filename: filename.to_string(),
-                    path: dest,
-                    size_bytes: size,
-                    downloaded_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                    digest: String::new(),
-                    model_name,
-                    description,
-                    architecture,
-                    context_length,
-                    metadata_read: true,
-                    format,
-                    base_model,
-                    source: registry::ModelSource::ManuallyImported,
-                },
-            );
-            reg.save(&self.registry_path())?;
-        } else {
+        if reg.models.contains_key(&key) {
             println!("model already imported");
+            return Ok(());
         }
-
+        reg.add(
+            key,
+            registry::ModelEntry {
+                repo: "manual".to_string(),
+                filename: filename.to_string(),
+                path: dest,
+                size_bytes: size,
+                downloaded_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                digest: String::new(),
+                model_name,
+                description,
+                architecture,
+                context_length,
+                metadata_read: true,
+                format,
+                base_model,
+                source: registry::ModelSource::ManuallyImported,
+            },
+        );
+        reg.save(&self.registry_path())?;
         Ok(())
     }
 
@@ -1006,5 +1013,71 @@ mod tests {
         // On Linux CI and Windows, this must be false so GGUF is the default.
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
         assert!(!platform_prefers_mlx());
+    }
+
+    #[test]
+    fn import_from_path_registers_gguf_as_manual() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        let src = dir.path().join("tiny.gguf");
+        std::fs::write(&src, b"placeholder gguf bytes").unwrap();
+
+        store
+            .import_from_path(src.to_str().unwrap())
+            .expect("gguf file import should succeed");
+
+        let reg = Registry::load(&store.registry_path()).unwrap();
+        let entry = reg.models.get("manual/tiny.gguf").expect("entry registered");
+        assert_eq!(entry.source, ModelSource::ManuallyImported);
+    }
+
+    // MLX import symlinks a directory; windows hard_link/copy cannot, so these
+    // exercise the unix path (same limitation as import_from_hf).
+    #[cfg(unix)]
+    #[test]
+    fn import_from_path_accepts_mlx_directory() {
+        // Regression: an MLX directory must import, not bail "not a file".
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        let src = dir.path().join("my-mlx-model");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("config.json"), b"{}").unwrap();
+        std::fs::write(src.join("model.safetensors"), vec![0u8; 2048]).unwrap();
+
+        store
+            .import_from_path(src.to_str().unwrap())
+            .expect("mlx directory import should succeed");
+
+        let reg = Registry::load(&store.registry_path()).unwrap();
+        let entry = reg.models.get("manual/my-mlx-model").expect("mlx entry registered");
+        assert_eq!(entry.format, ModelFormat::Mlx);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_from_path_mlx_size_sums_directory_files() {
+        // size_bytes must reflect the model files, not the directory inode.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        let src = dir.path().join("sized-mlx");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("config.json"), vec![0u8; 100]).unwrap();
+        std::fs::write(src.join("model.safetensors"), vec![0u8; 4096]).unwrap();
+
+        store.import_from_path(src.to_str().unwrap()).unwrap();
+
+        let reg = Registry::load(&store.registry_path()).unwrap();
+        let entry = reg.models.get("manual/sized-mlx").unwrap();
+        assert_eq!(entry.size_bytes, 4196, "size must sum directory files, not stat the dir");
+    }
+
+    #[test]
+    fn import_from_path_rejects_unsupported_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        let src = dir.path().join("notes.txt");
+        std::fs::write(&src, b"not a model").unwrap();
+
+        assert!(store.import_from_path(src.to_str().unwrap()).is_err());
     }
 }
