@@ -62,30 +62,316 @@ jobs:
       - name: Run tests
         run: cargo test --features cli,http
 
-  build:
+  # ---------------------------------------------------------------------------
+  # Windows CUDA builds — per NVIDIA architecture
+  # ---------------------------------------------------------------------------
+  build-windows-cuda:
+    name: Windows CUDA (${{ matrix.arch_label }})
     needs: test
+    runs-on: windows-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
+          - arch_label: ampere
+            cuda_arch: '86'
+            cuda_version: '12.4.1'
+            artifact: spindll-windows-cuda-ampere
+
+          - arch_label: blackwell
+            cuda_arch: '120'
+            cuda_version: '12.8.0'
+            artifact: spindll-windows-cuda-blackwell
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: ${{ matrix.cuda_version }}
+          method: network
+
+      - name: Install LLVM (bindgen)
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: '17'
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-cuda-${{ matrix.arch_label }}
+
+      - name: Build
+        shell: pwsh
+        env:
+          CMAKE_CUDA_ARCHITECTURES: ${{ matrix.cuda_arch }}
+          CUDAARCHS: ${{ matrix.cuda_arch }}
+          LIBCLANG_PATH: ${{ env.LLVM_PATH }}/bin
+        run: cargo build --release --features cli,http,cuda
+
+      - name: Package binary
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          mkdir -p dist
+          cp target/release/spindll.exe dist/
+          cd dist
+          7z a "${ARTIFACT}.zip" spindll.exe
+          rm spindll.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.zip
+
+  # ---------------------------------------------------------------------------
+  # Windows Vulkan builds — AMD & Intel (single binary covers both)
+  # ---------------------------------------------------------------------------
+  build-windows-vulkan:
+    name: Windows Vulkan
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Vulkan SDK
+        uses: humbletim/setup-vulkan-sdk@v1.2.0
+        with:
+          vulkan-query-version: 1.3.290.0
+          vulkan-components: Vulkan-Headers, Vulkan-Loader
+          vulkan-use-cache: true
+
+      - name: Install LLVM (bindgen)
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: '17'
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-vulkan
+
+      - name: Build
+        shell: pwsh
+        env:
+          LIBCLANG_PATH: ${{ env.LLVM_PATH }}/bin
+        run: cargo build --release --features cli,http,vulkan
+
+      - name: Package binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/spindll.exe dist/
+          cd dist
+          7z a "spindll-windows-vulkan.zip" spindll.exe
+          rm spindll.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spindll-windows-vulkan
+          path: dist/spindll-windows-vulkan.zip
+
+  # ---------------------------------------------------------------------------
+  # Linux CUDA builds — per NVIDIA architecture
+  # ---------------------------------------------------------------------------
+  build-linux-cuda:
+    name: Linux CUDA (${{ matrix.arch_label }})
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch_label: ampere
+            cuda_arch: '86'
+            cuda_version: '12.4.1'
+            artifact: spindll-linux-cuda-ampere
+
+          - arch_label: blackwell
+            cuda_arch: '120'
+            cuda_version: '12.8.0'
+            artifact: spindll-linux-cuda-blackwell
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake protobuf-compiler
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: ${{ matrix.cuda_version }}
+          method: network
+
+      - name: Install build dependencies
+        run: sudo apt-get install -y ninja-build libclang-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-cuda-${{ matrix.arch_label }}
+
+      - name: Build
+        env:
+          CMAKE_CUDA_ARCHITECTURES: ${{ matrix.cuda_arch }}
+          CUDAARCHS: ${{ matrix.cuda_arch }}
+          CMAKE_GENERATOR: Ninja
+        run: cargo build --release --features cli,http,cuda
+
+      - name: Package binary
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          mkdir -p dist
+          cp target/release/spindll dist/
+          cd dist
+          tar czf "${ARTIFACT}.tar.gz" spindll
+          rm spindll
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.tar.gz
+
+  # ---------------------------------------------------------------------------
+  # Linux Vulkan builds — AMD & Intel
+  # ---------------------------------------------------------------------------
+  build-linux-vulkan:
+    name: Linux Vulkan
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y cmake protobuf-compiler ninja-build libclang-dev libvulkan-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-vulkan
+
+      - name: Build
+        env:
+          CMAKE_GENERATOR: Ninja
+        run: cargo build --release --features cli,http,vulkan
+
+      - name: Package binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/spindll dist/
+          cd dist
+          tar czf "spindll-linux-vulkan.tar.gz" spindll
+          rm spindll
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spindll-linux-vulkan
+          path: dist/spindll-linux-vulkan.tar.gz
+
+  # ---------------------------------------------------------------------------
+  # macOS ARM (Metal + MLX)
+  # ---------------------------------------------------------------------------
+  build-macos:
+    name: macOS ARM
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: brew install protobuf
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-arm64
+
+      - name: Build
+        run: cargo build --release --features cli,http,mlx
+
+      - name: Package binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/spindll dist/
+          cd dist
+          tar czf "spindll-aarch64-apple-darwin.tar.gz" spindll
+          rm spindll
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spindll-aarch64-apple-darwin
+          path: dist/spindll-aarch64-apple-darwin.tar.gz
+
+  # ---------------------------------------------------------------------------
+  # CPU-only baseline builds (no GPU)
+  # ---------------------------------------------------------------------------
+  build-cpu:
+    name: CPU-only (${{ matrix.os_label }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            os_label: linux
+            target: x86_64-unknown-linux-gnu
+            artifact: spindll-x86_64-unknown-linux-gnu
+
+          - os: windows-latest
+            os_label: windows
+            target: x86_64-pc-windows-msvc
+            artifact: spindll-x86_64-pc-windows-msvc
+
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake protobuf-compiler
-
-      - name: Install system dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: brew install protobuf
 
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
@@ -93,45 +379,38 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
-      - name: Build (macOS with MLX)
-        if: runner.os == 'macOS'
-        run: cargo build --release --features cli,http,mlx
-
       - name: Build
-        if: runner.os != 'macOS'
         run: cargo build --release --features cli,http
 
       - name: Package binary
         shell: bash
         env:
-          TARGET: ${{ matrix.target }}
+          ARTIFACT: ${{ matrix.artifact }}
         run: |
           mkdir -p dist
           if [ -f target/release/spindll.exe ]; then
             cp target/release/spindll.exe dist/
             cd dist
-            7z a "spindll-${TARGET}.zip" spindll.exe
+            7z a "${ARTIFACT}.zip" spindll.exe
             rm spindll.exe
           else
             cp target/release/spindll dist/
             cd dist
-            tar czf "spindll-${TARGET}.tar.gz" spindll
+            tar czf "${ARTIFACT}.tar.gz" spindll
             rm spindll
           fi
 
       - uses: actions/upload-artifact@v4
         with:
-          name: spindll-${{ matrix.target }}
+          name: ${{ matrix.artifact }}
           path: dist/spindll-*
 
   release:
-    needs: build
+    needs: [build-windows-cuda, build-windows-vulkan, build-linux-cuda, build-linux-vulkan, build-macos, build-cpu]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
