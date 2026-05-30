@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::mpsc;
 
 use crate::engine::streaming::{GenerateParams, GenerateResult};
-use super::traits::{BackendLoadParams, BackendModel, InferenceBackend};
+use super::traits::{BackendLoadParams, BackendModel, EmbedResult, InferenceBackend};
 
 // ---------------------------------------------------------------------------
 // Raw C declarations (matches mlx_bridge.h)
@@ -51,6 +51,32 @@ unsafe extern "C" {
     ) -> *const c_char;
 
     fn mlx_free_string(s: *const c_char);
+
+    fn mlx_embed(
+        handle:   *mut MlxModelHandle,
+        text:     *const c_char,
+        out_data: *mut *mut f32,
+        out_len:  *mut i32,
+    ) -> i32;
+
+    fn mlx_free_floats(data: *mut f32);
+
+    fn mlx_set_cache_budgets(ram_bytes: u64, disk_bytes: u64);
+}
+
+// ---------------------------------------------------------------------------
+// Cache budget configuration
+// ---------------------------------------------------------------------------
+
+/// Configure the MLX prompt cache's RAM and disk byte budgets. Should be called
+/// once before any MLX models are loaded — the disk tier reads `disk_bytes` on
+/// first access, and each loaded model's RAM cache reads `ram_bytes` at the
+/// time the model is constructed. Pass `0` for either tier to disable it.
+pub fn set_cache_budgets(ram_bytes: u64, disk_bytes: u64) {
+    // Safety: setter is a thin write to two module-level globals on the Swift
+    // side. We expect this to be called once at startup, before any concurrent
+    // model loads or chat requests, so no synchronisation is needed.
+    unsafe { mlx_set_cache_budgets(ram_bytes, disk_bytes) }
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +440,39 @@ impl BackendModel for MlxSwiftEngine {
 
     fn kv_bytes_per_token(&self) -> u64 {
         self.kv_bytes_per_token
+    }
+
+    fn embed(&self, text: &str) -> anyhow::Result<EmbedResult> {
+        let c_text = CString::new(text)?;
+        let handle_addr: usize = self.handle as usize;
+
+        let join = std::thread::spawn(move || {
+            let h = handle_addr as *mut MlxModelHandle;
+            let mut data_ptr: *mut f32 = std::ptr::null_mut();
+            let mut len: i32 = 0;
+
+            let result = unsafe {
+                mlx_embed(h, c_text.as_ptr(), &mut data_ptr, &mut len)
+            };
+
+            if result < 0 || data_ptr.is_null() || len <= 0 {
+                return Err(anyhow::anyhow!("mlx_embed failed ({})", result));
+            }
+
+            let embedding = unsafe {
+                std::slice::from_raw_parts(data_ptr, len as usize)
+            }.to_vec();
+
+            unsafe { mlx_free_floats(data_ptr) };
+
+            Ok(EmbedResult {
+                embedding,
+                prompt_tokens: result as u32,
+            })
+        });
+
+        join.join()
+            .map_err(|_| anyhow::anyhow!("MLX embed thread panicked"))?
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

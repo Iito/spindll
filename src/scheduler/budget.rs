@@ -38,6 +38,16 @@ impl MemoryBudget {
         }
     }
 
+    /// Calculate the load budget for a model, accounting for scheduler overhead.
+    ///
+    /// Takes the minimum of the configured budget and available RAM, then subtracts
+    /// any scheduler overhead. This ensures the backend has accurate memory headroom
+    /// for context window sizing, and reserves space for batch scheduler threads if needed.
+    pub fn load_budget_with_scheduler(&self, scheduler_overhead: u64) -> u64 {
+        let working_budget = std::cmp::min(self.budget, self.available_ram);
+        working_budget.saturating_sub(scheduler_overhead)
+    }
+
     /// Check if a model of the given size can be loaded within budget.
     pub fn can_fit(&self, model_size: u64) -> bool {
         model_size <= self.budget
@@ -230,5 +240,34 @@ mod tests {
             "macOS available_ram ({} MB) should include inactive+purgeable+speculative pages",
             m.available_ram / 1_048_576
         );
+    }
+
+    // Default-mode clamp: when no explicit budget is set, load_budget_with_scheduler
+    // should clamp to min(budget, available_ram) and subtract scheduler overhead.
+    #[test]
+    fn default_mode_clamps_to_available_with_scheduler_offset() {
+        let m = MemoryBudget::detect(None);
+        let scheduler_overhead = 100 * 1_048_576; // 100 MB
+
+        let load_budget = m.load_budget_with_scheduler(scheduler_overhead);
+
+        // The effective working budget is min(configured budget, available_ram).
+        // Since budget == available_ram when no explicit budget is set, we should get:
+        let expected = m.available_ram.saturating_sub(scheduler_overhead);
+        assert_eq!(load_budget, expected, "default-mode clamp must account for scheduler overhead");
+    }
+
+    // Explicit budget clamped correctly with scheduler offset: ensure that
+    // explicit budgets are clamped to available_ram before scheduler subtraction.
+    #[test]
+    fn explicit_budget_clamped_then_scheduler_offset_applied() {
+        let m = MemoryBudget::detect(Some("8G"));
+        let scheduler_overhead = 50 * 1_048_576; // 50 MB
+
+        let load_budget = m.load_budget_with_scheduler(scheduler_overhead);
+
+        // load_budget should be min(8GB, available_ram) - scheduler_overhead
+        let expected = std::cmp::min(m.budget, m.available_ram).saturating_sub(scheduler_overhead);
+        assert_eq!(load_budget, expected, "explicit budget must be clamped then scheduler-offset applied");
     }
 }

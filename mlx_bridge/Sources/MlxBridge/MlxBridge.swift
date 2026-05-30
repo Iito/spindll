@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import MLX
 import MLXLLM
 import MLXLMCommon
@@ -18,58 +19,356 @@ private final class Box<T>: @unchecked Sendable {
 // ---------------------------------------------------------------------------
 // PromptCache — in-memory LRU cache of KV state keyed by token sequence.
 //
-// On a cache hit for an
-// identical prompt the expensive prefill is skipped: only the last prompt token
-// is re-processed (one decode step), so TTFT ≈ single-token forward pass.
+// On a cache *prefix* match the saved KV state is restored, trimmed back to the
+// longest token prefix it shares with the new prompt, and only the tokens that
+// are new since then are prefilled — so a follow-up turn in a chat (system +
+// turn1 + turn2 + …) costs O(new tokens) of prefill instead of O(whole prompt).
+// On an exact match (or when the new prompt is itself a prefix of the cached
+// one) just the last prompt token is re-processed, so TTFT ≈ a single decode
+// step.
+//
+// Each stored state is re-snapshotted *after* generation, so it covers the
+// prompt plus the tokens generated that turn — that is exactly the prefix the
+// next turn's prompt extends.
+//
+// Snapshots are quantized to keep the in-memory footprint small. The freshest
+// entry — the one the active conversation keeps extending — is kept at the
+// higher precision (`highBits`); older entries are demoted to `lowBits` the
+// moment a newer snapshot supersedes them. So the hot path always reuses a
+// near-lossless state while cold entries cost a quarter of an f16 state. This
+// mirrors how macOS keeps active pages uncompressed and compresses inactive
+// ones.
 //
 // Access is serialised by ModelContainer's SerialAccessContainer actor, so no
 // additional lock is needed.
 // ---------------------------------------------------------------------------
 
-private final class PromptCacheEntry {
-    let tokenIds: [Int32]
-    let lastTokenId: Int32
-    let kvCache: [any KVCache]
+private let kvGroupSize = 64
+private let highBits = 8     // freshest snapshot — near-lossless
+private let lowBits  = 4     // demoted (cold) snapshot — ¼ of f16
 
-    init(tokenIds: [Int32], kvCache: [any KVCache]) {
+/// Length of the longest common prefix of two token-id sequences.
+private func commonPrefixLength(_ a: [Int32], _ b: [Int32]) -> Int {
+    let n = min(a.count, b.count)
+    var i = 0
+    while i < n && a[i] == b[i] { i += 1 }
+    return i
+}
+
+private final class PromptCacheEntry {
+    /// Token sequence this KV state corresponds to — prompt tokens plus any
+    /// tokens generated after it, so a later turn can prefix off this entry.
+    var tokenIds: [Int32]
+    /// KV state covering exactly `tokenIds`: every layer has `offset == tokenIds.count`.
+    var kvCache: [any KVCache]
+    /// Bit width of the quantized attention layers (`highBits` or `lowBits`).
+    var bits: Int
+    /// In-RAM footprint of `kvCache`. Updated when `demote` re-quantises.
+    var sizeBytes: Int64
+    /// A copy of this state has already been written to the on-disk tier — so
+    /// it isn't re-written when the entry is later demoted or evicted.
+    var spilled = false
+
+    init(tokenIds: [Int32], kvCache: [any KVCache], bits: Int) {
         self.tokenIds  = tokenIds
-        self.lastTokenId = tokenIds.last ?? 0
         self.kvCache   = kvCache
+        self.bits      = bits
+        self.sizeBytes = sizeOf(kvCache)
     }
 }
 
-private final class PromptCache {
-    private var entries: [PromptCacheEntry] = []
-    private let maxSize: Int
+/// Result of a prompt-cache lookup: the matched entry and how many leading
+/// tokens it shares with the requested prompt.
+private struct PromptCacheHit {
+    let entry: PromptCacheEntry
+    let prefixLength: Int
+}
 
-    init(maxSize: Int = 2) { self.maxSize = maxSize }
+/// Re-quantize an entry's attention layers down to `lowBits`. Only ever called
+/// on entries that are no longer the most-recently-used, to shrink the in-memory
+/// footprint. Mamba/SSM layers (already independent deep copies) are left as-is.
+private func demote(_ entry: PromptCacheEntry) {
+    guard entry.bits != lowBits else { return }
+    entry.kvCache = entry.kvCache.map { layer -> any KVCache in
+        guard let q = layer as? QuantizedKVCache, q.bits != lowBits else { return layer }
+        return q.toUnquantized().toQuantized(groupSize: kvGroupSize, bits: lowBits)
+    }
+    entry.bits = lowBits
+    entry.sizeBytes = sizeOf(entry.kvCache)
+}
 
-    /// Return the entry whose token sequence exactly matches, and promote it
-    /// to the front of the LRU list.
-    func lookup(tokenIds: [Int32]) -> PromptCacheEntry? {
-        guard !tokenIds.isEmpty,
-              let idx = entries.firstIndex(where: { $0.tokenIds == tokenIds })
-        else { return nil }
-        let entry = entries.remove(at: idx)
-        entries.insert(entry, at: 0)
-        return entry
+/// Total bytes occupied by the live state arrays of every layer in `kvCache`.
+/// `MLXArray.nbytes` reports the size of the (possibly-sliced) view.
+private func sizeOf(_ kvCache: [any KVCache]) -> Int64 {
+    var total: Int64 = 0
+    for layer in kvCache {
+        for array in layer.state { total += Int64(array.nbytes) }
+    }
+    return total
+}
+
+// ---------------------------------------------------------------------------
+// Cache budgets — set once at startup via `mlx_set_cache_budgets`. Defaults
+// match the GGUF side's flag defaults so behaviour is consistent if the Rust
+// side never calls the setter.
+// ---------------------------------------------------------------------------
+
+private var mlxRamCacheBudget: Int64  = 512 * 1024 * 1024            // 512 MB
+private var mlxDiskCacheBudget: Int64 = 2 * 1024 * 1024 * 1024       // 2 GB
+
+/// Configure the prompt cache's RAM and disk byte budgets. Should be called
+/// before any models are loaded — `sharedMlxDiskCache` reads `diskBytes` on
+/// first access, and each `PromptCache` reads `ramBytes` at construction. Pass
+/// 0 for either tier to effectively disable it.
+@_cdecl("mlx_set_cache_budgets")
+public func mlxSetCacheBudgets(_ ramBytes: UInt64, _ diskBytes: UInt64) {
+    let clamp: (UInt64) -> Int64 = { Int64(min($0, UInt64(Int64.max))) }
+    mlxRamCacheBudget  = clamp(ramBytes)
+    mlxDiskCacheBudget = clamp(diskBytes)
+    fputs("[mlx-bridge] prompt cache: ram=\(ramBytes >> 20) MB disk=\(diskBytes >> 20) MB\n", stderr)
+}
+
+// ---------------------------------------------------------------------------
+// MlxDiskCache — on-disk LRU tier behind PromptCache.
+//
+// Evicted PromptCache entries are written here as safetensors (via
+// mlx-swift-lm's savePromptCache); a RAM miss checks here for a usable token
+// prefix before falling back to a cold prefill, so prompt prefixes survive
+// process restarts. Shared by every loaded model — entries are namespaced by a
+// digest of the model's config.json, so re-downloading a model invalidates them.
+// Set SPINDLL_MLX_DISK_CACHE=0 to disable.
+// ---------------------------------------------------------------------------
+
+private func sha256Hex(_ data: Data) -> String {
+    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+private struct DiskCacheEntry: Codable {
+    var file: String          // "<modelDigest>_<tokenDigest>.safetensors"
+    var modelDigest: String
+    var tokenIds: [Int32]
+    var bits: Int             // quantization width of the attention layers
+    var sizeBytes: Int64
+    var lastUsed: Double      // for LRU ordering
+}
+
+private final class MlxDiskCache {
+    private let dir: URL
+    private let maxBytes: Int64
+    private let enabled: Bool
+    private let lock = NSLock()
+    private var index: [String: DiskCacheEntry] = [:]
+
+    init() {
+        self.maxBytes = mlxDiskCacheBudget
+        self.enabled = mlxDiskCacheBudget > 0
+            && ProcessInfo.processInfo.environment["SPINDLL_MLX_DISK_CACHE"] != "0"
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+        self.dir = URL(fileURLWithPath: home)
+            .appendingPathComponent(".spindll").appendingPathComponent("cache").appendingPathComponent("mlx")
+        guard enabled else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        if let data = try? Data(contentsOf: dir.appendingPathComponent("index.json")),
+           let list = try? JSONDecoder().decode([DiskCacheEntry].self, from: data) {
+            index = Dictionary(list.map { ($0.file, $0) }, uniquingKeysWith: { a, _ in a })
+        }
     }
 
-    /// Insert (or replace) an entry for the given token sequence, evicting the
-    /// least-recently-used entry if the cache is full.
-    func save(tokenIds: [Int32], kvCache: [any KVCache]) {
+    private func saveIndexLocked() {
+        if let data = try? JSONEncoder().encode(Array(index.values)) {
+            try? data.write(to: dir.appendingPathComponent("index.json"), options: .atomic)
+        }
+    }
+
+    private func totalBytesLocked() -> Int64 { index.values.reduce(0) { $0 + $1.sizeBytes } }
+
+    private func evictLocked() {
+        while totalBytesLocked() > maxBytes,
+              let lru = index.values.min(by: { $0.lastUsed < $1.lastUsed }) {
+            index[lru.file] = nil
+            try? FileManager.default.removeItem(at: dir.appendingPathComponent(lru.file))
+        }
+    }
+
+    /// Find this model's disk entry sharing the longest token prefix with
+    /// `tokenIds` (≥ `minPrefix`), load it, refresh its LRU stamp, and return
+    /// its reconstructed KV state. `nil` on no match or a load failure.
+    func lookup(modelDigest: String, tokenIds: [Int32], minPrefix: Int)
+        -> (tokenIds: [Int32], kvCache: [any KVCache], bits: Int)? {
+        guard enabled else { return nil }
+        lock.lock()
+        var best: DiskCacheEntry? = nil
+        var bestLen = 0
+        for e in index.values where e.modelDigest == modelDigest {
+            let l = commonPrefixLength(e.tokenIds, tokenIds)
+            if l > bestLen { bestLen = l; best = e }
+        }
+        guard var entry = best, bestLen >= minPrefix else { lock.unlock(); return nil }
+        let url = dir.appendingPathComponent(entry.file)
+        lock.unlock()
+
+        let loaded: [KVCache]
+        do { loaded = try loadPromptCache(url: url).0 }
+        catch {
+            fputs("[mlx-bridge] disk cache: load failed (\(entry.file)): \(error)\n", stderr)
+            lock.lock(); index[entry.file] = nil; saveIndexLocked(); lock.unlock()
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
+        // loadPromptCache rebuilds QuantizedKVCache layers at the default 8-bit
+        // width — mlx-swift-lm doesn't restore bits/groupSize from metaState — so
+        // re-bind the loaded arrays into caches with the width we recorded.
+        let kvCache: [any KVCache] = entry.bits == 8 ? loaded : loaded.map { layer in
+            guard let q = layer as? QuantizedKVCache, q.bits != entry.bits else { return layer }
+            let nq = QuantizedKVCache(groupSize: q.groupSize, bits: entry.bits)
+            nq.state = q.state
+            nq.offset = q.offset
+            return nq
+        }
+        lock.lock()
+        entry.lastUsed = Date().timeIntervalSinceReferenceDate
+        index[entry.file] = entry
+        saveIndexLocked()
+        lock.unlock()
+        return (entry.tokenIds, kvCache, entry.bits)
+    }
+
+    /// Write an evicted RAM entry to disk, dropping LRU disk entries if over budget.
+    func put(modelDigest: String, tokenIds: [Int32], kvCache: [any KVCache], bits: Int) {
+        guard enabled, !tokenIds.isEmpty else { return }
+        var tokenData = Data(capacity: tokenIds.count * 4)
+        for t in tokenIds { withUnsafeBytes(of: t.littleEndian) { tokenData.append(contentsOf: $0) } }
+        let file = "\(modelDigest)_\(sha256Hex(tokenData)).safetensors"
+        let url = dir.appendingPathComponent(file)
+        do { try savePromptCache(url: url, cache: kvCache, metadata: [:]) }
+        catch {
+            fputs("[mlx-bridge] disk cache: save failed (\(file)): \(error)\n", stderr)
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+        let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        lock.lock()
+        index[file] = DiskCacheEntry(file: file, modelDigest: modelDigest, tokenIds: tokenIds,
+                                     bits: bits, sizeBytes: size, lastUsed: Date().timeIntervalSinceReferenceDate)
+        evictLocked()
+        if index[file] == nil { try? FileManager.default.removeItem(at: url) }  // entry alone > budget
+        saveIndexLocked()
+        lock.unlock()
+    }
+}
+
+private let sharedMlxDiskCache = MlxDiskCache()
+
+private final class PromptCache {
+    private var entries: [PromptCacheEntry] = []
+    /// Total in-RAM byte budget for the cache. Configured via `mlx_set_cache_budgets`
+    /// (wired to `--kv-ram-cache`); `0` disables the prompt cache entirely.
+    private let maxBytes: Int64
+    /// Don't reuse a state that shares only a handful of tokens — the prefill
+    /// we would save is dwarfed by the deep-copy + trim + re-snapshot overhead.
+    /// 64 tokens covers a typical chat-template wrapping plus a short turn; below
+    /// that, restoring is a net loss vs. a cold prefill.
+    private let minPrefix: Int
+    /// Only touch the on-disk tier for prompts at least this long — for short
+    /// prompts, reading an ~tens-of-MB safetensors back costs more than just
+    /// re-prefilling. The RAM tier is used regardless of length.
+    private let diskMinTokens = 512
+    /// Model identity (digest of config.json) — namespaces this model's entries
+    /// in the shared on-disk tier.
+    private let modelDigest: String
+
+    init(modelDigest: String, maxBytes: Int64? = nil, minPrefix: Int = 64) {
+        self.modelDigest = modelDigest
+        self.maxBytes    = maxBytes ?? mlxRamCacheBudget
+        self.minPrefix   = minPrefix
+    }
+
+    private var usedBytes: Int64 { entries.reduce(0) { $0 + $1.sizeBytes } }
+
+    /// RAM lookup: the entry sharing the longest token prefix with `tokenIds`
+    /// (≥ `minPrefix`), promoted to the front of the LRU list.
+    private func lookupRam(_ tokenIds: [Int32]) -> PromptCacheHit? {
+        var bestIdx: Int? = nil
+        var bestLen = 0
+        for (i, e) in entries.enumerated() {
+            let l = commonPrefixLength(e.tokenIds, tokenIds)
+            if l > bestLen { bestLen = l; bestIdx = i }
+        }
+        guard let idx = bestIdx, bestLen >= minPrefix else { return nil }
+        let entry = entries.remove(at: idx)
+        entries.insert(entry, at: 0)
+        return PromptCacheHit(entry: entry, prefixLength: bestLen)
+    }
+
+    /// Look up `tokenIds`, checking RAM first and then the on-disk tier; a disk
+    /// hit is loaded back into RAM (when RAM tier is enabled). `nil` if neither
+    /// has a usable prefix. `maxBytes == 0` disables only the RAM tier — disk
+    /// lookups still run so callers using `--no-kv-ram-cache` keep their disk
+    /// cache.
+    func lookup(tokenIds: [Int32]) -> PromptCacheHit? {
+        guard !tokenIds.isEmpty else { return nil }
+        if maxBytes > 0, let hit = lookupRam(tokenIds) { return hit }
+        guard tokenIds.count >= diskMinTokens,
+              let d = sharedMlxDiskCache.lookup(
+                modelDigest: modelDigest, tokenIds: tokenIds, minPrefix: minPrefix)
+        else { return nil }
+        let entry = PromptCacheEntry(tokenIds: d.tokenIds, kvCache: d.kvCache, bits: d.bits)
+        entry.spilled = true   // it came from disk; no need to write it back
+        if maxBytes > 0 {
+            entries.removeAll { commonPrefixLength($0.tokenIds, entry.tokenIds) == $0.tokenIds.count }
+            entries.insert(entry, at: 0)
+            evictExcess()
+        }
+        return PromptCacheHit(entry: entry, prefixLength: commonPrefixLength(entry.tokenIds, tokenIds))
+    }
+
+    /// Insert (or replace) the entry for `tokenIds`. Any existing entry whose
+    /// token sequence is a prefix of the new one is dropped (the new entry
+    /// supersedes it). Surviving older entries spill a near-lossless copy to the
+    /// on-disk tier and are then demoted to `lowBits` in RAM. The LRU entry, if
+    /// the cache is over its byte budget, is dropped from RAM (already on disk).
+    func save(tokenIds: [Int32], kvCache: [any KVCache], bits: Int) {
         guard !tokenIds.isEmpty else { return }
-        entries.removeAll { $0.tokenIds == tokenIds }
-        entries.insert(PromptCacheEntry(tokenIds: tokenIds, kvCache: kvCache), at: 0)
-        if entries.count > maxSize { entries.removeLast() }
+        // RAM tier disabled: skip RAM bookkeeping but still spill to disk so
+        // `--no-kv-ram-cache` users keep their on-disk cache.
+        if maxBytes == 0 {
+            let entry = PromptCacheEntry(tokenIds: tokenIds, kvCache: kvCache, bits: bits)
+            spillToDisk(entry)
+            return
+        }
+        entries.removeAll { commonPrefixLength($0.tokenIds, tokenIds) == $0.tokenIds.count }
+        for e in entries {
+            spillToDisk(e)   // while still highBits — disk entries stay near-lossless
+            demote(e)
+        }
+        entries.insert(PromptCacheEntry(tokenIds: tokenIds, kvCache: kvCache, bits: bits), at: 0)
+        evictExcess()
+    }
+
+    private func evictExcess() {
+        while usedBytes > maxBytes, let evicted = entries.popLast() {
+            spillToDisk(evicted)   // no-op if already spilled or already demoted
+        }
+    }
+
+    /// Write `entry`'s state to the on-disk tier once, while it's still at the
+    /// higher precision and only if it's long enough to be worth the I/O.
+    private func spillToDisk(_ entry: PromptCacheEntry) {
+        guard !entry.spilled, entry.bits == highBits, entry.tokenIds.count >= diskMinTokens else { return }
+        sharedMlxDiskCache.put(modelDigest: modelDigest,
+                               tokenIds: entry.tokenIds, kvCache: entry.kvCache, bits: entry.bits)
+        entry.spilled = true
     }
 }
 
 // Retains the ModelContainer and prompt KV cache across FFI calls.
 private final class ModelState: @unchecked Sendable {
     let container: ModelContainer
-    let promptCache = PromptCache()
-    init(_ container: ModelContainer) { self.container = container }
+    let promptCache: PromptCache
+    init(_ container: ModelContainer, modelDigest: String) {
+        self.container = container
+        self.promptCache = PromptCache(modelDigest: modelDigest)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -88,13 +387,23 @@ public func mlxModelLoad(_ path: UnsafePointer<CChar>?) -> UnsafeMutableRawPoint
     let sema = DispatchSemaphore(value: 0)
     let box = Box<ModelState>()
 
+    // Model identity for the on-disk prompt cache: digest of config.json (the
+    // same artefact the Rust side uses as the MLX model version), falling back
+    // to the path if it can't be read.
+    let modelDigest: String
+    if let cfg = try? Data(contentsOf: url.appendingPathComponent("config.json")) {
+        modelDigest = sha256Hex(cfg)
+    } else {
+        modelDigest = sha256Hex(Data(modelPath.utf8))
+    }
+
     Task {
         do {
             let container = try await LLMModelFactory.shared.loadContainer(
                 from: url,
                 using: #huggingFaceTokenizerLoader()
             )
-            box.value = ModelState(container)
+            box.value = ModelState(container, modelDigest: modelDigest)
         } catch {
             // box.value stays nil; Rust side receives NULL
         }
@@ -273,6 +582,26 @@ private func deepCopyCache(_ layer: any KVCache) -> any KVCache {
     return copied
 }
 
+/// Take an independent snapshot of a live KV cache for the prompt cache.
+///
+/// Attention layers are quantized to `bits` (`trim()` just decrements the offset
+/// so prefix reuse is unaffected by quantization); Mamba/SSM layers are deep-
+/// copied as-is. Works whether the live cache is f16 (`KVCacheSimple`, on a
+/// miss) or already quantized at some other width (`QuantizedKVCache`, on a hit
+/// off a previous snapshot). The result is independent — safe to retain while
+/// generation keeps mutating the live cache.
+private func snapshotCache(_ cache: [any KVCache], bits: Int) -> [any KVCache] {
+    cache.map { layer in
+        if let simple = layer as? KVCacheSimple {
+            return simple.toQuantized(groupSize: kvGroupSize, bits: bits)
+        }
+        if let q = layer as? QuantizedKVCache, q.bits != bits {
+            return q.toUnquantized().toQuantized(groupSize: kvGroupSize, bits: bits)
+        }
+        return deepCopyCache(layer)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // mlx_chat_generate
 // ---------------------------------------------------------------------------
@@ -322,48 +651,74 @@ public func mlxChatGenerate(
                     tokenizer: context.tokenizer, messages: msgs)
                 let tokenIds = rawIds.map { Int32($0) }
 
-                // --- Prompt KV cache ---
-                // On a hit we restore the saved KV state (trimmed by 1 token),
-                // then feed only the last prompt token to TokenIterator so that
-                // prefill is a single decode step instead of N steps.
-                // On a miss we run full prefill and snapshot the resulting cache
-                // (before generation) for the next call with the same prompt.
+                // --- Prompt KV cache (prefix reuse) ---
+                // Look for a cached state sharing a token prefix with this
+                // prompt. On a hit we restore that state, trim it back to the
+                // shared-prefix length, and prefill only the new tokens; on a
+                // miss we prefill the whole prompt into a fresh cache. Either
+                // way the live cache is re-snapshotted after generation (so it
+                // covers prompt + generated tokens) for the next prefix lookup.
+                //
+                // `canTrimPromptCache` is the SWA fallback: for Gemma-style
+                // sliding-window models `RotatingKVCache.isTrimmable` flips to
+                // false once the conversation exceeds the window, in which case
+                // we silently fall back to a cold prefill. Same guard on the
+                // save path below skips snapshotting non-trimmable caches at all.
+                let liveCache: [any KVCache]
                 var iterator: TokenIterator
-                if let entry = state.promptCache.lookup(tokenIds: tokenIds) {
-                    // HIT: restore cache at offset N-1, run last token only.
-                    let restoredCache = entry.kvCache.map { deepCopyCache($0) }
-                    trimPromptCache(restoredCache, numTokens: 1)
-                    let seedInput = LMInput(tokens: MLXArray([entry.lastTokenId]))
+                let snapshotBits: Int   // precision to re-snapshot the live cache at
+                let wasMiss: Bool
+
+                if let hit = state.promptCache.lookup(tokenIds: tokenIds),
+                   canTrimPromptCache(hit.entry.kvCache) {
+                    let cachedLen = hit.entry.tokenIds.count
+                    let prefixLen = hit.prefixLength      // 1 ≤ prefixLen ≤ tokenIds.count, ≤ cachedLen
+
+                    // If the cached state covers exactly the shared prefix (no
+                    // trim needed), consume it in place — the save below will
+                    // drop this entry by token prefix anyway, so we don't need
+                    // an independent copy. Otherwise we have to deep-copy, since
+                    // trimming + prefilling would mutate the surviving entry.
+                    let restored: [any KVCache]
+                    if prefixLen == cachedLen {
+                        restored = hit.entry.kvCache
+                    } else {
+                        restored = hit.entry.kvCache.map { deepCopyCache($0) }
+                        trimPromptCache(restored, numTokens: cachedLen - prefixLen)
+                    }
+
+                    let seedTokens: [Int32]
+                    if prefixLen < tokenIds.count {
+                        seedTokens = Array(tokenIds[prefixLen...])
+                    } else {
+                        // Whole prompt already cached — re-process just the last
+                        // token so TokenIterator has logits to sample from.
+                        trimPromptCache(restored, numTokens: 1)
+                        seedTokens = [tokenIds[tokenIds.count - 1]]
+                    }
+
+                    liveCache = restored
+                    // Keep the precision we restored at — re-quantizing a coarse
+                    // state to a finer width recovers no information.
+                    snapshotBits = hit.entry.bits
+                    wasMiss = false
                     iterator = try TokenIterator(
-                        input: seedInput,
+                        input: LMInput(tokens: MLXArray(seedTokens)),
                         model: context.model,
-                        cache: restoredCache,
+                        cache: liveCache,
                         parameters: params
                     )
                 } else {
-                    // MISS: full prefill.  We own the cache object so we can
-                    // snapshot it (via copy()) immediately after init — the KVCache
-                    // instances are classes and are mutated in-place by TokenIterator,
-                    // so ownedCache already reflects the post-prefill state.
-                    let ownedCache = makePromptCache(model: context.model, parameters: params)
-                    let lmInput = LMInput(tokens: MLXArray(tokenIds))
+                    liveCache = makePromptCache(model: context.model, parameters: params)
+                    // Miss: the live cache is f16 — snapshot it near-losslessly.
+                    snapshotBits = highBits
+                    wasMiss = true
                     iterator = try TokenIterator(
-                        input: lmInput,
+                        input: LMInput(tokens: MLXArray(tokenIds)),
                         model: context.model,
-                        cache: ownedCache,
+                        cache: liveCache,
                         parameters: params
                     )
-                    // Snapshot at offset=N (all prompt tokens processed, before decode).
-                    // Use toQuantized() to create independent data — .copy() uses
-                    // MLXArray views that share the underlying buffer, so mutations
-                    // during generation corrupt the "snapshot".
-                    let snapshot: [any KVCache] = ownedCache.map { layer in
-                        if let simple = layer as? KVCacheSimple {
-                            return simple.toQuantized(groupSize: 64, bits: 4)
-                        }
-                        return deepCopyCache(layer)
-                    }
-                    state.promptCache.save(tokenIds: tokenIds, kvCache: snapshot)
                 }
 
                 var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
@@ -379,7 +734,11 @@ public func mlxChatGenerate(
                 }
 
                 var cancelled = false
+                var generatedTokenIds: [Int32] = []
                 while let tokenId = iterator.next() {
+                    // TokenIterator has appended `tokenId` to liveCache by now,
+                    // so liveCache.offset == tokenIds.count + generatedTokenIds.count.
+                    generatedTokenIds.append(Int32(tokenId))
                     if stopTokenIds.contains(tokenId) { break }
                     generated += 1
                     detokenizer.append(token: tokenId)
@@ -396,6 +755,28 @@ public func mlxChatGenerate(
 
                 if !cancelled, let chunk = detokenizer.next() {
                     _ = chunk.withCString { ptr in callback(ptr, callbackCtx) }
+                }
+
+                // Hand the live cache — now covering prompt + generated tokens —
+                // to the prompt cache for the next turn's prefix lookup. Skip
+                // non-trimmable caches (Mamba/SSM hybrids): they could only ever
+                // be matched whole, which is never useful for prefix reuse.
+                //
+                // On a miss the live cache is f16 KVCacheSimple — quantize as we
+                // store (a raw KVCacheSimple snapshot would share buffers with
+                // the still-mutating live cache). On a hit the cache's
+                // QuantizedKVCache layers are already independent — deep-copied
+                // for partial-prefix hits, exclusively owned for full-prefix
+                // hits (the dedup in `save` drops the original entry) — so we
+                // hand them to `save` directly. This avoids the redundant
+                // post-generation deep copy that was happening on every hit.
+                if canTrimPromptCache(liveCache) {
+                    let toStore = wasMiss ? snapshotCache(liveCache, bits: snapshotBits)
+                                          : liveCache
+                    state.promptCache.save(
+                        tokenIds: tokenIds + generatedTokenIds,
+                        kvCache: toStore,
+                        bits: snapshotBits)
                 }
 
                 Stream().synchronize()
@@ -487,4 +868,91 @@ public func mlxFreeString(_ s: UnsafePointer<CChar>?) {
     let len = strlen(s) + 1
     mutable.deinitialize(count: len)
     mutable.deallocate()
+}
+
+// ---------------------------------------------------------------------------
+// mlx_embed
+// ---------------------------------------------------------------------------
+
+@_cdecl("mlx_embed")
+public func mlxEmbed(
+    _ handle:  UnsafeMutableRawPointer?,
+    _ text:    UnsafePointer<CChar>?,
+    _ outData: UnsafeMutablePointer<UnsafeMutablePointer<Float>?>?,
+    _ outLen:  UnsafeMutablePointer<Int32>?
+) -> Int32 {
+    guard let handle, let text, let outData, let outLen else { return -1 }
+    let state = Unmanaged<ModelState>.fromOpaque(handle).takeUnretainedValue()
+    let inputText = String(cString: text)
+
+    let sema = DispatchSemaphore(value: 0)
+    let box = Box<(UnsafeMutablePointer<Float>, Int32, Int32)>()
+
+    // NOTE: This path produces *heuristic* embeddings from a generative LM by
+    // mean-pooling the input embedding rows for the tokenised text. It is NOT
+    // a true pseudo-inverse hidden-state recovery — the previous
+    // `matmul(logits, W_embed)` formula did not compute one either. Use a
+    // dedicated embedding model (e.g. sentence-transformers MLX) for any
+    // task where vector quality matters.
+    Task {
+        do {
+            try await state.container.perform(nonSendable: inputText) { context, txt in
+                let tokenIds = context.tokenizer.encode(text: txt)
+                guard !tokenIds.isEmpty else { return }
+
+                let allParams = context.model.parameters().flattened()
+
+                let embedKeys = ["embed_tokens", "wte", "word_embeddings"]
+                guard let prefix = embedKeys.lazy.compactMap({ name -> String? in
+                    allParams.first(where: { $0.0.contains(name) && $0.0.hasSuffix(".weight") })
+                        .map { String($0.0.dropLast(".weight".count)) }
+                }).first else { return }
+
+                guard let embedWeight = allParams.first(where: { $0.0 == prefix + ".weight" })?.1
+                else { return }
+                let embedScales = allParams.first(where: { $0.0 == prefix + ".scales" })?.1
+                let embedBiases = allParams.first(where: { $0.0 == prefix + ".biases" })?.1
+
+                let fullWeight: MLXArray
+                if let embedScales {
+                    fullWeight = dequantized(
+                        embedWeight, scales: embedScales, biases: embedBiases)
+                } else {
+                    fullWeight = embedWeight
+                }
+
+                // Look up the input embedding row per token and mean-pool.
+                let idxArr = MLXArray(tokenIds.map { Int32($0) })
+                let rows = fullWeight.asType(.float32).take(idxArr, axis: 0)
+                let pooled = rows.mean(axis: 0).reshaped(-1)
+
+                let norm = MLX.sqrt((pooled * pooled).sum())
+                let normalized = norm.item(Float.self) > 0 ? pooled / norm : pooled
+                MLX.eval(normalized)
+
+                let floats = normalized.asArray(Float.self)
+                let buf = UnsafeMutablePointer<Float>.allocate(capacity: floats.count)
+                buf.initialize(from: floats, count: floats.count)
+                box.value = (buf, Int32(floats.count), Int32(tokenIds.count))
+            }
+        } catch {
+            // box stays nil → returns -1
+        }
+        sema.signal()
+    }
+    sema.wait()
+
+    guard let (buf, len, promptTokens) = box.value else { return -1 }
+    outData.pointee = buf
+    outLen.pointee = len
+    return promptTokens
+}
+
+// ---------------------------------------------------------------------------
+// mlx_free_floats
+// ---------------------------------------------------------------------------
+
+@_cdecl("mlx_free_floats")
+public func mlxFreeFloats(_ data: UnsafeMutablePointer<Float>?) {
+    data?.deallocate()
 }

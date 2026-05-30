@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **AnythingLLM native provider support** — enhanced OpenAI API with per-model metadata:
+  - `GET /v1/models` now includes architecture, context_length, format, size_bytes, capabilities, created timestamp
+  - `GET /v1/models/{id}` endpoint for per-model config queries
+  - `GET /v1/status` endpoint for server status with model inventory
+- **Run command chat template and system prompt** — `spindll run` now uses the model's chat template (via `generate_chat`) and injects a default system prompt ("You are a helpful assistant."). Add `--system` flag to override, `--max-tokens` to control output length.
+
+### Refactored
+
+- **Budget calculation clarity** — extracted `MemoryBudget::load_budget_with_scheduler()` method to clarify the interaction between configured budgets, available RAM, and scheduler overhead. Added regression tests for default-mode clamping behavior (PR #47 follow-up).
+- **Max-tokens default handling** — `--max-tokens` in run command is optional (no clap default) to avoid duplicating `GenerateParams::default().max_tokens` (512). Falls back to library default when not provided (PR #46 follow-up).
+
+## [0.6.0] - 2026-05-30
+
+### Added
+
+- **Model source tracking** — registry tracks how each model entered Spindll (downloaded from Ollama/HuggingFace, imported from local Ollama/HF cache, or manually imported). Five source types enable multi-engine compatibility.
+- **Extended import command** — `spindll import --from-hf` discovers models in local HuggingFace cache; `spindll import "/path/to/model"` validates and symlinks arbitrary GGUF/MLX files.
+- **Smart model cleanup** — `spindll rm` auto-deletes models Spindll owns, prompts for externally-managed models. `--purge` flag skips confirmation; users can respond "no" to keep models registered.
+- **Registry v2 migration** — auto-detects and infers source types for existing models on first load, ensuring backward compatibility with 0.5.1 registries.
+- **Embeddings support** — `POST /v1/embeddings` OpenAI-compatible endpoint; MLX and GGUF embedding extraction with input validation and rate limiting.
+- **MLX prompt cache disk tier** — extends prompt cache beyond RAM with adaptive quantization; longest-prefix-match reuse (not exact match); freshest cache kept near-lossless.
+- **Search command** — `spindll search <query>` across HuggingFace + Ollama with hardware-aware ranking, quant-aware sizing, FITS column, and `--format`/`--sort` flags.
+- **Device/GPU selection** — `--device` flag for serve/run commands; device-aware backend selection and per-model GPU pinning.
+- **Improved benchmarking** — before-after merge gate mode, separate decode tok/s from total tok/s, auto-detect platform features.
+
+### Fixed
+
+- **KV cache hardening** — fixed cross-tenant RAM leak, sampling crashes (hit and miss paths), hardened restore paths.
+- **Embeddings refinements** — array-len cap, right-size n_batch, OpenAI compat fixes, separate error counters.
+- **Search ranking** — rank by total system RAM on dedicated GPU, current available on shared; backfill HF model sizes from API and safetensors metadata.
+
 ## [0.5.1] - 2026-05-30
 
 ### Fixed
@@ -15,6 +48,60 @@ All notable changes to this project will be documented in this file.
 - **Linux build and runtime dependencies** — documented complete dev build requirements for bare Ubuntu (libssl-dev, clang, libclang-dev, etc.) and end-user runtime dependencies (libssl3, libgomp1) to address CI/bare-Ubuntu parity gaps.
 
 ## [0.5.0] - 2026-05-23
+
+### Added
+
+- **Per-model eviction priority + idle-reload watcher** — models can be pinned or
+  deprioritised for eviction; idle-reload watches previously-loaded models and
+  brings them back when memory permits.
+- **MLX prompt KV cache** — prefix caching for MLX models with fused chat generate,
+  matching the GGUF backend's disk-backed cache.
+- **MLX chat template support** — reads Jinja chat templates via the Swift bridge,
+  falling back to ChatML when the model ships without one.
+- **`spindll search`** — search for models across HuggingFace and Ollama registries,
+  ranked by host hardware compatibility (preferred format first, models that fit
+  in available RAM before those that don't, then by download count).
+- `docs/mlx-bridge.md` documenting the `mlx_bridge/` Swift package: C ABI,
+  prompt KV cache, build pipeline, and Rust FFI integration. Linked from the
+  `docs/` index and from a new `mlx_bridge/README.md` pointer.
+
+### Changed
+
+- `bench` command gated from release builds (`#[cfg(debug_assertions)]`).
+- Bench throughput reporting now separates decode tok/s from total tok/s;
+  comparison model is optional for single-model profiling.
+- `run` command routes through `ModelManager` instead of dispatching to backends
+  directly; gains `--ctx-size` and `--budget` flags.
+- Bench memory footprint measurement switched from raw `phys_footprint_mb` FFI to
+  the `memory-stats` crate.
+
+### Fixed
+
+- **MLX KV cache corruption** — quantize cache snapshots before storing to prevent
+  stale float buffers on cache hits; deep-copy `MambaCache` state to prevent
+  shared-buffer corruption across generations.
+- **MLX ChatML fallback** — models without a chat template no longer panic; the
+  bridge falls back to ChatML formatting.
+- MLX pull/run/rm bugs: import path resolution, model removal, incorrect format
+  detection.
+- MLX backend skipped gracefully when metallib not found next to binary.
+- `platform_prefers_mlx` gated on the `mlx` feature flag — no longer suggests MLX
+  format on builds compiled without the feature.
+- Reject MLX pull on unsupported platforms instead of downloading unusable weights.
+- Split GGUF models: download all shards instead of only the first file.
+- Suppress llama.cpp C-level log messages from leaking into terminal output;
+  restore log suppression with correct `ggml` level mapping.
+- Xcode toolchain rpath for Swift concurrency dylib on macOS.
+- Honor `--budget 0` flag and guard registry save against empty model stores.
+- **Linux budget-aware loading** — account for batch scheduler weight in memory
+  budget calculations, add `clamp_budget_to_live` to prevent over-allocation on
+  explicit budgets, use `checked_div` in `resolve_n_ctx` to avoid division by zero
+  on very small budgets.
+- README links to `docs/API.md` (removed in the v0.5.0 docs split) now point to
+  `docs/README.md` and `docs/api-rust.md`.
+
+## [0.5.0] - 2026-04-28
+>>>>>>> fb494ff (docs: add search command to README and changelog)
 
 ### Added
 
