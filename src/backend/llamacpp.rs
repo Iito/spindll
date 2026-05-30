@@ -4,12 +4,13 @@ use std::sync::OnceLock;
 
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::LlamaModel;
+use llama_cpp_2::model::{AddBos, LlamaModel};
 
 use crate::engine::streaming::{GenerateParams, GenerateResult, generate_streaming};
 use crate::engine::apply_chat_template_with_fallback;
-use super::traits::{BackendLoadParams, BackendModel, InferenceBackend};
+use super::traits::{BackendLoadParams, BackendModel, EmbedResult, InferenceBackend};
 
 static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
 
@@ -217,6 +218,60 @@ impl BackendModel for LlamaCppModel {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn embed(&self, text: &str) -> anyhow::Result<EmbedResult> {
+        let tokens = self
+            .model
+            .str_to_token(text, AddBos::Always)
+            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+
+        if tokens.is_empty() {
+            anyhow::bail!("empty input produces no tokens");
+        }
+
+        let n_tokens = tokens.len().min(self.n_ctx as usize);
+        let n_batch: u32 = (n_tokens as u32).min(self.n_ctx);
+
+        let ctx_params = LlamaContextParams::default()
+            .with_embeddings(true)
+            .with_n_ctx(NonZeroU32::new(self.n_ctx))
+            .with_n_batch(n_batch);
+        let mut ctx = self
+            .model
+            .new_context(shared_backend(), ctx_params)
+            .map_err(|e| anyhow::anyhow!("failed to create embedding context: {e}"))?;
+
+        let mut batch = LlamaBatch::new(n_tokens.max(512), 1);
+        let last_idx = n_tokens as i32 - 1;
+        for (i, token) in (0_i32..).zip(tokens[..n_tokens].iter()) {
+            batch.add(*token, i, &[0], i == last_idx)?;
+        }
+
+        ctx.decode(&mut batch)
+            .map_err(|e| anyhow::anyhow!("decode failed: {e}"))?;
+
+        let raw = match ctx.embeddings_seq_ith(0) {
+            Ok(emb) => emb.to_vec(),
+            Err(llama_cpp_2::EmbeddingsError::NonePoolType) => {
+                ctx.embeddings_ith(last_idx)
+                    .map_err(|e| anyhow::anyhow!("embeddings_ith failed: {e}"))?
+                    .to_vec()
+            }
+            Err(e) => anyhow::bail!("embeddings_seq_ith failed: {e}"),
+        };
+
+        let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let embedding = if norm > 0.0 {
+            raw.iter().map(|x| x / norm).collect()
+        } else {
+            raw
+        };
+
+        Ok(EmbedResult {
+            embedding,
+            prompt_tokens: n_tokens as u32,
+        })
     }
 }
 

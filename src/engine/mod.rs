@@ -2,6 +2,7 @@
 
 pub mod batch;
 pub mod kv_cache;
+pub mod kv_ram_cache;
 pub mod manager;
 pub mod metrics;
 pub mod ram_cache;
@@ -9,6 +10,7 @@ pub mod streaming;
 
 pub use batch::{BatchEvent, BatchRequest, BatchScheduler};
 pub use kv_cache::KvCache;
+pub use kv_ram_cache::KvRamCache;
 pub use manager::{EvictionPriority, LoadOptions, ModelManager};
 pub use metrics::Metrics;
 pub use ram_cache::RamCache;
@@ -30,6 +32,7 @@ pub struct Engine {
     n_ctx: u32,
     model_digest: String,
     kv_cache: Option<KvCache>,
+    kv_ram_cache: Option<KvRamCache>,
 }
 
 impl Engine {
@@ -73,6 +76,7 @@ impl Engine {
             n_ctx,
             model_digest: String::new(),
             kv_cache: None,
+            kv_ram_cache: None,
         })
     }
 
@@ -107,8 +111,22 @@ impl Engine {
     }
 
     /// Enable the disk-backed KV cache with the given maximum size in bytes.
+    /// Also enables the in-memory RAM tier (512 MB) unless already configured.
     pub fn enable_kv_cache(&mut self, max_bytes: u64) {
         self.kv_cache = Some(KvCache::new(max_bytes));
+        if self.kv_ram_cache.is_none() {
+            self.kv_ram_cache = Some(KvRamCache::new(512 * 1_048_576));
+        }
+    }
+
+    /// Enable the in-memory KV state cache with the given maximum size in bytes.
+    pub fn enable_kv_ram_cache(&mut self, max_bytes: u64) {
+        self.kv_ram_cache = Some(KvRamCache::new(max_bytes));
+    }
+
+    /// Disable the in-memory KV state cache.
+    pub fn disable_kv_ram_cache(&mut self) {
+        self.kv_ram_cache = None;
     }
 
     /// Set the model file digest for KV cache keying.
@@ -130,7 +148,8 @@ impl Engine {
         let mut ctx = self.create_context()?;
         match &self.kv_cache {
             Some(cache) => streaming::generate_streaming_cached(
-                &self.model, &mut ctx, prompt, params, "default", &self.model_digest, cache, None, on_token,
+                &self.model, &mut ctx, prompt, params, "default", &self.model_digest,
+                cache, self.kv_ram_cache.as_ref(), None, on_token,
             ),
             None => streaming::generate_streaming(&self.model, &mut ctx, prompt, params, on_token),
         }

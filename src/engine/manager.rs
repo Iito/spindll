@@ -16,6 +16,7 @@ use crate::model_store::registry::ModelFormat;
 
 use super::batch::{BatchEvent, BatchRequest, BatchScheduler};
 use super::kv_cache::KvCache;
+use super::kv_ram_cache::KvRamCache;
 use super::metrics::Metrics;
 use super::ram_cache::RamCache;
 use super::streaming::{GenerateParams, GenerateResult, generate_streaming_cached};
@@ -99,6 +100,7 @@ pub struct ModelManager {
     default_gpu_layers: u32,
     memory_budget: u64,
     kv_cache: Option<KvCache>,
+    kv_ram_cache: Option<KvRamCache>,
     ram_cache: Option<RamCache>,
     metrics: Arc<Metrics>,
     batch_slots: usize,
@@ -187,6 +189,7 @@ impl ModelManager {
             default_gpu_layers,
             memory_budget,
             kv_cache: None,
+            kv_ram_cache: None,
             ram_cache: None,
             metrics: Arc::new(Metrics::new()),
             batch_slots: 0,
@@ -206,6 +209,7 @@ impl ModelManager {
             default_gpu_layers: 0,
             memory_budget,
             kv_cache: None,
+            kv_ram_cache: None,
             ram_cache: None,
             metrics: Arc::new(Metrics::new()),
             batch_slots: 0,
@@ -384,8 +388,7 @@ impl ModelManager {
         // Once weights are mmap'd / uploaded to Metal, available memory drops,
         // so the snapshot has to happen here, not inside the backend.
         let mem = crate::scheduler::budget::MemoryBudget::detect(None);
-        let load_budget = std::cmp::min(self.memory_budget, mem.available_ram);
-        let load_budget = load_budget.saturating_sub(planned_scheduler_bytes);
+        let load_budget = mem.load_budget_with_scheduler(planned_scheduler_bytes);
 
         let layers = gpu_layers.unwrap_or(self.default_gpu_layers);
 
@@ -535,8 +538,26 @@ impl ModelManager {
     }
 
     /// Enable the disk-backed KV cache with the given max size in bytes.
+    /// The in-memory RAM tier is independent — callers must enable it
+    /// explicitly via [`Self::enable_kv_ram_cache`] so `--no-kv-ram-cache`
+    /// can fully disable it.
     pub fn enable_kv_cache(&mut self, max_bytes: u64) {
         self.kv_cache = Some(KvCache::new(max_bytes));
+    }
+
+    /// Enable the in-memory KV state cache with the given max size in bytes.
+    pub fn enable_kv_ram_cache(&mut self, max_bytes: u64) {
+        self.kv_ram_cache = Some(KvRamCache::new(max_bytes));
+    }
+
+    /// Disable the in-memory KV state cache.
+    pub fn disable_kv_ram_cache(&mut self) {
+        self.kv_ram_cache = None;
+    }
+
+    /// Returns a reference to the KV RAM cache, if enabled.
+    pub fn kv_ram_cache(&self) -> Option<&KvRamCache> {
+        self.kv_ram_cache.as_ref()
     }
 
     /// Enable the KV cache with a custom directory.
@@ -713,6 +734,7 @@ impl ModelManager {
                     model_name,
                     &loaded.digest,
                     cache,
+                    self.kv_ram_cache.as_ref(),
                     encryption_key,
                     on_token,
                 );
@@ -821,6 +843,7 @@ impl ModelManager {
                     model_name,
                     &loaded.digest,
                     cache,
+                    self.kv_ram_cache.as_ref(),
                     encryption_key,
                     on_token,
                 );
@@ -846,6 +869,43 @@ impl ModelManager {
             .ok_or_else(|| anyhow::anyhow!("model '{}' not loaded", model_name))?;
         *loaded.last_used.write().unwrap() = Instant::now();
         loaded.model.apply_chat_template(messages)
+    }
+
+    /// Compute an embedding vector for a text string.
+    #[tracing::instrument(skip(self, text), fields(model = model_name))]
+    pub fn embed(
+        &self,
+        model_name: &str,
+        text: &str,
+    ) -> anyhow::Result<crate::backend::EmbedResult> {
+        let _active = ActiveGuard::new(&self.active_requests);
+        let models = self.models.read().unwrap();
+        let loaded = models
+            .get(model_name)
+            .ok_or_else(|| anyhow::anyhow!("model '{}' not loaded", model_name))?;
+        *loaded.last_used.write().unwrap() = Instant::now();
+        self.record_activity();
+
+        let start = Instant::now();
+        let result = loaded.model.embed(text);
+        let elapsed_us = start.elapsed().as_micros() as u64;
+
+        match &result {
+            Ok(r) => {
+                tracing::info!(
+                    prompt_tokens = r.prompt_tokens,
+                    embedding_dim = r.embedding.len(),
+                    elapsed_ms = elapsed_us / 1000,
+                    "embedding complete"
+                );
+                self.metrics.record_embed(r.prompt_tokens as u64, elapsed_us);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, elapsed_ms = elapsed_us / 1000, "embedding failed");
+                self.metrics.record_embed_error();
+            }
+        }
+        result
     }
 }
 
@@ -1086,8 +1146,12 @@ mod tests {
 
         // Push last_activity into the past so the idle check passes
         *mgr.last_activity.write().unwrap() = Instant::now() - Duration::from_millis(200);
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
+        // Poll until the idle watcher reloads "a" (generous timeout for slow CI)
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !mgr.is_loaded("a") && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(mgr.is_loaded("a"), "model should be reloaded by idle watcher");
     }
 
@@ -1152,6 +1216,7 @@ mod tests {
         assert!(!mgr.is_loaded("a"), "reload must not fire without into_arc()");
     }
 
+    #[test]
     fn evict_for_skips_high_when_low_present() {
         let dir = tempfile::tempdir().unwrap();
         // Each model costs 100 (file) + 1*2048 (kv) = 2148 in total_loaded_bytes.
@@ -1234,6 +1299,19 @@ mod tests {
             false // cancel immediately
         });
         assert!(token_count <= 1, "expected at most 1 token, got {token_count}");
+    }
+
+    #[test]
+    #[ignore]
+    fn gguf_embed_produces_normalized_vector() {
+        let path = real_gguf_path().expect("GGUF model not found");
+        let mgr = ModelManager::new(512, None, 0).unwrap();
+        mgr.load_model("test", &path, None).unwrap();
+        let result = mgr.embed("test", "Hello world").unwrap();
+        assert!(!result.embedding.is_empty(), "embedding should not be empty");
+        assert!(result.prompt_tokens > 0);
+        let norm: f32 = result.embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 0.01, "embedding should be L2-normalized, got norm={norm}");
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
