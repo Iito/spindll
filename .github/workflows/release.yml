@@ -305,9 +305,9 @@ jobs:
   # # macOS ARM (Metal + MLX)
   # # ---------------------------------------------------------------------------
   build-macos:
-    name: macOS ARM
+    name: macOS ARM (Sequoia)
     needs: test
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
