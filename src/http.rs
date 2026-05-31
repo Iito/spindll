@@ -1642,4 +1642,222 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), 400);
     }
+
+    #[test]
+    fn tool_call_parsing_extracts_json_objects() {
+        let output = r#"The model output {"name": "search", "arguments": "{\"query\": \"hello\"}"} and some more text"#;
+        let (calls, remaining) = parse_tool_calls(output);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "search");
+        assert_eq!(calls[0].r#type, "function");
+        assert!(calls[0].id.starts_with("call_"));
+        assert!(!remaining.is_empty());
+    }
+
+    #[test]
+    fn tool_call_parsing_handles_multiple_calls() {
+        let output = r#"First {"name": "search", "arguments": "{\"q\": \"a\"}"} and then {"name": "calculate", "arguments": "{\"expr\": \"1+1\"}"}"#;
+        let (calls, _) = parse_tool_calls(output);
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "search");
+        assert_eq!(calls[1].function.name, "calculate");
+    }
+
+    #[test]
+    fn tool_call_parsing_fallback_when_no_calls() {
+        let output = "This is just regular model output with no tool calls";
+        let (calls, remaining) = parse_tool_calls(output);
+
+        assert_eq!(calls.len(), 0);
+        assert_eq!(remaining, output);
+    }
+
+    #[test]
+    fn tool_call_response_format_is_openai_compatible() {
+        let call = OaiToolCallMessage {
+            id: "call_abc123".to_string(),
+            r#type: "function".to_string(),
+            function: OaiToolCallFunction {
+                name: "search".to_string(),
+                arguments: r#"{"query":"hello"}"#.to_string(),
+            },
+        };
+
+        let json = serde_json::json!({
+            "id": call.id,
+            "type": call.r#type,
+            "function": {
+                "name": call.function.name,
+                "arguments": call.function.arguments
+            }
+        });
+
+        assert_eq!(json["type"], "function");
+        assert_eq!(json["function"]["name"], "search");
+        assert!(json["id"].as_str().unwrap().starts_with("call_"));
+    }
+
+    #[tokio::test]
+    async fn oai_chat_completions_accepts_functions_parameter() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        let app = router(mgr, store);
+
+        let body = serde_json::json!({
+            "model": "test-org/test-model",
+            "messages": [{"role": "user", "content": "use search tool"}],
+            "stream": false,
+            "max_tokens": 10,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "Search for information",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"}
+                        },
+                        "required": ["query"]
+                    }
+                }
+            }]
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(resp.status().as_u16() >= 200 && resp.status().as_u16() < 500);
+    }
+
+    #[tokio::test]
+    async fn oai_chat_completions_streams_tool_calls_with_correct_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        let app = router(mgr, store);
+
+        let body = serde_json::json!({
+            "model": "test-org/test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "max_tokens": 10,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "test_tool",
+                    "description": "A test tool",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        assert!(text.contains("data: "));
+        assert!(text.contains("[DONE]"));
+        assert!(text.contains("finish_reason"));
+    }
+
+    #[tokio::test]
+    async fn oai_chat_completions_non_stream_returns_tool_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        let app = router(mgr, store);
+
+        let body = serde_json::json!({
+            "model": "test-org/test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false,
+            "max_tokens": 10,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "test_tool",
+                    "description": "A test tool",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert!(json["choices"].is_array());
+        assert!(json["choices"][0]["message"].is_object());
+
+        let message = &json["choices"][0]["message"];
+        let has_content = message.get("content").is_some();
+        let has_tool_calls = message.get("tool_calls").is_some();
+        assert!(has_content || has_tool_calls);
+
+        if let Some(tool_calls) = message.get("tool_calls") {
+            assert!(tool_calls.is_array());
+            if let Some(first_call) = tool_calls.get(0) {
+                assert_eq!(first_call["type"], "function");
+                assert!(first_call["id"].is_string());
+                assert!(first_call["function"]["name"].is_string());
+                assert!(first_call["function"]["arguments"].is_string());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oai_chat_completions_fallback_without_tool_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        let app = router(mgr, store);
+
+        let body = serde_json::json!({
+            "model": "test-org/test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false,
+            "max_tokens": 10
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["choices"][0]["finish_reason"], "stop");
+        assert!(json["choices"][0]["message"]["content"].is_string());
+    }
 }

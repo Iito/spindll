@@ -18,3 +18,8 @@ Append-only. One entry per `/implement` close. Format:
 - Harness scaffold installed: AGENTS.md (+ CLAUDE.md, .codex/AGENTS.md symlinks), .claude/{settings.json, commands/*.md}, docs/{PUNCHLIST,WORKLOG}.md, scripts/{ratchet,review-fanout,autoloop,mlx-validate}.sh, nightshift.yml.
 - Branch base: origin/main.
 - Next: smoke-test `/implement` against the seeded punchlist.
+
+## 2026-05-31 11:05  claude  test/function-calling  ratchet=green  review=2/2-clean
+- Verification tests for existing OpenAI-compatible function calling implementation. Already in codebase (no code changes needed). Added comprehensive tests covering tool parsing, response format, streaming/non-streaming, fallback.
+- files: src/http.rs, docs/PUNCHLIST.md
+- Tests: parse_tool_calls (single/multiple), response format validation, streaming/non-streaming with tools, fallback without tools. All 133 tests passing (8 new).
