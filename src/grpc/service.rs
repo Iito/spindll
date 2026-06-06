@@ -54,29 +54,33 @@ fn send_usage(
 }
 
 /// Convert proto `Message` list with `parts` into engine `MultimodalMessage` list.
+///
+/// Enforces the same per-image byte cap as the HTTP path so the gRPC entry
+/// point can't be used to bypass the DoS guard.
 #[cfg(feature = "vision")]
-fn proto_to_multimodal(messages: &[crate::proto::Message]) -> Vec<crate::engine::MultimodalMessage> {
-    use crate::engine::multimodal::{ContentPart, MultimodalMessage};
+fn proto_to_multimodal(messages: &[crate::proto::Message]) -> anyhow::Result<Vec<crate::engine::MultimodalMessage>> {
+    use crate::engine::multimodal::{check_image_len, ContentPart, MultimodalMessage};
 
     messages.iter().map(|m| {
         if m.parts.is_empty() {
             // Text-only message — wrap content as a single Text part.
-            MultimodalMessage {
+            Ok(MultimodalMessage {
                 role: m.role.clone(),
                 content: vec![ContentPart::Text(m.content.clone())],
-            }
+            })
         } else {
             let content = m.parts.iter().map(|p| {
                 if p.r#type == "image" {
-                    ContentPart::ImageBytes {
+                    check_image_len(p.image_data.len())?;
+                    Ok(ContentPart::ImageBytes {
                         data: p.image_data.clone(),
                         media_type: if p.media_type.is_empty() { None } else { Some(p.media_type.clone()) },
-                    }
+                    })
                 } else {
-                    ContentPart::Text(p.text.clone())
+                    Ok(ContentPart::Text(p.text.clone()))
                 }
-            }).collect();
-            MultimodalMessage { role: m.role.clone(), content }
+            }).collect::<anyhow::Result<Vec<_>>>()?;
+            Ok(MultimodalMessage { role: m.role.clone(), content })
         }
     }).collect()
 }
@@ -184,7 +188,13 @@ impl Spindll for SpindllService {
 
             #[cfg(feature = "vision")]
             let result = if has_image {
-                let mm_messages = proto_to_multimodal(&req.messages);
+                let mm_messages = match proto_to_multimodal(&req.messages) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(Status::invalid_argument(e.to_string())));
+                        return;
+                    }
+                };
                 mgr.generate_chat_multimodal(&req.model, &mm_messages, &params, |token| {
                     let resp = ChatResponse {
                         token: token.to_string(),
@@ -614,5 +624,42 @@ mod tests {
         assert_eq!(mlx.base_model, "llama3.1-8b");
 
         assert!(!resp.prefer_format.is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "vision"))]
+mod proto_to_multimodal_tests {
+    use super::*;
+    use crate::engine::multimodal::{ContentPart as MmPart, MAX_IMAGE_BYTES};
+
+    fn image_msg(image_data: Vec<u8>) -> crate::proto::Message {
+        crate::proto::Message {
+            role: "user".into(),
+            content: String::new(),
+            parts: vec![crate::proto::ContentPart {
+                r#type: "image".into(),
+                text: String::new(),
+                image_data,
+                media_type: "image/png".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn maps_image_part_within_cap() {
+        let out = proto_to_multimodal(&[image_msg(vec![1, 2, 3])]).unwrap();
+        match &out[0].content[..] {
+            [MmPart::ImageBytes { data, media_type }] => {
+                assert_eq!(data.as_slice(), &[1, 2, 3]);
+                assert_eq!(media_type.as_deref(), Some("image/png"));
+            }
+            other => panic!("expected image part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_image() {
+        let err = proto_to_multimodal(&[image_msg(vec![0u8; MAX_IMAGE_BYTES + 1])]).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "got: {err}");
     }
 }

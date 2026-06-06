@@ -410,7 +410,7 @@ impl MlxSwiftEngine {
                 let text: String = m.content.iter().filter_map(|p| match p {
                     ContentPart::Text(t) => Some(t.as_str()),
                     _ => None,
-                }).collect::<Vec<_>>().join("");
+                }).collect::<String>();
                 serde_json::json!({ "role": &m.role, "content": text })
             })
             .collect();

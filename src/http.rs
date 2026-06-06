@@ -17,7 +17,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::engine::{GenerateParams, ModelManager};
 #[cfg(feature = "vision")]
-use crate::engine::multimodal::{ContentPart, MultimodalMessage};
+use crate::engine::multimodal::{check_image_len, ContentPart, MAX_IMAGE_BYTES, MultimodalMessage};
 use crate::model_store::registry::Registry;
 use crate::model_store::ModelStore;
 
@@ -556,8 +556,7 @@ impl OaiContent {
                     OaiContentPart::Text { text } => Some(text.as_str()),
                     _ => None,
                 })
-                .collect::<Vec<_>>()
-                .join(""),
+                .collect::<String>(),
         }
     }
 
@@ -577,19 +576,15 @@ enum OaiContentPart {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "image_url")]
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "vision"), allow(dead_code))]
     ImageUrl { image_url: OaiImageUrl },
 }
 
 #[derive(Deserialize, Clone)]
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "vision"), allow(dead_code))]
 struct OaiImageUrl {
     url: String,
 }
-
-/// Per-image decoded byte cap. Bounds request-handler allocation.
-#[cfg(feature = "vision")]
-const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 
 /// MIME allow-list. Rejected before `MtmdBitmap::from_buffer` / MLX ImageIO.
 #[cfg(feature = "vision")]
@@ -604,13 +599,18 @@ fn decode_data_uri(uri: &str) -> anyhow::Result<(Vec<u8>, Option<String>)> {
 
     let rest = uri.strip_prefix("data:")
         .ok_or_else(|| anyhow::anyhow!("image_url must be a data: URI (http(s) URLs not yet supported)"))?;
-    let (header, b64) = rest.split_once(",")
+    let (header, b64) = rest.split_once(',')
         .ok_or_else(|| anyhow::anyhow!("malformed data URI: missing comma"))?;
 
-    let media_type = header.strip_suffix(";base64").map(|s| {
-        // Strip `;param=value` tail.
-        s.split(';').next().unwrap_or(s).trim().to_lowercase()
-    });
+    // Require base64 so raw/percent-encoded bodies aren't fed to the decoder.
+    let Some(meta) = header.strip_suffix(";base64") else {
+        anyhow::bail!("image_url data URI must be base64-encoded (missing \";base64\")");
+    };
+    // Strip `;param=value` tail; empty type → None.
+    let media_type = {
+        let mt = meta.split(';').next().unwrap_or(meta).trim().to_lowercase();
+        if mt.is_empty() { None } else { Some(mt) }
+    };
 
     // Pre-check encoded length (b64 ~4→3 bytes) → reject before alloc.
     if b64.len() / 4 * 3 > MAX_IMAGE_BYTES {
@@ -624,9 +624,7 @@ fn decode_data_uri(uri: &str) -> anyhow::Result<(Vec<u8>, Option<String>)> {
     let data = base64::engine::general_purpose::STANDARD.decode(b64)
         .map_err(|e| anyhow::anyhow!("base64 decode failed: {e}"))?;
 
-    if data.len() > MAX_IMAGE_BYTES {
-        anyhow::bail!("image exceeds {} byte limit ({} bytes)", MAX_IMAGE_BYTES, data.len());
-    }
+    check_image_len(data.len())?;
 
     if let Some(mt) = &media_type {
         if !ALLOWED_IMAGE_MEDIA.contains(&mt.as_str()) {
@@ -1838,5 +1836,35 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), 400);
+    }
+}
+
+#[cfg(all(test, feature = "vision"))]
+mod vision_tests {
+    use super::*;
+
+    #[test]
+    fn decode_data_uri_decodes_base64_with_media_type() {
+        let (bytes, media) = decode_data_uri("data:image/png;base64,aGVsbG8=").unwrap();
+        assert_eq!(bytes.as_slice(), b"hello");
+        assert_eq!(media.as_deref(), Some("image/png"));
+    }
+
+    #[test]
+    fn decode_data_uri_rejects_uri_without_base64_marker() {
+        let err = decode_data_uri("data:image/png,aGVsbG8=").unwrap_err();
+        assert!(err.to_string().contains("base64"), "got: {err}");
+    }
+
+    #[test]
+    fn decode_data_uri_rejects_disallowed_media_type() {
+        let err = decode_data_uri("data:image/tiff;base64,aGVsbG8=").unwrap_err();
+        assert!(err.to_string().contains("unsupported"), "got: {err}");
+    }
+
+    #[test]
+    fn decode_data_uri_rejects_invalid_base64() {
+        let err = decode_data_uri("data:image/png;base64,@@@").unwrap_err();
+        assert!(err.to_string().contains("base64 decode"), "got: {err}");
     }
 }

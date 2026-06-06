@@ -318,16 +318,17 @@ impl BackendModel for LlamaCppModel {
         // Build (role, text_with_markers) pairs for the chat template, and
         // collect image bytes in the order markers appear.
         let mut template_messages: Vec<(String, String)> = Vec::with_capacity(messages.len());
-        let mut image_bytes: Vec<(Vec<u8>, Option<String>)> = Vec::new();
+        // Borrow, don't clone: `from_buffer` copies internally; `messages` outlives use.
+        let mut image_bytes: Vec<&[u8]> = Vec::new();
 
         for msg in messages {
             let mut text = String::new();
             for part in &msg.content {
                 match part {
                     ContentPart::Text(t) => text.push_str(t),
-                    ContentPart::ImageBytes { data, media_type } => {
+                    ContentPart::ImageBytes { data, .. } => {
                         text.push_str(marker);
-                        image_bytes.push((data.clone(), media_type.clone()));
+                        image_bytes.push(data.as_slice());
                     }
                 }
             }
@@ -339,7 +340,7 @@ impl BackendModel for LlamaCppModel {
 
         // Create bitmaps from image bytes.
         let bitmaps: Vec<MtmdBitmap> = image_bytes.iter()
-            .map(|(data, _media_type)| {
+            .map(|data| {
                 MtmdBitmap::from_buffer(mtmd_ctx, data)
                     .map_err(|e| anyhow::anyhow!("failed to create bitmap: {e}"))
             })
