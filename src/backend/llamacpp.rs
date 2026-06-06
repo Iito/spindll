@@ -398,7 +398,9 @@ impl BackendModel for LlamaCppModel {
         let mut completion_tokens = 0u32;
 
         for _ in 0..params.max_tokens {
-            let token = sampler.sample(&ctx, 0);
+            // -1 = last logits row. `eval_chunks` emits logits only at the final
+            // position; the single-token decodes below put theirs there too.
+            let token = sampler.sample(&ctx, -1);
             sampler.accept(token);
 
             if self.model.is_eog_token(token) {
