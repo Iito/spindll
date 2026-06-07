@@ -53,6 +53,22 @@ fn send_usage(
     }
 }
 
+/// Effective text of a proto `Message`. Per the proto contract, a non-empty
+/// `parts` list replaces `content`, so flatten the text parts (ignoring images);
+/// otherwise fall back to `content`. Without this, a text-only message sent via
+/// `parts` (with empty `content`) would be silently dropped on the text path.
+fn proto_message_text(m: &crate::proto::Message) -> String {
+    if m.parts.is_empty() {
+        m.content.clone()
+    } else {
+        m.parts
+            .iter()
+            .filter(|p| p.r#type != "image")
+            .map(|p| p.text.as_str())
+            .collect()
+    }
+}
+
 /// Convert proto `Message` list with `parts` into engine `MultimodalMessage` list.
 ///
 /// Enforces the same per-image byte cap as the HTTP path so the gRPC entry
@@ -205,7 +221,7 @@ impl Spindll for SpindllService {
                 })
             } else {
                 let messages: Vec<_> = req.messages.iter()
-                    .map(|m| (m.role.clone(), m.content.clone()))
+                    .map(|m| (m.role.clone(), proto_message_text(m)))
                     .collect();
                 let enc_key: Option<[u8; 32]> = if req.encryption_key.len() == 32 {
                     let mut arr = [0u8; 32];
@@ -227,7 +243,7 @@ impl Spindll for SpindllService {
             #[cfg(not(feature = "vision"))]
             let result = {
                 let messages: Vec<_> = req.messages.iter()
-                    .map(|m| (m.role.clone(), m.content.clone()))
+                    .map(|m| (m.role.clone(), proto_message_text(m)))
                     .collect();
                 let enc_key: Option<[u8; 32]> = if req.encryption_key.len() == 32 {
                     let mut arr = [0u8; 32];
@@ -661,5 +677,59 @@ mod proto_to_multimodal_tests {
     fn rejects_oversized_image() {
         let err = proto_to_multimodal(&[image_msg(vec![0u8; MAX_IMAGE_BYTES + 1])]).unwrap_err();
         assert!(err.to_string().contains("exceeds"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod proto_message_text_tests {
+    use super::*;
+
+    fn text_part(text: &str) -> crate::proto::ContentPart {
+        crate::proto::ContentPart {
+            r#type: "text".into(),
+            text: text.into(),
+            image_data: Vec::new(),
+            media_type: String::new(),
+        }
+    }
+
+    #[test]
+    fn falls_back_to_content_when_no_parts() {
+        let m = crate::proto::Message {
+            role: "user".into(),
+            content: "hello".into(),
+            parts: vec![],
+        };
+        assert_eq!(proto_message_text(&m), "hello");
+    }
+
+    #[test]
+    fn flattens_text_parts_when_content_empty() {
+        // Regression: text carried in `parts` with empty `content` must not be dropped.
+        let m = crate::proto::Message {
+            role: "user".into(),
+            content: String::new(),
+            parts: vec![text_part("foo "), text_part("bar")],
+        };
+        assert_eq!(proto_message_text(&m), "foo bar");
+    }
+
+    #[test]
+    fn parts_override_content_and_skip_images() {
+        let m = crate::proto::Message {
+            role: "user".into(),
+            content: "ignored".into(),
+            parts: vec![
+                text_part("see "),
+                crate::proto::ContentPart {
+                    r#type: "image".into(),
+                    text: "alt".into(),
+                    image_data: vec![1, 2, 3],
+                    media_type: "image/png".into(),
+                },
+                text_part("this"),
+            ],
+        };
+        assert_eq!(proto_message_text(&m), "see this");
     }
 }
