@@ -626,13 +626,13 @@ fn decode_data_uri(uri: &str) -> anyhow::Result<(Vec<u8>, Option<String>)> {
 
     check_image_len(data.len())?;
 
-    if let Some(mt) = &media_type {
-        if !ALLOWED_IMAGE_MEDIA.contains(&mt.as_str()) {
-            anyhow::bail!(
-                "unsupported image media type {mt}; allowed: {}",
-                ALLOWED_IMAGE_MEDIA.join(", ")
-            );
-        }
+    if let Some(mt) = &media_type
+        && !ALLOWED_IMAGE_MEDIA.contains(&mt.as_str())
+    {
+        anyhow::bail!(
+            "unsupported image media type {mt}; allowed: {}",
+            ALLOWED_IMAGE_MEDIA.join(", ")
+        );
     }
 
     Ok((data, media_type))

@@ -394,10 +394,11 @@ impl BackendModel for LlamaCppModel {
         ]);
 
         let mut decoder = encoding_rs::UTF_8.new_decoder();
-        let mut n_cur = n_past;
         let mut completion_tokens = 0u32;
 
-        for _ in 0..params.max_tokens {
+        // `n_cur` is the KV-cache position of the token being decoded; it starts
+        // just past the prompt (`n_past`) and advances one slot per generated token.
+        for (n_cur, _) in (n_past..).zip(0..params.max_tokens) {
             // -1 = last logits row. `eval_chunks` emits logits only at the final
             // position; the single-token decodes below put theirs there too.
             let token = sampler.sample(&ctx, -1);
@@ -419,7 +420,6 @@ impl BackendModel for LlamaCppModel {
             let mut batch = llama_cpp_2::llama_batch::LlamaBatch::new(1, 1);
             batch.add(token, n_cur, &[0], true)?;
             ctx.decode(&mut batch)?;
-            n_cur += 1;
         }
 
         Ok(GenerateResult {
