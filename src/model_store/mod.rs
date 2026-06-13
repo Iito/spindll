@@ -168,6 +168,7 @@ impl ModelStore {
             format: registry::ModelFormat::Mlx,
             base_model,
             source: registry::ModelSource::HfSourceDownloaded,
+            mmproj_path: None,
         });
         reg.save(&self.registry_path())?;
 
@@ -180,13 +181,13 @@ impl ModelStore {
         let is_hf = model.contains('/');
 
         // --- Download & detect format ---
-        let (path, size_bytes, key, digest, format) = if is_hf {
+        let (path, size_bytes, key, digest, format, mmproj_path) = if is_hf {
             let dest_dir = self.model_dir(model);
             match download::download_hf_auto(model, quant, &dest_dir)? {
-                download::HfDownload::Gguf { path, filename, size, digest } => {
+                download::HfDownload::Gguf { path, filename, size, digest, mmproj_path } => {
                     download::validate_gguf(&path)?;
                     let key = format!("{}/{}", model, filename);
-                    (path, size, key, digest, registry::ModelFormat::Gguf)
+                    (path, size, key, digest, registry::ModelFormat::Gguf, mmproj_path)
                 }
                 download::HfDownload::Mlx { dir, size, digest } => {
                     if strict_gguf {
@@ -201,7 +202,7 @@ impl ModelStore {
                         );
                     }
                     let key = model.to_string();
-                    (dir, size, key, digest, registry::ModelFormat::Mlx)
+                    (dir, size, key, digest, registry::ModelFormat::Mlx, None)
                 }
             }
         } else {
@@ -211,7 +212,7 @@ impl ModelStore {
             download::validate_gguf(&path)?;
             let filename = path.file_name().unwrap().to_string_lossy();
             let key = format!("ollama/{name}/{filename}");
-            (path, size, key, digest, registry::ModelFormat::Gguf)
+            (path, size, key, digest, registry::ModelFormat::Gguf, None)
         };
 
         // --- Read metadata ---
@@ -253,6 +254,7 @@ impl ModelStore {
             format,
             base_model,
             source,
+            mmproj_path,
         });
         reg.save(&self.registry_path())?;
 
@@ -391,6 +393,40 @@ impl ModelStore {
         Ok(reg.models[&key].digest.clone())
     }
 
+    /// Resolve the mmproj path for a model.
+    ///
+    /// Returns the stored `mmproj_path` from the registry entry if present,
+    /// otherwise scans the model's directory for `*mmproj*.gguf` files.
+    pub fn resolve_mmproj_path(&self, model: &str) -> anyhow::Result<Option<PathBuf>> {
+        let key = self.resolve_key(model)?;
+        let reg = registry::Registry::load(&self.registry_path())?;
+        let entry = &reg.models[&key];
+
+        // Return stored path if present and still exists on disk.
+        if let Some(ref stored) = entry.mmproj_path {
+            if stored.exists() {
+                return Ok(Some(stored.clone()));
+            }
+        }
+
+        // Auto-discover: scan the model's parent directory.
+        let search_dir = if entry.path.is_dir() {
+            // MLX or directory-based model — scan the model directory itself.
+            entry.path.clone()
+        } else {
+            // GGUF file — scan its parent directory.
+            entry.path.parent().map(|p| p.to_path_buf()).unwrap_or_default()
+        };
+
+        if search_dir.is_dir() {
+            if let Some(found) = discover_mmproj(&search_dir) {
+                return Ok(Some(found));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Import all models from Ollama's local storage.
     pub fn import_from_ollama(&self) -> anyhow::Result<u32> {
         self.ensure_dirs()?;
@@ -467,6 +503,7 @@ impl ModelStore {
                         format: registry::ModelFormat::Gguf,
                         base_model,
                         source: registry::ModelSource::OllamaImported,
+                        mmproj_path: None,
                     },
                 );
                 println!("imported {name}:{tag} ({:.1} GB)", layer.size as f64 / 1_073_741_824.0);
@@ -549,6 +586,7 @@ impl ModelStore {
                                 format: registry::ModelFormat::Gguf,
                                 base_model,
                                 source: registry::ModelSource::HfImported,
+                                mmproj_path: None,
                             },
                         );
                         println!("imported {}/{}", repo_id, filename);
@@ -591,6 +629,7 @@ impl ModelStore {
                             format: registry::ModelFormat::Mlx,
                             base_model: repo_id.clone(),
                             source: registry::ModelSource::HfImported,
+                            mmproj_path: None,
                         },
                     );
                     println!("imported mlx model: {}", repo_id);
@@ -689,6 +728,7 @@ impl ModelStore {
                 format,
                 base_model,
                 source: registry::ModelSource::ManuallyImported,
+                mmproj_path: None,
             },
         );
         reg.save(&self.registry_path())?;
@@ -813,6 +853,21 @@ pub fn display_name(key: &str, entry: &registry::ModelEntry) -> String {
     }
 }
 
+/// Scan a directory for a multimodal projector GGUF file (`*mmproj*.gguf`).
+///
+/// Returns the path to the first match, or `None` if no mmproj file is found.
+pub fn discover_mmproj(dir: &std::path::Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_lower = name.to_string_lossy().to_lowercase();
+        if name_lower.contains("mmproj") && name_lower.ends_with(".gguf") {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
 /// Returns true if this platform should prefer MLX over GGUF.
 pub fn platform_prefers_mlx() -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))
@@ -856,6 +911,7 @@ mod tests {
             format: ModelFormat::Mlx,
             base_model: base_model.to_string(),
             source: registry::ModelSource::HfSourceDownloaded,
+            mmproj_path: None,
         }
     }
 
@@ -953,6 +1009,7 @@ mod tests {
             format: ModelFormat::Gguf,
             base_model: String::new(),
             source: registry::ModelSource::HfSourceDownloaded,
+            mmproj_path: None,
         }
     }
 

@@ -115,6 +115,16 @@ enum Commands {
         /// Enable KV cache for prompt prefixes (e.g. "2G", default 2G when enabled)
         #[arg(long)]
         kv_cache: Option<Option<String>>,
+
+        /// Path to an image file to include with the prompt (requires vision model)
+        #[cfg(feature = "vision")]
+        #[arg(long)]
+        image: Option<std::path::PathBuf>,
+
+        /// Path to the multimodal projector GGUF (auto-detected if omitted)
+        #[cfg(feature = "vision")]
+        #[arg(long)]
+        mmproj: Option<std::path::PathBuf>,
     },
 
     /// Benchmark one or two models (GGUF vs GGUF, MLX vs MLX, or mixed)
@@ -317,6 +327,8 @@ fn bench_by_format(
         n_ctx: ctx_size,
         n_gpu_layers: None,
         memory_budget: 0,
+        #[cfg(feature = "vision")]
+        mmproj_path: None,
     };
     let model = backend.load_model(path, load_params)?;
     let params = spindll::engine::GenerateParams {
@@ -532,6 +544,10 @@ async fn main() -> anyhow::Result<()> {
             ctx_size,
             budget,
             kv_cache,
+            #[cfg(feature = "vision")]
+            image,
+            #[cfg(feature = "vision")]
+            mmproj,
         } => {
             let store = spindll::model_store::ModelStore::new(None);
             let model_path = store.resolve_model_path(&model)?;
@@ -547,7 +563,65 @@ async fn main() -> anyhow::Result<()> {
                 manager.enable_kv_cache(bytes);
             }
 
-            manager.load_model_with_digest(&model, &model_path, None, digest)?;
+            #[cfg(feature = "vision")]
+            let has_image = image.is_some();
+
+            #[cfg(feature = "vision")]
+            {
+                let mmproj_resolved = mmproj.or_else(|| {
+                    store.resolve_mmproj_path(&model).unwrap_or(None)
+                });
+                let opts = spindll::engine::LoadOptions {
+                    digest: digest.clone(),
+                    mmproj_path: mmproj_resolved,
+                    ..Default::default()
+                };
+                manager.load_model_with_options(&model, &model_path, opts)?;
+            }
+            #[cfg(not(feature = "vision"))]
+            {
+                manager.load_model_with_digest(&model, &model_path, None, digest)?;
+            }
+
+            #[cfg(feature = "vision")]
+            if has_image {
+                let image_path = image.unwrap();
+                let image_data = std::fs::read(&image_path)
+                    .map_err(|e| anyhow::anyhow!("failed to read image {}: {e}", image_path.display()))?;
+                let ext = image_path.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("png");
+                let media_type = match ext {
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "png" => "image/png",
+                    "gif" => "image/gif",
+                    "bmp" => "image/bmp",
+                    "webp" => "image/webp",
+                    _ => "application/octet-stream",
+                };
+                let mut params = spindll::engine::GenerateParams::default();
+                if let Some(max) = max_tokens {
+                    params.max_tokens = max;
+                }
+                let messages = vec![spindll::engine::MultimodalMessage {
+                    role: "user".to_string(),
+                    content: vec![
+                        spindll::engine::ContentPart::ImageBytes {
+                            data: image_data,
+                            media_type: Some(media_type.to_string()),
+                        },
+                        spindll::engine::ContentPart::Text(prompt.clone()),
+                    ],
+                }];
+                manager.generate_chat_multimodal(&model, &messages, &params, |token| {
+                    use std::io::Write;
+                    print!("{token}");
+                    std::io::stdout().flush().ok();
+                    true
+                })?;
+                println!();
+                return Ok(());
+            }
 
             let system_prompt = system.unwrap_or_else(|| "You are a helpful assistant.".to_string());
             let messages = vec![

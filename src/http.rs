@@ -16,6 +16,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 
 use crate::engine::{GenerateParams, ModelManager};
+#[cfg(feature = "vision")]
+use crate::engine::multimodal::{check_image_len, ContentPart, MAX_IMAGE_BYTES, MultimodalMessage};
 use crate::model_store::registry::Registry;
 use crate::model_store::ModelStore;
 
@@ -529,11 +531,143 @@ fn default_true() -> bool {
 struct OaiMessage {
     role: String,
     #[serde(default)]
-    content: Option<String>,
+    content: Option<OaiContent>,
     #[serde(default)]
     tool_calls: Option<Vec<OaiToolCallMessage>>,
     #[serde(default)]
     tool_call_id: Option<String>,
+}
+
+/// OpenAI `content` field: either a plain string or an array of content parts.
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+enum OaiContent {
+    Text(String),
+    Parts(Vec<OaiContentPart>),
+}
+
+impl OaiContent {
+    /// Flatten to a plain text string (ignoring images).
+    fn as_text(&self) -> String {
+        match self {
+            OaiContent::Text(s) => s.clone(),
+            OaiContent::Parts(parts) => parts.iter()
+                .filter_map(|p| match p {
+                    OaiContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+        }
+    }
+
+    /// Returns `true` if any part is an image.
+    #[cfg(feature = "vision")]
+    fn has_images(&self) -> bool {
+        match self {
+            OaiContent::Text(_) => false,
+            OaiContent::Parts(parts) => parts.iter().any(|p| matches!(p, OaiContentPart::ImageUrl { .. })),
+        }
+    }
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(tag = "type")]
+enum OaiContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    #[cfg_attr(not(feature = "vision"), allow(dead_code))]
+    ImageUrl { image_url: OaiImageUrl },
+}
+
+#[derive(Deserialize, Clone)]
+#[cfg_attr(not(feature = "vision"), allow(dead_code))]
+struct OaiImageUrl {
+    url: String,
+}
+
+/// MIME allow-list. Rejected before `MtmdBitmap::from_buffer` / MLX ImageIO.
+#[cfg(feature = "vision")]
+const ALLOWED_IMAGE_MEDIA: &[&str] = &[
+    "image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp",
+];
+
+/// Decode `data:...;base64,...` URI. Rejects > MAX_IMAGE_BYTES.
+#[cfg(feature = "vision")]
+fn decode_data_uri(uri: &str) -> anyhow::Result<(Vec<u8>, Option<String>)> {
+    use base64::Engine as _;
+
+    let rest = uri.strip_prefix("data:")
+        .ok_or_else(|| anyhow::anyhow!("image_url must be a data: URI (http(s) URLs not yet supported)"))?;
+    let (header, b64) = rest.split_once(',')
+        .ok_or_else(|| anyhow::anyhow!("malformed data URI: missing comma"))?;
+
+    // Require base64 so raw/percent-encoded bodies aren't fed to the decoder.
+    let Some(meta) = header.strip_suffix(";base64") else {
+        anyhow::bail!("image_url data URI must be base64-encoded (missing \";base64\")");
+    };
+    // Strip `;param=value` tail; empty type → None.
+    let media_type = {
+        let mt = meta.split(';').next().unwrap_or(meta).trim().to_lowercase();
+        if mt.is_empty() { None } else { Some(mt) }
+    };
+
+    // Pre-check encoded length (b64 ~4→3 bytes) → reject before alloc.
+    if b64.len() / 4 * 3 > MAX_IMAGE_BYTES {
+        anyhow::bail!(
+            "image exceeds {} byte limit (encoded ~{} bytes)",
+            MAX_IMAGE_BYTES,
+            b64.len() / 4 * 3,
+        );
+    }
+
+    let data = base64::engine::general_purpose::STANDARD.decode(b64)
+        .map_err(|e| anyhow::anyhow!("base64 decode failed: {e}"))?;
+
+    check_image_len(data.len())?;
+
+    if let Some(mt) = &media_type
+        && !ALLOWED_IMAGE_MEDIA.contains(&mt.as_str())
+    {
+        anyhow::bail!(
+            "unsupported image media type {mt}; allowed: {}",
+            ALLOWED_IMAGE_MEDIA.join(", ")
+        );
+    }
+
+    Ok((data, media_type))
+}
+
+/// Convert OAI messages into multimodal messages, decoding data URIs.
+#[cfg(feature = "vision")]
+fn oai_to_multimodal(messages: &[OaiMessage]) -> anyhow::Result<Vec<MultimodalMessage>> {
+    let mut out = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let content = match &msg.content {
+            None => vec![ContentPart::Text(String::new())],
+            Some(OaiContent::Text(s)) => vec![ContentPart::Text(s.clone())],
+            Some(OaiContent::Parts(parts)) => {
+                let mut content_parts = Vec::with_capacity(parts.len());
+                for part in parts {
+                    match part {
+                        OaiContentPart::Text { text } => {
+                            content_parts.push(ContentPart::Text(text.clone()));
+                        }
+                        OaiContentPart::ImageUrl { image_url } => {
+                            let (data, media_type) = decode_data_uri(&image_url.url)?;
+                            content_parts.push(ContentPart::ImageBytes { data, media_type });
+                        }
+                    }
+                }
+                content_parts
+            }
+        };
+        out.push(MultimodalMessage {
+            role: msg.role.clone(),
+            content,
+        });
+    }
+    Ok(out)
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -695,7 +829,7 @@ fn prepare_messages_with_tools(
     let mut system_injected = false;
 
     for msg in messages {
-        let content = msg.content.clone().unwrap_or_default();
+        let content = msg.content.as_ref().map(|c| c.as_text()).unwrap_or_default();
 
         if msg.role == "system" && !system_injected {
             if let Some(ref preamble) = tool_preamble {
@@ -736,6 +870,33 @@ fn prepare_messages_with_tools(
     result
 }
 
+/// Check whether any OAI message contains image content parts.
+#[cfg(feature = "vision")]
+fn oai_has_images(messages: &[OaiMessage]) -> bool {
+    messages.iter().any(|m| m.content.as_ref().is_some_and(|c| c.has_images()))
+}
+
+/// Generate via the multimodal path (vision) or the text-only chat path,
+/// depending on whether images are present.
+///
+/// Returns the `GenerateResult` from whichever path was taken.
+#[cfg(feature = "vision")]
+fn generate_maybe_multimodal(
+    mgr: &ModelManager,
+    model: &str,
+    oai_messages: &[OaiMessage],
+    text_messages: &[(String, String)],
+    params: &GenerateParams,
+    on_token: &mut dyn FnMut(&str) -> bool,
+) -> anyhow::Result<crate::engine::GenerateResult> {
+    if oai_has_images(oai_messages) {
+        let mm = oai_to_multimodal(oai_messages)?;
+        mgr.generate_chat_multimodal(model, &mm, params, on_token)
+    } else {
+        mgr.generate_chat(model, text_messages, params, None, on_token)
+    }
+}
+
 async fn oai_chat_completions(
     State(state): State<AppState>,
     Json(req): Json<OaiChatRequest>,
@@ -773,6 +934,12 @@ async fn oai_chat_completions(
             if has_tools {
                 // When tools are active, collect full output to parse tool calls.
                 let mut output = String::new();
+                #[cfg(feature = "vision")]
+                let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &params, &mut |token| {
+                    output.push_str(token);
+                    true
+                });
+                #[cfg(not(feature = "vision"))]
                 let result = mgr.generate_chat(&req.model, &messages, &params, None, |token| {
                     output.push_str(token);
                     true
@@ -839,6 +1006,22 @@ async fn oai_chat_completions(
                 }
             } else {
                 // No tools — stream tokens directly as before.
+                #[cfg(feature = "vision")]
+                let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &params, &mut |token| {
+                    let chunk = serde_json::json!({
+                        "id": &completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": &req.model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": token},
+                            "finish_reason": null,
+                        }]
+                    });
+                    tx.blocking_send(Ok(sse_data(&chunk))).is_ok()
+                });
+                #[cfg(not(feature = "vision"))]
                 let result = mgr.generate_chat(&req.model, &messages, &params, None, |token| {
                     let chunk = serde_json::json!({
                         "id": &completion_id,
@@ -911,6 +1094,12 @@ async fn oai_chat_completions(
             };
 
             let mut output = String::new();
+            #[cfg(feature = "vision")]
+            let stats = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &params, &mut |token| {
+                output.push_str(token);
+                true
+            })?;
+            #[cfg(not(feature = "vision"))]
             let stats = mgr.generate_chat(&req.model, &messages, &params, None, |token| {
                 output.push_str(token);
                 true
@@ -1362,7 +1551,12 @@ fn auto_load(
     }
     let path = store.resolve_model_path(model)?;
     let digest = store.resolve_model_digest(model).unwrap_or_default();
-    mgr.load_model_with_digest(model, &path, None, digest)?;
+    mgr.load_model_with_options(model, &path, crate::engine::manager::LoadOptions {
+        digest,
+        #[cfg(feature = "vision")]
+        mmproj_path: store.resolve_mmproj_path(model).unwrap_or(None),
+        ..Default::default()
+    })?;
     Ok(())
 }
 
@@ -1429,6 +1623,7 @@ mod tests {
             format: ModelFormat::Gguf,
             base_model: String::new(),
             source: ModelSource::HfSourceDownloaded,
+            mmproj_path: None,
         });
         reg.save(&store.registry_path()).unwrap();
 
@@ -1641,5 +1836,35 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), 400);
+    }
+}
+
+#[cfg(all(test, feature = "vision"))]
+mod vision_tests {
+    use super::*;
+
+    #[test]
+    fn decode_data_uri_decodes_base64_with_media_type() {
+        let (bytes, media) = decode_data_uri("data:image/png;base64,aGVsbG8=").unwrap();
+        assert_eq!(bytes.as_slice(), b"hello");
+        assert_eq!(media.as_deref(), Some("image/png"));
+    }
+
+    #[test]
+    fn decode_data_uri_rejects_uri_without_base64_marker() {
+        let err = decode_data_uri("data:image/png,aGVsbG8=").unwrap_err();
+        assert!(err.to_string().contains("base64"), "got: {err}");
+    }
+
+    #[test]
+    fn decode_data_uri_rejects_disallowed_media_type() {
+        let err = decode_data_uri("data:image/tiff;base64,aGVsbG8=").unwrap_err();
+        assert!(err.to_string().contains("unsupported"), "got: {err}");
+    }
+
+    #[test]
+    fn decode_data_uri_rejects_invalid_base64() {
+        let err = decode_data_uri("data:image/png;base64,@@@").unwrap_err();
+        assert!(err.to_string().contains("base64 decode"), "got: {err}");
     }
 }

@@ -48,6 +48,9 @@ pub struct LoadOptions {
     pub priority: EvictionPriority,
     /// Reload this long after eviction under VRAM pressure. `None` disables.
     pub idle_reload: Option<Duration>,
+    /// Path to the multimodal projector GGUF. Enables vision on this model.
+    #[cfg(feature = "vision")]
+    pub mmproj_path: Option<PathBuf>,
 }
 
 /// A model that has been loaded into memory and is ready for inference.
@@ -356,7 +359,14 @@ impl ModelManager {
         opts: LoadOptions,
     ) -> anyhow::Result<()> {
         self.cancel_watcher(name);
-        let LoadOptions { gpu_layers, digest, priority, idle_reload } = opts;
+        let LoadOptions {
+            gpu_layers,
+            digest,
+            priority,
+            idle_reload,
+            #[cfg(feature = "vision")]
+            mmproj_path,
+        } = opts;
         let format = Self::infer_format(path);
         let backend = self.backend_for_format(&format)?;
         let from_ram_cache = self
@@ -396,6 +406,8 @@ impl ModelManager {
             n_ctx: self.default_n_ctx,
             n_gpu_layers: Some(layers),
             memory_budget: load_budget,
+            #[cfg(feature = "vision")]
+            mmproj_path,
         };
 
         let model = backend.load_model(path, load_params)?;
@@ -854,6 +866,65 @@ impl ModelManager {
         loaded.model.generate_chat(messages, params, on_token)
     }
 
+    /// Run multimodal inference (text + images) on a loaded model.
+    ///
+    /// Bypasses the batch scheduler and KV cache — uses a direct per-request
+    /// context only.  Returns an error if the model was not loaded with a
+    /// multimodal projector.
+    #[cfg(feature = "vision")]
+    #[tracing::instrument(
+        skip(self, messages, params, on_token),
+        fields(model = model_name)
+    )]
+    pub fn generate_chat_multimodal(
+        &self,
+        model_name: &str,
+        messages: &[crate::engine::multimodal::MultimodalMessage],
+        params: &GenerateParams,
+        mut on_token: impl FnMut(&str) -> bool,
+    ) -> anyhow::Result<GenerateResult> {
+        let _active = ActiveGuard::new(&self.active_requests);
+        *self.last_activity.write().unwrap() = Instant::now();
+
+        let start = Instant::now();
+        let result = {
+            let models = self.models.read().unwrap();
+            let loaded = models
+                .get(model_name)
+                .ok_or_else(|| anyhow::anyhow!("model '{}' not loaded", model_name))?;
+            *loaded.last_used.write().unwrap() = Instant::now();
+
+            if !loaded.model.supports_vision() {
+                anyhow::bail!("model '{}' does not support vision (no mmproj loaded)", model_name);
+            }
+
+            loaded.model.generate_multimodal(messages, params, &mut on_token)
+        };
+
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        match &result {
+            Ok(stats) => {
+                tracing::info!(
+                    prompt_tokens = stats.prompt_tokens,
+                    completion_tokens = stats.completion_tokens,
+                    elapsed_ms = elapsed_us / 1000,
+                    "multimodal generation complete"
+                );
+                self.metrics.record_generate(
+                    stats.prompt_tokens as u64,
+                    stats.completion_tokens as u64,
+                    elapsed_us,
+                    false,
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, elapsed_ms = elapsed_us / 1000, "multimodal generation failed");
+                self.metrics.record_error();
+            }
+        }
+        result
+    }
+
     /// Apply the model's built-in chat template to a list of `(role, content)` messages.
     /// Falls back to ChatML if the model has no embedded template.
     ///
@@ -955,6 +1026,8 @@ async fn reload_watcher(weak: Weak<ModelManager>, spec: PendingReload) {
             digest: spec.digest.clone(),
             priority: spec.priority,
             idle_reload: Some(spec.idle_reload),
+            #[cfg(feature = "vision")]
+            mmproj_path: None,
         };
         let mgr_blocking = mgr.clone();
         let path = spec.path.clone();

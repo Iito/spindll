@@ -1,7 +1,11 @@
 import Foundation
 import CryptoKit
+import CoreGraphics
+import ImageIO
+import UniformTypeIdentifiers
 import MLX
 import MLXLLM
+import MLXVLM
 import MLXLMCommon
 import MLXHuggingFace
 import Tokenizers
@@ -365,9 +369,12 @@ private final class PromptCache {
 private final class ModelState: @unchecked Sendable {
     let container: ModelContainer
     let promptCache: PromptCache
-    init(_ container: ModelContainer, modelDigest: String) {
+    /// True when the model was loaded via VLMModelFactory (supports images).
+    let isVLM: Bool
+    init(_ container: ModelContainer, modelDigest: String, isVLM: Bool = false) {
         self.container = container
         self.promptCache = PromptCache(modelDigest: modelDigest)
+        self.isVLM = isVLM
     }
 }
 
@@ -377,6 +384,7 @@ private final class ModelState: @unchecked Sendable {
 
 /// Load a model from a local MLX-format directory.
 /// Blocks the calling thread until the model is fully resident in memory.
+/// Tries VLM first (supports vision models), falls back to LLM.
 /// Returns NULL on failure; caller must free with mlx_model_free.
 @_cdecl("mlx_model_load")
 public func mlxModelLoad(_ path: UnsafePointer<CChar>?) -> UnsafeMutableRawPointer? {
@@ -398,14 +406,25 @@ public func mlxModelLoad(_ path: UnsafePointer<CChar>?) -> UnsafeMutableRawPoint
     }
 
     Task {
+        // Try VLM first — covers vision-language models (Qwen2.5-VL, Gemma3, etc.)
+        // plus text-only models registered in VLMTypeRegistry (Qwen3.5, etc.).
         do {
-            let container = try await LLMModelFactory.shared.loadContainer(
+            let container = try await VLMModelFactory.shared.loadContainer(
                 from: url,
                 using: #huggingFaceTokenizerLoader()
             )
-            box.value = ModelState(container, modelDigest: modelDigest)
+            box.value = ModelState(container, modelDigest: modelDigest, isVLM: true)
         } catch {
-            // box.value stays nil; Rust side receives NULL
+            // Fall back to LLM for text-only architectures.
+            do {
+                let container = try await LLMModelFactory.shared.loadContainer(
+                    from: url,
+                    using: #huggingFaceTokenizerLoader()
+                )
+                box.value = ModelState(container, modelDigest: modelDigest, isVLM: false)
+            } catch {
+                // box.value stays nil; Rust side receives NULL
+            }
         }
         sema.signal()
     }
@@ -413,6 +432,14 @@ public func mlxModelLoad(_ path: UnsafePointer<CChar>?) -> UnsafeMutableRawPoint
 
     guard let state = box.value else { return nil }
     return Unmanaged.passRetained(state).toOpaque()
+}
+
+/// Returns 1 if the model was loaded as a VLM (supports vision), 0 otherwise.
+@_cdecl("mlx_model_is_vlm")
+public func mlxModelIsVlm(_ handle: UnsafeMutableRawPointer?) -> Int32 {
+    guard let handle else { return 0 }
+    let state = Unmanaged<ModelState>.fromOpaque(handle).takeUnretainedValue()
+    return state.isVLM ? 1 : 0
 }
 
 // ---------------------------------------------------------------------------
@@ -789,6 +816,226 @@ public func mlxChatGenerate(
         sema.signal()
     }
     sema.wait()
+
+    return box.value ?? -1
+}
+
+// ---------------------------------------------------------------------------
+// Image resizing helper
+// ---------------------------------------------------------------------------
+
+/// Default maximum pixel count (~4M pixels ≈ 2048×2048).
+/// Produces ~5K–10K image tokens — a good balance of quality vs speed.
+private let kDefaultMaxPixels: Int = 4_194_304
+
+/// If the image at `url` exceeds `maxPixels` total pixels, write a
+/// proportionally down-scaled JPEG (preserving colour and aspect ratio)
+/// to a temporary file and return its URL. Otherwise returns the
+/// original URL unchanged.
+private func resizeImageIfNeeded(url: URL, maxPixels: Int = kDefaultMaxPixels) -> URL {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil)
+    else { return url }
+
+    let w = cgImage.width
+    let h = cgImage.height
+    let totalPixels = w * h
+
+    guard totalPixels > maxPixels else { return url }
+
+    // Scale factor to fit within maxPixels while preserving aspect ratio.
+    let scale = sqrt(Double(maxPixels) / Double(totalPixels))
+    let newW = Int(Double(w) * scale)
+    let newH = Int(Double(h) * scale)
+
+    // Draw into an sRGB bitmap context — preserves colour.
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    guard let ctx = CGContext(
+        data: nil,
+        width: newW,
+        height: newH,
+        bitsPerComponent: 8,
+        bytesPerRow: newW * 4,
+        space: colorSpace,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else { return url }
+
+    ctx.interpolationQuality = .high
+    ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: newW, height: newH))
+
+    guard let resized = ctx.makeImage() else { return url }
+
+    // Write as JPEG to a temp file.
+    let tmpPath = NSTemporaryDirectory() + "spindll_vlm_resized_\(ProcessInfo.processInfo.processIdentifier).jpg"
+    let tmpURL = URL(fileURLWithPath: tmpPath)
+    guard let dest = CGImageDestinationCreateWithURL(
+        tmpURL as CFURL, UTType.jpeg.identifier as CFString, 1, nil
+    ) else { return url }
+
+    // Quality 0.85 — good fidelity, reasonable file size.
+    let opts: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.85]
+    CGImageDestinationAddImage(dest, resized, opts as CFDictionary)
+    guard CGImageDestinationFinalize(dest) else { return url }
+
+    fputs("[mlx-bridge] resized image from \(w)×\(h) to \(newW)×\(newH) (\(tmpPath))\n", stderr)
+    return tmpURL
+}
+
+// ---------------------------------------------------------------------------
+// mlx_chat_generate_vision
+// ---------------------------------------------------------------------------
+
+/// Chat generation with image input for VLM models.
+///
+/// `messagesJson` is a UTF-8 JSON array of `{"role": ..., "content": ...}`.
+/// `imagePath` is a NUL-terminated path to an image file on disk (JPEG, PNG, etc.),
+/// or NULL for text-only requests. The image is attached to the last user message.
+///
+/// Returns the number of tokens generated on success, -1 on error.
+@_cdecl("mlx_chat_generate_vision")
+public func mlxChatGenerateVision(
+    _ handle:      UnsafeMutableRawPointer?,
+    _ messagesJson: UnsafePointer<CChar>?,
+    _ imagePath:   UnsafePointer<CChar>?,
+    _ maxTokens:   UInt32,
+    _ temperature: Float,
+    _ topP:        Float,
+    _ seed:        UInt32,
+    _ callback:    @convention(c) (UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Int32,
+    _ callbackCtx: UnsafeMutableRawPointer?
+) -> Int32 {
+    guard let handle, let messagesJson else { return -1 }
+    let state = Unmanaged<ModelState>.fromOpaque(handle).takeUnretainedValue()
+    let json = String(cString: messagesJson)
+
+    guard
+        let data = json.data(using: .utf8),
+        let parsed = try? JSONSerialization.jsonObject(with: data),
+        let messages = parsed as? [[String: String]]
+    else { return -1 }
+
+    // Resolve image from file path if provided, resizing if too large.
+    var userImage: UserInput.Image? = nil
+    var resizedTempURL: URL? = nil
+    if let imagePath {
+        let pathStr = String(cString: imagePath)
+        let url = URL(fileURLWithPath: pathStr)
+        let attrs = try? FileManager.default.attributesOfItem(atPath: pathStr)
+        let fileSize = (attrs?[.size] as? UInt64) ?? 0
+        fputs("[mlx-bridge] image path: \(pathStr) (\(fileSize) bytes)\n", stderr)
+        guard fileSize > 0 else {
+            fputs("[mlx-bridge] image file not found or empty: \(pathStr)\n", stderr)
+            return -1
+        }
+        let finalURL = resizeImageIfNeeded(url: url)
+        if finalURL != url { resizedTempURL = finalURL }
+        userImage = .url(finalURL)
+    }
+
+    let sema = DispatchSemaphore(value: 0)
+    let box = Box<Int32>()
+
+    Task {
+        do {
+            let params = GenerateParameters(
+                maxTokens: Int(maxTokens),
+                temperature: temperature,
+                topP: topP
+            )
+
+            // Build UserInput from chat messages + optional image.
+            // Find the index of the last user message so we can attach the image to it.
+            var lastUserIdx: Int? = nil
+            for (i, msg) in messages.enumerated() {
+                if msg["role"] == "user" { lastUserIdx = i }
+            }
+
+            var chatMessages: [Chat.Message] = []
+            for (i, msg) in messages.enumerated() {
+                guard let role = msg["role"], let content = msg["content"] else { continue }
+                switch role {
+                case "system":
+                    chatMessages.append(.system(content))
+                case "assistant":
+                    chatMessages.append(.assistant(content))
+                default:
+                    if let img = userImage, i == lastUserIdx {
+                        chatMessages.append(.user(content, images: [img]))
+                    } else {
+                        chatMessages.append(.user(content))
+                    }
+                }
+            }
+
+            let userInput = UserInput(chat: chatMessages)
+
+            var generated: Int32 = 0
+            fputs("[mlx-bridge] userInput has \(userInput.images.count) image(s)\n", stderr)
+            try await state.container.perform(nonSendable: userInput) { context, input in
+                fputs("[mlx-bridge] preparing input with processor: \(type(of: context.processor))\n", stderr)
+                let lmInput = try await context.processor.prepare(input: input)
+                let hasImage = lmInput.image != nil
+                if let img = lmInput.image {
+                    let shape = img.pixels.shape
+                    let mean = img.pixels.mean().item(Float.self)
+                    let minVal = img.pixels.min().item(Float.self)
+                    let maxVal = img.pixels.max().item(Float.self)
+                    fputs("[mlx-bridge] lmInput: tokens=\(lmInput.text.tokens.count) image shape=\(shape) mean=\(mean) min=\(minVal) max=\(maxVal)\n", stderr)
+                } else {
+                    fputs("[mlx-bridge] lmInput: tokens=\(lmInput.text.tokens.count) hasImage=false\n", stderr)
+                }
+                var iterator = try TokenIterator(
+                    input: lmInput,
+                    model: context.model,
+                    parameters: params
+                )
+                var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
+
+                var stopTokenIds: Set<Int> = []
+                if let eos = context.tokenizer.eosTokenId { stopTokenIds.insert(eos) }
+                if let unk = context.tokenizer.unknownTokenId { stopTokenIds.insert(unk) }
+                for id in context.configuration.eosTokenIds { stopTokenIds.insert(id) }
+                for token in context.configuration.extraEOSTokens {
+                    if let id = context.tokenizer.convertTokenToId(token) {
+                        stopTokenIds.insert(id)
+                    }
+                }
+
+                var cancelled = false
+                while let tokenId = iterator.next() {
+                    if stopTokenIds.contains(tokenId) { break }
+                    generated += 1
+                    detokenizer.append(token: tokenId)
+                    if let chunk = detokenizer.next() {
+                        let shouldContinue = chunk.withCString { ptr in
+                            callback(ptr, callbackCtx)
+                        }
+                        if shouldContinue == 0 {
+                            cancelled = true
+                            break
+                        }
+                    }
+                }
+
+                if !cancelled, let chunk = detokenizer.next() {
+                    _ = chunk.withCString { ptr in callback(ptr, callbackCtx) }
+                }
+
+                Stream().synchronize()
+            }
+            box.value = generated
+        } catch {
+            fputs("[mlx-bridge] mlx_chat_generate_vision error: \(error)\n", stderr)
+            box.value = -1
+        }
+        sema.signal()
+    }
+    sema.wait()
+
+    // Clean up resized temp file if we created one.
+    if let tmp = resizedTempURL {
+        try? FileManager.default.removeItem(at: tmp)
+    }
 
     return box.value ?? -1
 }

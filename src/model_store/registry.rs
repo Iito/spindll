@@ -80,6 +80,10 @@ pub struct ModelEntry {
     /// Defaults to OllamaSourceDownloaded for backward compatibility.
     #[serde(default)]
     pub source: ModelSource,
+    /// Path to the multimodal projector GGUF, if one was downloaded or
+    /// discovered alongside the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mmproj_path: Option<PathBuf>,
 }
 
 /// Sum the sizes of all files in a directory (non-recursive, follows symlinks).
@@ -359,6 +363,7 @@ mod tests {
             format: ModelFormat::Gguf,
             base_model: String::new(),
             source: ModelSource::OllamaSourceDownloaded,
+            mmproj_path: None,
         });
 
         let result = reg.save(&path);
@@ -392,6 +397,7 @@ mod tests {
             format: ModelFormat::Gguf,
             base_model: "Test-Model-7B".into(),
             source: ModelSource::OllamaSourceDownloaded,
+            mmproj_path: None,
         });
         reg.save(&path).unwrap();
 

@@ -53,6 +53,54 @@ fn send_usage(
     }
 }
 
+/// Effective text of a proto `Message`. Per the proto contract, a non-empty
+/// `parts` list replaces `content`, so flatten the text parts (ignoring images);
+/// otherwise fall back to `content`. Without this, a text-only message sent via
+/// `parts` (with empty `content`) would be silently dropped on the text path.
+fn proto_message_text(m: &crate::proto::Message) -> String {
+    if m.parts.is_empty() {
+        m.content.clone()
+    } else {
+        m.parts
+            .iter()
+            .filter(|p| p.r#type != "image")
+            .map(|p| p.text.as_str())
+            .collect()
+    }
+}
+
+/// Convert proto `Message` list with `parts` into engine `MultimodalMessage` list.
+///
+/// Enforces the same per-image byte cap as the HTTP path so the gRPC entry
+/// point can't be used to bypass the DoS guard.
+#[cfg(feature = "vision")]
+fn proto_to_multimodal(messages: &[crate::proto::Message]) -> anyhow::Result<Vec<crate::engine::MultimodalMessage>> {
+    use crate::engine::multimodal::{check_image_len, ContentPart, MultimodalMessage};
+
+    messages.iter().map(|m| {
+        if m.parts.is_empty() {
+            // Text-only message — wrap content as a single Text part.
+            Ok(MultimodalMessage {
+                role: m.role.clone(),
+                content: vec![ContentPart::Text(m.content.clone())],
+            })
+        } else {
+            let content = m.parts.iter().map(|p| {
+                if p.r#type == "image" {
+                    check_image_len(p.image_data.len())?;
+                    Ok(ContentPart::ImageBytes {
+                        data: p.image_data.clone(),
+                        media_type: if p.media_type.is_empty() { None } else { Some(p.media_type.clone()) },
+                    })
+                } else {
+                    Ok(ContentPart::Text(p.text.clone()))
+                }
+            }).collect::<anyhow::Result<Vec<_>>>()?;
+            Ok(MultimodalMessage { role: m.role.clone(), content })
+        }
+    }).collect()
+}
+
 #[tonic::async_trait]
 impl Spindll for SpindllService {
     type GenerateStream = ReceiverStream<Result<GenerateResponse, Status>>;
@@ -123,7 +171,21 @@ impl Spindll for SpindllService {
                     }
                 };
                 let digest = store.resolve_model_digest(&req.model).unwrap_or_default();
-                if let Err(e) = mgr.load_model_with_digest(&req.model, &path, None, digest) {
+                // mmproj_path on autoload → first image req has vision.
+                #[cfg(feature = "vision")]
+                let mmproj_path = store.resolve_mmproj_path(&req.model).ok().flatten();
+                #[cfg(feature = "vision")]
+                let opts = crate::engine::manager::LoadOptions {
+                    digest,
+                    mmproj_path,
+                    ..Default::default()
+                };
+                #[cfg(not(feature = "vision"))]
+                let opts = crate::engine::manager::LoadOptions {
+                    digest,
+                    ..Default::default()
+                };
+                if let Err(e) = mgr.load_model_with_options(&req.model, &path, opts) {
                     let _ = tx.blocking_send(Err(Status::internal(
                         format!("failed to load model '{}': {e}", req.model)
                     )));
@@ -131,27 +193,74 @@ impl Spindll for SpindllService {
                 }
             }
 
-            let messages: Vec<_> = req.messages.iter()
-                .map(|m| (m.role.clone(), m.content.clone()))
-                .collect();
             let params = proto_params_to_engine(req.params);
-            let enc_key: Option<[u8; 32]> = if req.encryption_key.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&req.encryption_key);
-                Some(arr)
-            } else {
-                None
-            };
             let start = std::time::Instant::now();
 
-            let result = mgr.generate_chat(&req.model, &messages, &params, enc_key.as_ref(), |token| {
-                let resp = ChatResponse {
-                    token: token.to_string(),
-                    done: false,
-                    usage: None,
-                };
-                tx.blocking_send(Ok(resp)).is_ok()
+            // Vision path only if ≥1 image part. Text-only `parts` stay on text path.
+            #[cfg(feature = "vision")]
+            let has_image = req.messages.iter().any(|m| {
+                m.parts.iter().any(|p| p.r#type == "image")
             });
+
+            #[cfg(feature = "vision")]
+            let result = if has_image {
+                let mm_messages = match proto_to_multimodal(&req.messages) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(Status::invalid_argument(e.to_string())));
+                        return;
+                    }
+                };
+                mgr.generate_chat_multimodal(&req.model, &mm_messages, &params, |token| {
+                    let resp = ChatResponse {
+                        token: token.to_string(),
+                        done: false,
+                        usage: None,
+                    };
+                    tx.blocking_send(Ok(resp)).is_ok()
+                })
+            } else {
+                let messages: Vec<_> = req.messages.iter()
+                    .map(|m| (m.role.clone(), proto_message_text(m)))
+                    .collect();
+                let enc_key: Option<[u8; 32]> = if req.encryption_key.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&req.encryption_key);
+                    Some(arr)
+                } else {
+                    None
+                };
+                mgr.generate_chat(&req.model, &messages, &params, enc_key.as_ref(), |token| {
+                    let resp = ChatResponse {
+                        token: token.to_string(),
+                        done: false,
+                        usage: None,
+                    };
+                    tx.blocking_send(Ok(resp)).is_ok()
+                })
+            };
+
+            #[cfg(not(feature = "vision"))]
+            let result = {
+                let messages: Vec<_> = req.messages.iter()
+                    .map(|m| (m.role.clone(), proto_message_text(m)))
+                    .collect();
+                let enc_key: Option<[u8; 32]> = if req.encryption_key.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&req.encryption_key);
+                    Some(arr)
+                } else {
+                    None
+                };
+                mgr.generate_chat(&req.model, &messages, &params, enc_key.as_ref(), |token| {
+                    let resp = ChatResponse {
+                        token: token.to_string(),
+                        done: false,
+                        usage: None,
+                    };
+                    tx.blocking_send(Ok(resp)).is_ok()
+                })
+            };
 
             match result {
                 Err(e) => {
@@ -300,7 +409,14 @@ impl Spindll for SpindllService {
             .load_model_with_options(
                 &req.model,
                 &model_path,
-                LoadOptions { gpu_layers, digest, priority, idle_reload },
+                LoadOptions {
+                    gpu_layers,
+                    digest,
+                    priority,
+                    idle_reload,
+                    #[cfg(feature = "vision")]
+                    mmproj_path: self.model_store.resolve_mmproj_path(&req.model).unwrap_or(None),
+                },
             )
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -487,6 +603,7 @@ mod tests {
             format: ModelFormat::Gguf,
             base_model: String::new(),
             source: ModelSource::HfSourceDownloaded,
+            mmproj_path: None,
         });
         reg.add("mlx-community/Llama-3.1-8B-4bit".into(), ModelEntry {
             repo: "mlx-community/Llama-3.1-8B-4bit".into(),
@@ -503,6 +620,7 @@ mod tests {
             format: ModelFormat::Mlx,
             base_model: "llama3.1-8b".into(),
             source: ModelSource::HfSourceDownloaded,
+            mmproj_path: None,
         });
         reg.save(&store.registry_path()).unwrap();
 
@@ -522,5 +640,96 @@ mod tests {
         assert_eq!(mlx.base_model, "llama3.1-8b");
 
         assert!(!resp.prefer_format.is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "vision"))]
+mod proto_to_multimodal_tests {
+    use super::*;
+    use crate::engine::multimodal::{ContentPart as MmPart, MAX_IMAGE_BYTES};
+
+    fn image_msg(image_data: Vec<u8>) -> crate::proto::Message {
+        crate::proto::Message {
+            role: "user".into(),
+            content: String::new(),
+            parts: vec![crate::proto::ContentPart {
+                r#type: "image".into(),
+                text: String::new(),
+                image_data,
+                media_type: "image/png".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn maps_image_part_within_cap() {
+        let out = proto_to_multimodal(&[image_msg(vec![1, 2, 3])]).unwrap();
+        match &out[0].content[..] {
+            [MmPart::ImageBytes { data, media_type }] => {
+                assert_eq!(data.as_slice(), &[1, 2, 3]);
+                assert_eq!(media_type.as_deref(), Some("image/png"));
+            }
+            other => panic!("expected image part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_image() {
+        let err = proto_to_multimodal(&[image_msg(vec![0u8; MAX_IMAGE_BYTES + 1])]).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod proto_message_text_tests {
+    use super::*;
+
+    fn text_part(text: &str) -> crate::proto::ContentPart {
+        crate::proto::ContentPart {
+            r#type: "text".into(),
+            text: text.into(),
+            image_data: Vec::new(),
+            media_type: String::new(),
+        }
+    }
+
+    #[test]
+    fn falls_back_to_content_when_no_parts() {
+        let m = crate::proto::Message {
+            role: "user".into(),
+            content: "hello".into(),
+            parts: vec![],
+        };
+        assert_eq!(proto_message_text(&m), "hello");
+    }
+
+    #[test]
+    fn flattens_text_parts_when_content_empty() {
+        // Regression: text carried in `parts` with empty `content` must not be dropped.
+        let m = crate::proto::Message {
+            role: "user".into(),
+            content: String::new(),
+            parts: vec![text_part("foo "), text_part("bar")],
+        };
+        assert_eq!(proto_message_text(&m), "foo bar");
+    }
+
+    #[test]
+    fn parts_override_content_and_skip_images() {
+        let m = crate::proto::Message {
+            role: "user".into(),
+            content: "ignored".into(),
+            parts: vec![
+                text_part("see "),
+                crate::proto::ContentPart {
+                    r#type: "image".into(),
+                    text: "alt".into(),
+                    image_data: vec![1, 2, 3],
+                    media_type: "image/png".into(),
+                },
+                text_part("this"),
+            ],
+        };
+        assert_eq!(proto_message_text(&m), "see this");
     }
 }
