@@ -2,10 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.7.0] - 2026-06-14
 
 ### Added
 
+- **Vision / multimodal inference** — chat requests can include images over gRPC (`Message.parts` / `ContentPart`) and the OpenAI HTTP API (`image_url` base64 `data:` URIs). GGUF vision via llama.cpp's `mtmd` API; MLX VLM decode path (Qwen2.5-VL) on Apple Silicon. Gated behind a new `vision` Cargo feature; auto-downloads the `mmproj` projector sibling and enforces a 32 MB per-image decode cap.
 - **AnythingLLM native provider support** — enhanced OpenAI API with per-model metadata:
   - `GET /v1/models` now includes architecture, context_length, format, size_bytes, capabilities, created timestamp
   - `GET /v1/models/{id}` endpoint for per-model config queries
