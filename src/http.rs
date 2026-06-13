@@ -785,8 +785,7 @@ fn find_json_end(text: &str, start: usize) -> Option<usize> {
     let mut depth = 0i32;
     let mut in_string = false;
     let mut escape = false;
-    for i in start..bytes.len() {
-        let ch = bytes[i];
+    for (i, &ch) in bytes.iter().enumerate().skip(start) {
         if escape {
             escape = false;
             continue;
@@ -861,11 +860,10 @@ fn prepare_messages_with_tools(
     }
 
     // If there was no system message but we have tools, inject one
-    if !system_injected {
-        if let Some(preamble) = tool_preamble {
+    if !system_injected
+        && let Some(preamble) = tool_preamble {
             result.insert(0, ("system".to_string(), preamble));
         }
-    }
 
     result
 }
@@ -1362,7 +1360,7 @@ fn encode_embedding_base64(v: &[f32]) -> String {
     for f in v {
         bytes.extend_from_slice(&f.to_le_bytes());
     }
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= bytes.len() {
         let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | bytes[i + 2] as u32;

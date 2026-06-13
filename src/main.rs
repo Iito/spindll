@@ -244,6 +244,7 @@ fn manager_memory_budget(raw_budget: Option<&str>, detected_budget: u64) -> u64 
 // Backend dispatch
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "bench")]
 fn backend_for_format(
     format: &spindll::model_store::registry::ModelFormat,
 ) -> anyhow::Result<Box<dyn spindll::backend::InferenceBackend>> {
@@ -909,8 +910,8 @@ async fn main() -> anyhow::Result<()> {
                 println!("no models loaded");
             } else {
                 println!(
-                    "{:<35} {:>10} {:>6}  {}",
-                    "MODEL", "MEMORY", "GPU", "DIGEST"
+                    "{:<35} {:>10} {:>6}  DIGEST",
+                    "MODEL", "MEMORY", "GPU"
                 );
                 println!("{}", "-".repeat(75));
                 for m in &resp.models {

@@ -16,8 +16,10 @@ use std::path::PathBuf;
 
 /// Caller-specified format preference for `pull()`.
 #[derive(Debug, Clone, PartialEq)]
+#[derive(Default)]
 pub enum FormatPreference {
     /// Let the platform decide: MLX on Apple Silicon, GGUF elsewhere.
+    #[default]
     Auto,
     /// Force GGUF regardless of platform.
     Gguf,
@@ -25,11 +27,6 @@ pub enum FormatPreference {
     Mlx,
 }
 
-impl Default for FormatPreference {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
 
 /// Local model store backed by `~/.spindll` (or a custom directory).
 ///
@@ -306,8 +303,8 @@ impl ModelStore {
         let arch_w  = rows.iter().map(|r| r.3.len()).max().unwrap_or(0).max("ARCH".len()) + PADDING;
 
         println!(
-            "{:<model_w$} {:<5} {:>10}  {:<arch_w$}  {}",
-            "MODEL", "FMT", "SIZE", "ARCH", "DESCRIPTION"
+            "{:<model_w$} {:<5} {:>10}  {:<arch_w$}  DESCRIPTION",
+            "MODEL", "FMT", "SIZE", "ARCH"
         );
         let total_w = model_w + 1 + 5 + 1 + 10 + 2 + arch_w + 2 + "DESCRIPTION".len();
         println!("{}", "-".repeat(total_w));
@@ -356,7 +353,7 @@ impl ModelStore {
         }
 
         // 5. Match by base_model (finds MLX entries for Ollama-style names)
-        let normalized = model.replace(':', "-").replace(' ', "-");
+        let normalized = model.replace([':', ' '], "-");
         if let Some((key, _)) = reg.models.iter().find(|(_, e)| {
             !e.base_model.is_empty() && e.base_model.eq_ignore_ascii_case(&normalized)
         }) {
@@ -403,11 +400,10 @@ impl ModelStore {
         let entry = &reg.models[&key];
 
         // Return stored path if present and still exists on disk.
-        if let Some(ref stored) = entry.mmproj_path {
-            if stored.exists() {
+        if let Some(ref stored) = entry.mmproj_path
+            && stored.exists() {
                 return Ok(Some(stored.clone()));
             }
-        }
 
         // Auto-discover: scan the model's parent directory.
         let search_dir = if entry.path.is_dir() {
@@ -418,11 +414,10 @@ impl ModelStore {
             entry.path.parent().map(|p| p.to_path_buf()).unwrap_or_default()
         };
 
-        if search_dir.is_dir() {
-            if let Some(found) = discover_mmproj(&search_dir) {
+        if search_dir.is_dir()
+            && let Some(found) = discover_mmproj(&search_dir) {
                 return Ok(Some(found));
             }
-        }
 
         Ok(None)
     }
@@ -535,7 +530,7 @@ impl ModelStore {
             // Find GGUF or MLX models in this snapshot
             let gguf_files: Vec<_> = std::fs::read_dir(&snapshot_path)?
                 .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map_or(false, |ext| ext == "gguf"))
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "gguf"))
                 .collect();
 
             let is_mlx_dir = snapshot_path.join("model.safetensors").exists()
@@ -797,6 +792,7 @@ impl ModelStore {
 ///
 /// - `ollama/nemotron-3-nano/4b.gguf` → `nemotron-3-nano:4b`
 /// - `TheBloke/Llama-3-8B-GGUF/model.gguf` → `TheBloke/Llama-3-8B-GGUF:model`
+///
 /// Derive a canonical base model name from GGUF metadata or the user-provided model string.
 ///
 /// Prefers `general.name` from GGUF metadata (most reliable), falling back to
@@ -837,12 +833,11 @@ pub fn display_name(key: &str, entry: &registry::ModelEntry) -> String {
         registry::ModelFormat::Gguf => {
             // Ollama: registry key is `ollama/<name>/<tag>.gguf` → `<name>:<tag>`.
             let parts: Vec<&str> = key.splitn(3, '/').collect();
-            if let [provider, name, file] = parts.as_slice() {
-                if *provider == "ollama" {
+            if let [provider, name, file] = parts.as_slice()
+                && *provider == "ollama" {
                     let tag = file.strip_suffix(".gguf").unwrap_or(file);
                     return format!("{name}:{tag}");
                 }
-            }
             // HF: `<repo> (<quant>)` when we can detect the quant, else just repo.
             let base = if entry.repo.is_empty() { key } else { entry.repo.as_str() };
             match download::extract_quant(&entry.filename) {

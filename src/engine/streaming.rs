@@ -132,6 +132,8 @@ pub fn generate_streaming(
     let mut n_cur = batch.n_tokens();
     let mut completion_tokens = 0u32;
 
+    // n_cur tracks the KV position (non-zero base), so enumerate doesn't apply.
+    #[allow(clippy::explicit_counter_loop)]
     for _ in 0..params.max_tokens {
         let token = sampler.sample(ctx, batch.n_tokens() - 1);
         sampler.accept(token);
@@ -307,11 +309,10 @@ pub fn generate_streaming_cached(
         let save_path = cache.save_path(prompt, model_name, model_digest, encryption_key);
         let tmp = save_path.with_extension("tmp");
         if ctx.state_save_file(&tmp, &tokens).is_ok() {
-            if let Ok(raw) = std::fs::read(&tmp) {
-                if save_state_to_disk(&save_path, &raw, encryption_key).is_ok() {
+            if let Ok(raw) = std::fs::read(&tmp)
+                && save_state_to_disk(&save_path, &raw, encryption_key).is_ok() {
                     cache.register(prompt, model_name, model_digest, encryption_key);
                 }
-            }
             std::fs::remove_file(&tmp).ok();
         }
     }
@@ -354,6 +355,8 @@ pub fn generate_streaming_cached(
         tokens.len() as i32 - 1
     };
 
+    // n_cur tracks the KV position (non-zero base), so enumerate doesn't apply.
+    #[allow(clippy::explicit_counter_loop)]
     for _ in 0..params.max_tokens {
         let token = sampler.sample(ctx, logit_idx);
         sampler.accept(token);

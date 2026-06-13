@@ -167,7 +167,7 @@ impl ModelManager {
             }
         }
 
-        let default_gpu_layers = gpu_layers.unwrap_or_else(|| {
+        let default_gpu_layers = gpu_layers.unwrap_or({
             if cfg!(target_os = "macos")
                 || cfg!(feature = "cuda")
                 || cfg!(feature = "metal")
@@ -412,11 +412,10 @@ impl ModelManager {
 
         let model = backend.load_model(path, load_params)?;
 
-        if from_ram_cache {
-            if let Some(cache) = &self.ram_cache {
+        if from_ram_cache
+            && let Some(cache) = &self.ram_cache {
                 cache.remove(name);
             }
-        }
 
         let n_ctx = model.n_ctx();
         let n_ctx_train = model.n_ctx_train();
@@ -727,8 +726,8 @@ impl ModelManager {
         *loaded.last_used.write().unwrap() = Instant::now();
 
         // KV cache path: GGUF models with cache enabled get the cached generate path.
-        if let Some(cache) = &self.kv_cache {
-            if let Some(llama) = loaded.model.as_any().downcast_ref::<LlamaCppModel>() {
+        if let Some(cache) = &self.kv_cache
+            && let Some(llama) = loaded.model.as_any().downcast_ref::<LlamaCppModel>() {
                 // n_batch == n_ctx so prefill batches always fit. Default n_batch=512
                 // hits GGML_ASSERT and crashes on prompts longer than 512 tokens.
                 let ctx_params = LlamaContextParams::default()
@@ -751,7 +750,6 @@ impl ModelManager {
                     on_token,
                 );
             }
-        }
 
         loaded.model.generate(prompt, params, on_token)
     }
@@ -837,8 +835,8 @@ impl ModelManager {
         *loaded.last_used.write().unwrap() = Instant::now();
 
         // KV cache path: GGUF models need the prompt as a string.
-        if let Some(cache) = &self.kv_cache {
-            if let Some(llama) = loaded.model.as_any().downcast_ref::<LlamaCppModel>() {
+        if let Some(cache) = &self.kv_cache
+            && let Some(llama) = loaded.model.as_any().downcast_ref::<LlamaCppModel>() {
                 let prompt = loaded.model.apply_chat_template(messages)?;
                 let ctx_params = LlamaContextParams::default()
                     .with_n_ctx(NonZeroU32::new(loaded.n_ctx))
@@ -860,7 +858,6 @@ impl ModelManager {
                     on_token,
                 );
             }
-        }
 
         // All other backends (MLX): fused template + generation.
         loaded.model.generate_chat(messages, params, on_token)

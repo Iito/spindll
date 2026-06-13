@@ -45,7 +45,7 @@ impl Engine {
     pub fn load(path: &Path, n_gpu_layers: Option<u32>, n_ctx: u32) -> anyhow::Result<Self> {
         let backend = crate::backend::llamacpp::shared_backend();
 
-        let gpu_layers = n_gpu_layers.unwrap_or_else(|| {
+        let gpu_layers = n_gpu_layers.unwrap_or({
             if cfg!(target_os = "macos")
                 || cfg!(feature = "cuda")
                 || cfg!(feature = "metal")

@@ -107,7 +107,7 @@ pub fn search_models(
 
     match opts.sort {
         SortOrder::Default => rank_results(&mut results, prefers_mlx, inference_mem),
-        SortOrder::Downloads => results.sort_by(|a, b| b.downloads.cmp(&a.downloads)),
+        SortOrder::Downloads => results.sort_by_key(|r| std::cmp::Reverse(r.downloads)),
         SortOrder::Size => results.sort_by_key(|r| {
             r.estimated_bytes.map(|b| b as i64).unwrap_or(i64::MAX)
         }),
@@ -239,13 +239,12 @@ fn detect_vram_nvidia() -> Option<u64> {
 }
 
 fn estimate_from_api(m: &HfModel, format: &ModelFormat) -> Option<u64> {
-    if let Some(ref st) = m.safetensors {
-        if st.total > 0 {
+    if let Some(ref st) = m.safetensors
+        && st.total > 0 {
             let params_b = st.total as f64 / 1e9;
             let bpp = bpp_for_name(&m.id, format);
             return Some((params_b * bpp * 1e9) as u64);
         }
-    }
     estimate_model_bytes(&m.id, format)
 }
 
@@ -328,8 +327,8 @@ fn rank_results(results: &mut [SearchResult], prefers_mlx: bool, available_mem: 
         let a_preferred = matches!(a.format, ModelFormat::Mlx) == prefers_mlx;
         let b_preferred = matches!(b.format, ModelFormat::Mlx) == prefers_mlx;
 
-        let a_fits = a.estimated_bytes.map_or(true, |s| s < available_mem);
-        let b_fits = b.estimated_bytes.map_or(true, |s| s < available_mem);
+        let a_fits = a.estimated_bytes.is_none_or(|s| s < available_mem);
+        let b_fits = b.estimated_bytes.is_none_or(|s| s < available_mem);
 
         b_preferred
             .cmp(&a_preferred)
@@ -373,11 +372,10 @@ fn extract_param_billions(name: &str) -> Option<f64> {
                 let after = if i + 1 < len { bytes[i + 1] } else { b'-' };
                 if !after.is_ascii_alphabetic() {
                     let s = &name[start..i];
-                    if let Ok(n) = s.parse::<f64>() {
-                        if n > 0.0 && n < 1000.0 {
+                    if let Ok(n) = s.parse::<f64>()
+                        && n > 0.0 && n < 1000.0 {
                             return Some(n);
                         }
-                    }
                 }
             }
         }
@@ -553,8 +551,7 @@ mod tests {
 
     #[test]
     fn size_sort_puts_none_last() {
-        let mut results = vec![
-            SearchResult {
+        let mut results = [SearchResult {
                 name: "unknown".into(),
                 source: SearchSource::HuggingFace,
                 format: ModelFormat::Gguf,
@@ -574,8 +571,7 @@ mod tests {
                 format: ModelFormat::Gguf,
                 downloads: 0,
                 estimated_bytes: Some(1_000_000_000),
-            },
-        ];
+            }];
         results.sort_by_key(|r| r.estimated_bytes.map(|b| b as i64).unwrap_or(i64::MAX));
         assert_eq!(results[0].name, "small");
         assert_eq!(results[1].name, "big");

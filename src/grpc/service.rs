@@ -451,6 +451,8 @@ impl Spindll for SpindllService {
         let mgr = self.manager.clone();
         let store = self.model_store.clone();
 
+        // The closure returns Result<_, tonic::Status>; Status is large by design.
+        #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
             // Auto-load the model if not already loaded.
             if !mgr.is_loaded(&req.model) {
@@ -562,7 +564,6 @@ mod tests {
     use crate::backend::{BackendLoadParams, BackendModel, InferenceBackend};
     use crate::engine::streaming::{GenerateParams as EngineParams, GenerateResult};
     use crate::model_store::registry::{ModelEntry, ModelFormat, ModelSource, Registry};
-    use crate::proto::spindll_server::Spindll as _; // trait needed for .list()
 
     struct FakeBackend;
     impl InferenceBackend for FakeBackend {

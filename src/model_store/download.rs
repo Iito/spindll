@@ -28,12 +28,7 @@ const FULL_PRECISION: &[&str] = &["fp16", "bf16", "f32"];
 ///   "model.gguf" -> None
 pub(crate) fn extract_quant(filename: &str) -> Option<&'static str> {
     let lower = filename.to_lowercase();
-    for q in QUANT_PRIORITY.iter().chain(FULL_PRECISION.iter()) {
-        if lower.contains(q) {
-            return Some(q);
-        }
-    }
-    None
+    QUANT_PRIORITY.iter().chain(FULL_PRECISION.iter()).find(|&q| lower.contains(q)).map(|v| v as _)
 }
 
 /// If `filename` matches the split-GGUF naming pattern
