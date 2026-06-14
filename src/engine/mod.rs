@@ -9,6 +9,7 @@ pub mod metrics;
 pub mod multimodal;
 pub mod ram_cache;
 pub mod streaming;
+pub mod tools;
 
 pub use batch::{BatchEvent, BatchRequest, BatchScheduler};
 pub use kv_cache::KvCache;
@@ -19,6 +20,7 @@ pub use metrics::Metrics;
 pub use multimodal::{ContentPart, MultimodalMessage};
 pub use ram_cache::RamCache;
 pub use streaming::{GenerateParams, GenerateResult};
+pub use tools::{ToolCall, ToolChoice, ToolSpec};
 
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
