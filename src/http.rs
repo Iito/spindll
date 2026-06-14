@@ -495,7 +495,7 @@ async fn oai_status(State(state): State<AppState>) -> impl IntoResponse {
 struct OaiChatRequest {
     model: String,
     messages: Vec<OaiMessage>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     stream: bool,
     #[serde(default)]
     max_tokens: Option<u32>,
@@ -519,10 +519,6 @@ struct OaiChatRequest {
 struct StreamOptions {
     #[serde(default)]
     include_usage: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Deserialize)]
@@ -981,7 +977,7 @@ async fn oai_chat_completions(
 struct OaiCompletionRequest {
     model: String,
     prompt: String,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     stream: bool,
     #[serde(default)]
     max_tokens: Option<u32>,
@@ -1859,5 +1855,30 @@ mod tests {
 
         assert_eq!(json["choices"][0]["finish_reason"], "stop");
         assert!(json["choices"][0]["message"]["content"].is_string());
+    }
+
+    #[test]
+    fn oai_chat_request_defaults_stream_to_false() {
+        // OpenAI spec: `stream` defaults to false when the field is omitted.
+        let req: OaiChatRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[]}"#).unwrap();
+        assert!(!req.stream, "omitted stream must default to false");
+    }
+
+    #[test]
+    fn oai_chat_request_honors_explicit_stream() {
+        let on: OaiChatRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[],"stream":true}"#).unwrap();
+        assert!(on.stream);
+        let off: OaiChatRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[],"stream":false}"#).unwrap();
+        assert!(!off.stream);
+    }
+
+    #[test]
+    fn oai_completion_request_defaults_stream_to_false() {
+        let req: OaiCompletionRequest =
+            serde_json::from_str(r#"{"model":"m","prompt":"hi"}"#).unwrap();
+        assert!(!req.stream, "omitted stream must default to false");
     }
 }
