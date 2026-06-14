@@ -720,98 +720,24 @@ fn format_tools_for_prompt(tools: &[OaiTool]) -> String {
     out
 }
 
-/// Try to extract tool calls from model output.
-///
-/// Looks for JSON objects containing `"name"` and `"arguments"` keys, which is the
-/// format most tool-calling models produce. Returns extracted calls and any remaining
-/// text content.
+/// Extract tool calls from model output, adapting the shared engine parser
+/// (`engine::tools::parse_tool_calls`) to the OpenAI response shape. The shared
+/// parser also understands the Hermes / Llama-3.1 / Mistral wrappers, so this
+/// is strictly more capable than the old HTTP-local JSON scan it replaced.
 fn parse_tool_calls(output: &str) -> (Vec<OaiToolCallMessage>, String) {
-    let mut calls = Vec::new();
-    let mut remaining = String::new();
-    let trimmed = output.trim();
-
-    // Try to find JSON objects in the output
-    let mut search_from = 0;
-    while search_from < trimmed.len() {
-        if let Some(start) = trimmed[search_from..].find('{') {
-            let abs_start = search_from + start;
-            // Try increasingly larger slices to find valid JSON
-            if let Some(call) = extract_tool_call_at(trimmed, abs_start) {
-                remaining.push_str(&trimmed[search_from..abs_start]);
-                let json_len = find_json_end(trimmed, abs_start).unwrap_or(trimmed.len()) - abs_start;
-                search_from = abs_start + json_len;
-                calls.push(call);
-                continue;
-            }
-        }
-        remaining.push_str(&trimmed[search_from..]);
-        break;
-    }
-
-    (calls, remaining.trim().to_string())
-}
-
-fn extract_tool_call_at(text: &str, start: usize) -> Option<OaiToolCallMessage> {
-    let end = find_json_end(text, start)?;
-    let candidate = &text[start..end];
-    let parsed: serde_json::Value = serde_json::from_str(candidate).ok()?;
-    let obj = parsed.as_object()?;
-
-    let name = obj.get("name")?.as_str()?;
-    let arguments = obj.get("arguments")?;
-
-    let call_id = format!("call_{:016x}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
-
-    Some(OaiToolCallMessage {
-        id: call_id,
-        r#type: "function".to_string(),
-        function: OaiToolCallFunction {
-            name: name.to_string(),
-            arguments: if arguments.is_string() {
-                arguments.as_str().unwrap().to_string()
-            } else {
-                serde_json::to_string(arguments).unwrap_or_default()
+    let (calls, remaining) = crate::engine::tools::parse_tool_calls(output);
+    let calls = calls
+        .into_iter()
+        .map(|c| OaiToolCallMessage {
+            id: c.id,
+            r#type: "function".to_string(),
+            function: OaiToolCallFunction {
+                name: c.name,
+                arguments: c.arguments,
             },
-        },
-    })
-}
-
-/// Find the end of a balanced JSON object starting at `start`.
-fn find_json_end(text: &str, start: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    if bytes.get(start)? != &b'{' {
-        return None;
-    }
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escape = false;
-    for (i, &ch) in bytes.iter().enumerate().skip(start) {
-        if escape {
-            escape = false;
-            continue;
-        }
-        if ch == b'\\' && in_string {
-            escape = true;
-            continue;
-        }
-        if ch == b'"' {
-            in_string = !in_string;
-            continue;
-        }
-        if in_string {
-            continue;
-        }
-        if ch == b'{' {
-            depth += 1;
-        } else if ch == b'}' {
-            depth -= 1;
-            if depth == 0 {
-                return Some(i + 1);
-            }
-        }
-    }
-    None
+        })
+        .collect();
+    (calls, remaining)
 }
 
 /// Prepare messages for template application, injecting tool descriptions when present.
