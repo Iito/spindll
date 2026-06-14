@@ -286,7 +286,13 @@ async fn load(
     let digest = state.store.resolve_model_digest(&req.model).unwrap_or_default();
     let gpu_layers = req.gpu_layers.and_then(|l| if l < 0 { None } else { Some(l as u32) });
 
-    match state.manager.load_model_with_digest(&req.model, &path, gpu_layers, digest) {
+    match state.manager.load_model_with_options(&req.model, &path, crate::engine::manager::LoadOptions {
+        gpu_layers,
+        digest,
+        #[cfg(feature = "vision")]
+        mmproj_path: state.store.resolve_mmproj_path(&req.model).unwrap_or(None),
+        ..Default::default()
+    }) {
         Ok(()) => Json(LoadResponse { already_loaded: false }).into_response(),
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -481,7 +487,7 @@ async fn oai_status(State(state): State<AppState>) -> impl IntoResponse {
 
     Json(serde_json::json!({
         "status": "ok",
-        "version": "0.6.0",
+        "version": env!("CARGO_PKG_VERSION"),
         "models": {
             "total": total_models,
             "loaded": loaded_models.len(),
@@ -557,7 +563,6 @@ impl OaiContent {
     }
 
     /// Returns `true` if any part is an image.
-    #[cfg(feature = "vision")]
     fn has_images(&self) -> bool {
         match self {
             OaiContent::Text(_) => false,
@@ -865,7 +870,6 @@ fn prepare_messages_with_tools(
 }
 
 /// Check whether any OAI message contains image content parts.
-#[cfg(feature = "vision")]
 fn oai_has_images(messages: &[OaiMessage]) -> bool {
     messages.iter().any(|m| m.content.as_ref().is_some_and(|c| c.has_images()))
 }
@@ -900,6 +904,15 @@ async fn oai_chat_completions(
     let store = state.store.clone();
     let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
     let include_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
+
+    #[cfg(not(feature = "vision"))]
+    if oai_has_images(&req.messages) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(oai_error("image_url content requires the vision feature")),
+        )
+            .into_response();
+    }
 
     if req.stream {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
@@ -1681,6 +1694,35 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["object"], "chat.completion");
         assert!(json["choices"][0]["message"]["content"].as_str().unwrap().contains("Hello"));
+    }
+
+    #[cfg(not(feature = "vision"))]
+    #[tokio::test]
+    async fn oai_chat_completions_rejects_images_without_vision() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        let app = router(mgr, store);
+
+        let body = serde_json::json!({
+            "model": "test-org/test-model",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+                ]
+            }]
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

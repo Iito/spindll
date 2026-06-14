@@ -81,6 +81,8 @@ pub struct LoadedModel {
     pub batch_tx: Option<std::sync::mpsc::Sender<BatchRequest>>,
     pub priority: EvictionPriority,
     pub idle_reload: Option<Duration>,
+    #[cfg(feature = "vision")]
+    pub mmproj_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +93,8 @@ struct PendingReload {
     gpu_layers: Option<u32>,
     priority: EvictionPriority,
     idle_reload: Duration,
+    #[cfg(feature = "vision")]
+    mmproj_path: Option<PathBuf>,
 }
 
 /// Multi-model manager with LRU memory budgeting.
@@ -296,6 +300,8 @@ impl ModelManager {
                         gpu_layers: model.requested_gpu_layers,
                         priority: model.priority,
                         idle_reload: d,
+                        #[cfg(feature = "vision")]
+                        mmproj_path: model.mmproj_path.clone(),
                     });
                 }
             }
@@ -407,7 +413,7 @@ impl ModelManager {
             n_gpu_layers: Some(layers),
             memory_budget: load_budget,
             #[cfg(feature = "vision")]
-            mmproj_path,
+            mmproj_path: mmproj_path.clone(),
         };
 
         let model = backend.load_model(path, load_params)?;
@@ -464,6 +470,8 @@ impl ModelManager {
             batch_tx,
             priority,
             idle_reload,
+            #[cfg(feature = "vision")]
+            mmproj_path,
         };
 
         self.models.write().unwrap().insert(name.to_string(), loaded);
@@ -1024,7 +1032,7 @@ async fn reload_watcher(weak: Weak<ModelManager>, spec: PendingReload) {
             priority: spec.priority,
             idle_reload: Some(spec.idle_reload),
             #[cfg(feature = "vision")]
-            mmproj_path: None,
+            mmproj_path: spec.mmproj_path.clone(),
         };
         let mgr_blocking = mgr.clone();
         let path = spec.path.clone();
@@ -1183,6 +1191,27 @@ mod tests {
         let f = std::fs::File::create(&p).unwrap();
         f.set_len(size).unwrap();
         p
+    }
+
+    #[cfg(feature = "vision")]
+    #[test]
+    fn idle_reload_preserves_mmproj_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(4300);
+        let p_a = fake_model_file(dir.path(), "a.gguf", 100);
+        let p_b = fake_model_file(dir.path(), "b.gguf", 100);
+        let mmproj = dir.path().join("mmproj.gguf");
+
+        mgr.load_model_with_options("a", &p_a, LoadOptions {
+            priority: EvictionPriority::Low,
+            idle_reload: Some(Duration::from_secs(1)),
+            mmproj_path: Some(mmproj.clone()),
+            ..Default::default()
+        }).unwrap();
+        mgr.load_model_with_options("b", &p_b, LoadOptions::default()).unwrap();
+
+        let pending = mgr.evict_for(100).unwrap();
+        assert_eq!(pending[0].mmproj_path.as_deref(), Some(mmproj.as_path()));
     }
 
     #[tokio::test]

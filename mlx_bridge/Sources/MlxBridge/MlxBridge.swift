@@ -866,7 +866,7 @@ private func resizeImageIfNeeded(url: URL, maxPixels: Int = kDefaultMaxPixels) -
     guard let resized = ctx.makeImage() else { return url }
 
     // Write as JPEG to a temp file.
-    let tmpPath = NSTemporaryDirectory() + "spindll_vlm_resized_\(ProcessInfo.processInfo.processIdentifier).jpg"
+    let tmpPath = NSTemporaryDirectory() + "spindll_vlm_resized_\(UUID().uuidString).jpg"
     let tmpURL = URL(fileURLWithPath: tmpPath)
     guard let dest = CGImageDestinationCreateWithURL(
         tmpURL as CFURL, UTType.jpeg.identifier as CFString, 1, nil
