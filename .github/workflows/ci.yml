@@ -105,11 +105,6 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.os }}-vulkan-vision
-          cache-targets: ${{ runner.os != 'Windows' }}
-
       - name: Check release feature set (Linux)
         if: runner.os == 'Linux'
         env:
