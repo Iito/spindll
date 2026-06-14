@@ -69,6 +69,15 @@ pub trait BackendModel: Send + Sync {
         false
     }
 
+    /// Returns `true` if the backend can constrain generation to a GBNF
+    /// grammar during sampling, so emitted tool calls are structurally valid
+    /// by construction rather than best-effort parsed afterwards. llama.cpp
+    /// supports this; the MLX backend does not yet and degrades to prompt
+    /// injection plus [`crate::engine::tools::parse_tool_calls`].
+    fn supports_constrained_decoding(&self) -> bool {
+        false
+    }
+
     /// Per-token KV bytes for eviction sizing. Required so a new backend
     /// cannot silently underflow `total_loaded_bytes` by forgetting it.
     fn kv_bytes_per_token(&self) -> u64;
