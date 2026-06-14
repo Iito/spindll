@@ -66,3 +66,58 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --features cli,http
+
+  release-feature-check:
+    name: release feature check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake protobuf-compiler ninja-build libclang-dev libvulkan-dev
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Vulkan SDK (Windows)
+        if: runner.os == 'Windows'
+        uses: humbletim/setup-vulkan-sdk@v1.2.0
+        with:
+          vulkan-query-version: 1.3.290.0
+          vulkan-components: Vulkan-Headers, Vulkan-Loader
+          vulkan-use-cache: true
+
+      - name: Install LLVM (Windows)
+        if: runner.os == 'Windows'
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: '17'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-vulkan-vision
+          cache-targets: ${{ runner.os != 'Windows' }}
+
+      - name: Check release feature set (Linux)
+        if: runner.os == 'Linux'
+        env:
+          CMAKE_GENERATOR: Ninja
+        run: cargo check --features cli,http,vulkan,vision
+
+      - name: Check release feature set (Windows)
+        if: runner.os == 'Windows'
+        env:
+          LIBCLANG_PATH: ${{ env.LLVM_PATH }}/bin
+        run: cargo check --features cli,http,vulkan,vision

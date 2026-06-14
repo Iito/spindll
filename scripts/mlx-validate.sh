@@ -18,11 +18,11 @@ git fetch origin "$BRANCH"
 git switch "$BRANCH" 2>/dev/null || git switch -c "$BRANCH" "origin/$BRANCH"
 git pull --ff-only origin "$BRANCH"
 
-echo "==> cargo build --release --features cli,http,mlx"
-cargo build --release --features cli,http,mlx
+echo "==> cargo build --release --features cli,http,mlx,vision"
+cargo build --release --features cli,http,mlx,vision
 
-echo "==> cargo test --features cli,http,mlx --lib"
-cargo test --features cli,http,mlx --lib
+echo "==> cargo test --features cli,http,mlx,vision --lib"
+cargo test --features cli,http,mlx,vision --lib
 
 TS=$(date "+%Y-%m-%d %H:%M")
 {
