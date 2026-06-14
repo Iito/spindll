@@ -497,7 +497,7 @@ async fn oai_status(State(state): State<AppState>) -> impl IntoResponse {
 struct OaiChatRequest {
     model: String,
     messages: Vec<OaiMessage>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     stream: bool,
     #[serde(default)]
     max_tokens: Option<u32>,
@@ -521,10 +521,6 @@ struct OaiChatRequest {
 struct StreamOptions {
     #[serde(default)]
     include_usage: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Deserialize)]
@@ -1168,7 +1164,7 @@ async fn oai_chat_completions(
 struct OaiCompletionRequest {
     model: String,
     prompt: String,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     stream: bool,
     #[serde(default)]
     max_tokens: Option<u32>,
