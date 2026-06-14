@@ -170,12 +170,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: windows-vulkan
+          cache-targets: false
 
       - name: Build
         shell: pwsh
         env:
           LIBCLANG_PATH: ${{ env.LLVM_PATH }}/bin
-        run: cargo build --release --features cli,http,vulkan
+        run: cargo build --release --features cli,http,vulkan,vision
 
       - name: Package binary
         shell: bash
@@ -285,7 +286,7 @@ jobs:
       - name: Build
         env:
           CMAKE_GENERATOR: Ninja
-        run: cargo build --release --features cli,http,vulkan
+        run: cargo build --release --features cli,http,vulkan,vision
 
       - name: Package binary
         shell: bash
@@ -324,7 +325,7 @@ jobs:
           key: macos-arm64
 
       - name: Build
-        run: cargo build --release --features cli,http,mlx
+        run: cargo build --release --features cli,http,mlx,vision
 
       - name: Package binary
         shell: bash
@@ -411,9 +412,6 @@ jobs:
 
   release:
     needs: [build-macos, build-windows-vulkan, build-linux-vulkan]
-    # Publish if at least one build leg succeeded; a failing leg just omits
-    # its artifact rather than blocking the release.
-    if: ${{ always() && contains(needs.*.result, 'success') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
