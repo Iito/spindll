@@ -1,0 +1,222 @@
+# Daily check for new `llama-cpp-2` releases (the crate that vendors llama.cpp).
+#
+# What it does, once a day (and on manual dispatch):
+#   1. Compare the locked `llama-cpp-2` version against the latest stable on crates.io.
+#   2. If newer, bump it on a branch and run the same gate CI uses
+#      (`cargo test` + `cargo clippy -D warnings`), building llama.cpp from source.
+#   3. Open a PR against `next`:
+#        - in-range patch (same major.minor) + green  -> ready-for-review PR.
+#        - new minor/major, or any failure            -> DRAFT PR, labelled for a
+#          human decision (this is the "whether we bump minor depends" gate).
+#
+# It never bumps the spindll version, never pushes to `next`, and never tags a
+# release. Releases stay tag-driven (see release.yml): a human sets Cargo.toml
+# `version` (patch vs minor) and pushes `vX.Y.Z`.
+#
+# Requirements:
+#   - Settings > Actions > General > "Allow GitHub Actions to create and approve
+#     pull requests" must be enabled (the default GITHUB_TOKEN opens the PR).
+#   - PRs opened by GITHUB_TOKEN do not re-trigger ci.yml, which is why this job
+#     runs the test + clippy gate itself before marking a PR ready.
+
+name: llama.cpp upgrade check
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily at 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Force a specific llama-cpp-2 version (default: latest stable on crates.io)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: llama-cpp-upgrade
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  BASE_BRANCH: next
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Resolve current vs latest llama-cpp-2
+        id: ver
+        env:
+          FORCE_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+
+          CURRENT=$(grep -A1 '^name = "llama-cpp-2"' Cargo.lock \
+            | grep -m1 '^version' | sed -E 's/version = "(.*)"/\1/')
+
+          if [ -n "${FORCE_VERSION:-}" ]; then
+            LATEST="$FORCE_VERSION"
+          else
+            LATEST=$(curl -fsSL \
+              -H "User-Agent: spindll-ci (mansa.camara.jp@gmail.com)" \
+              https://crates.io/api/v1/crates/llama-cpp-2 \
+              | jq -r '.crate.max_stable_version')
+          fi
+
+          echo "Current locked: $CURRENT"
+          echo "Latest stable:  $LATEST"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
+            echo "::error::Could not resolve latest llama-cpp-2 version from crates.io."
+            exit 1
+          fi
+
+          BRANCH="deps/llama-cpp-2-$LATEST"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+          # Same major.minor as the locked version => in-range patch (auto).
+          # Different => new minor/major, gated for a human decision.
+          if [ "${CURRENT%.*}" = "${LATEST%.*}" ]; then
+            echo "class=patch" >> "$GITHUB_OUTPUT"
+          else
+            echo "class=minor-major" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "$CURRENT" = "$LATEST" ]; then
+            echo "::notice::llama-cpp-2 already at $CURRENT — nothing to do."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          elif git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "::notice::Branch $BRANCH already exists — bump already proposed. Skipping."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install system dependencies
+        if: steps.ver.outputs.proceed == 'true'
+        run: sudo apt-get update && sudo apt-get install -y cmake protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.ver.outputs.proceed == 'true'
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.ver.outputs.proceed == 'true'
+
+      - name: Bump llama-cpp-2
+        if: steps.ver.outputs.proceed == 'true'
+        env:
+          LATEST: ${{ steps.ver.outputs.latest }}
+          CLASS: ${{ steps.ver.outputs.class }}
+        run: |
+          set -euo pipefail
+
+          if [ "$CLASS" = "minor-major" ]; then
+            # A new minor/major is outside the current Cargo.toml requirement;
+            # widen the requirement to the new major.minor before updating the lock.
+            NEW_MM="${LATEST%.*}"
+            sed -i -E "s/^(llama-cpp-2[[:space:]]*=[[:space:]]*)\"[^\"]+\"/\1\"$NEW_MM\"/" Cargo.toml
+            sed -i -E "s/^(llama-cpp-sys-2[[:space:]]*=[[:space:]]*)\"[^\"]+\"/\1\"$NEW_MM\"/" Cargo.toml
+          fi
+
+          cargo update -p llama-cpp-2 --precise "$LATEST"
+          cargo update -p llama-cpp-sys-2 --precise "$LATEST" || true
+
+          echo "---- Cargo.toml ----"; grep -n 'llama-cpp' Cargo.toml || true
+          echo "---- Cargo.lock ----"; grep -A1 '^name = "llama-cpp-2"' Cargo.lock || true
+
+      - name: Verify (test + clippy)
+        id: verify
+        if: steps.ver.outputs.proceed == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cargo test --features cli,http
+          cargo clippy --features cli,http -- -D warnings
+
+      - name: Open pull request
+        if: steps.ver.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT: ${{ steps.ver.outputs.current }}
+          LATEST: ${{ steps.ver.outputs.latest }}
+          CLASS: ${{ steps.ver.outputs.class }}
+          BRANCH: ${{ steps.ver.outputs.branch }}
+          VERIFY: ${{ steps.verify.outcome }}
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet; then
+            echo "::notice::No file changes after bump — skipping PR."
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(deps): bump llama-cpp-2 $CURRENT -> $LATEST"
+          git push origin "$BRANCH"
+
+          # Ready only for an in-range patch that passed the gate; everything
+          # else (new minor/major, or any failure) is a draft for a human.
+          DRAFT=0
+          STATUS_LINES=()
+          if [ "$CLASS" = "patch" ] && [ "$VERIFY" = "success" ]; then
+            STATUS_LINES+=("✅ In-range patch, \`test\` + \`clippy -D warnings\` green — **ready for release**.")
+          else
+            DRAFT=1
+            if [ "$CLASS" != "patch" ]; then
+              STATUS_LINES+=("⚠️ **${CLASS}** bump (outside the current \`${CURRENT%.*}\` requirement). Decide whether to take it, and whether spindll's own release bumps **minor**.")
+            fi
+            if [ "$VERIFY" != "success" ]; then
+              STATUS_LINES+=("❌ \`test\`/\`clippy\` failed on this bump — see the run logs. Not release-ready.")
+            fi
+          fi
+
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          {
+            echo "Automated by \`.github/workflows/llama-cpp-upgrade.yml\` (daily upstream check)."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| llama-cpp-2 | \`$CURRENT\` → \`$LATEST\` |"
+            echo "| class | \`$CLASS\` |"
+            echo "| verification | \`$VERIFY\` (test + clippy -D warnings, features \`cli,http\`) |"
+            echo
+            for line in "${STATUS_LINES[@]}"; do echo "$line"; echo; done
+            echo "### Before merging / releasing"
+            echo "- Review the upstream delta (and the bundled llama.cpp version): https://github.com/utilityai/llama-cpp-rs/releases"
+            echo "- MLX was **not** built here (Apple-only). If the bump touches shared engine paths, run \`scripts/mlx-validate.sh\` on a mac."
+            echo "- Releases are tag-driven (\`release.yml\`): set \`Cargo.toml\` \`version\` (patch vs minor — your call) to match a \`vX.Y.Z\` tag, then push the tag."
+            echo "- This PR only changes \`Cargo.toml\` / \`Cargo.lock\`; it does not bump the spindll version, push to \`$BASE_BRANCH\`, or tag."
+            echo
+            echo "_[Workflow run]($RUN_URL)_"
+          } > /tmp/pr-body.md
+
+          for L in dependencies needs-decision blocked; do
+            gh label create "$L" >/dev/null 2>&1 || true
+          done
+
+          LABELS=(--label dependencies)
+          [ "$CLASS" != "patch" ] && LABELS+=(--label needs-decision)
+          [ "$VERIFY" != "success" ] && LABELS+=(--label blocked)
+
+          CREATE=(--base "$BASE_BRANCH" --head "$BRANCH"
+                  --title "chore(deps): bump llama-cpp-2 to $LATEST"
+                  --body-file /tmp/pr-body.md "${LABELS[@]}")
+          [ "$DRAFT" = "1" ] && CREATE+=(--draft)
+
+          gh pr create "${CREATE[@]}"
