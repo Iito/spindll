@@ -206,17 +206,19 @@ jobs:
             echo "_[Workflow run]($RUN_URL)_"
           } > /tmp/pr-body.md
 
-          for L in dependencies needs-decision blocked; do
-            gh label create "$L" >/dev/null 2>&1 || true
-          done
-
-          LABELS=(--label dependencies)
-          [ "$CLASS" != "patch" ] && LABELS+=(--label needs-decision)
-          [ "$VERIFY" != "success" ] && LABELS+=(--label blocked)
-
+          # Create the PR first (no labels) so a label hiccup can never block it.
           CREATE=(--base "$BASE_BRANCH" --head "$BRANCH"
                   --title "chore(deps): bump llama-cpp-2 to $LATEST"
-                  --body-file /tmp/pr-body.md "${LABELS[@]}")
+                  --body-file /tmp/pr-body.md)
           [ "$DRAFT" = "1" ] && CREATE+=(--draft)
+          PR_URL=$(gh pr create "${CREATE[@]}")
+          echo "Opened $PR_URL"
 
-          gh pr create "${CREATE[@]}"
+          # Labels are best-effort: ensure they exist, then attach.
+          LABELS=(dependencies)
+          [ "$CLASS" != "patch" ] && LABELS+=(needs-decision)
+          [ "$VERIFY" != "success" ] && LABELS+=(blocked)
+          for L in "${LABELS[@]}"; do
+            gh label create "$L" -c ededed >/dev/null 2>&1 || true
+            gh pr edit "$PR_URL" --add-label "$L" >/dev/null 2>&1 || true
+          done
