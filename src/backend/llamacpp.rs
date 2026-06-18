@@ -236,10 +236,6 @@ impl BackendModel for LlamaCppModel {
         true
     }
 
-    fn supports_constrained_decoding(&self) -> bool {
-        true
-    }
-
     fn kv_bytes_per_token(&self) -> u64 {
         kv_bytes_per_token(&self.model)
     }
