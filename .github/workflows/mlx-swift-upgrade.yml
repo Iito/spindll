@@ -1,0 +1,233 @@
+# Daily check for new MLX Swift upstream (the Apple-Silicon backend's deps).
+#
+# The MLX bridge (mlx_bridge/) depends on two upstreams from ml-explore:
+#   - mlx-swift-lm  — pinned to `branch: main` in Package.swift (no semver tag),
+#                     so "new version" means a new commit on main.
+#   - mlx-swift     — the core array framework, a versioned transitive dep.
+#
+# What it does, once a day (and on manual dispatch):
+#   1. detect  (ubuntu): cheaply compare the locked mlx-swift-lm main revision and
+#      the mlx-swift tag in Package.resolved against upstream via `git ls-remote`.
+#   2. resolve (macOS, only if something moved): regenerate Package.resolved with
+#      `swift package update`, stage a spindll patch bump, and open a DRAFT PR
+#      against `next` labelled `mlx-validate-required`.
+#
+# MLX is Apple-only and, per the repo convention, is NOT built in CI — the bridge
+# is validated by hand on a mac (`scripts/mlx-validate.sh`). So this workflow only
+# refreshes the lockfile; it never builds MLX, never pushes to `next`, never tags.
+# A human runs the mac validation, then merges + pushes the `vX.Y.Z` tag. The
+# spindll patch bump is staged in the PR so that release version is ready on merge.
+#
+# Requirements:
+#   - Settings > Actions > General > "Allow GitHub Actions to create and approve
+#     pull requests" must be enabled (the default GITHUB_TOKEN opens the PR).
+
+name: MLX Swift upgrade check
+
+on:
+  schedule:
+    - cron: "0 7 * * *" # daily at 07:00 UTC (offset from the llama-cpp check)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Run the macOS resolve even if upstream hasn't moved (refreshes the lock)."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: mlx-swift-upgrade
+  cancel-in-progress: false
+
+env:
+  BASE_BRANCH: next
+  LM_REPO: https://github.com/ml-explore/mlx-swift-lm
+  CORE_REPO: https://github.com/ml-explore/mlx-swift
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.ver.outputs.proceed }}
+      branch: ${{ steps.ver.outputs.branch }}
+      moved: ${{ steps.ver.outputs.moved }}
+      lm_current: ${{ steps.ver.outputs.lm_current }}
+      core_current: ${{ steps.ver.outputs.core_current }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+
+      - name: Resolve current vs latest MLX upstream
+        id: ver
+        env:
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+
+          RESOLVED=mlx_bridge/Package.resolved
+          LM_CURRENT=$(jq -r '.pins[] | select(.identity=="mlx-swift-lm") | .state.revision' "$RESOLVED")
+          CORE_CURRENT=$(jq -r '.pins[] | select(.identity=="mlx-swift") | .state.version' "$RESOLVED")
+
+          # mlx-swift-lm is tracked on `main`, so "latest" is the head commit.
+          LM_LATEST=$(git ls-remote "$LM_REPO" refs/heads/main | awk '{print $1}')
+          # mlx-swift is tagged; take the highest semver tag (with or without `v`).
+          CORE_LATEST=$(git ls-remote --tags --refs --sort=-v:refname "$CORE_REPO" \
+            | sed -E 's#.*refs/tags/##' \
+            | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' \
+            | head -n1)
+          CORE_LATEST="${CORE_LATEST#v}"
+
+          echo "mlx-swift-lm  locked main: $LM_CURRENT"
+          echo "mlx-swift-lm  latest main: $LM_LATEST"
+          echo "mlx-swift     locked tag:  $CORE_CURRENT"
+          echo "mlx-swift     latest tag:  $CORE_LATEST"
+
+          if [ -z "$LM_LATEST" ]; then
+            echo "::error::Could not resolve latest mlx-swift-lm main from $LM_REPO."
+            exit 1
+          fi
+
+          {
+            echo "lm_current=$LM_CURRENT"
+            echo "core_current=$CORE_CURRENT"
+          } >> "$GITHUB_OUTPUT"
+
+          MOVED=""
+          if [ "$LM_CURRENT" != "$LM_LATEST" ]; then MOVED="mlx-swift-lm"; fi
+          if [ -n "$CORE_LATEST" ] && [ "$CORE_CURRENT" != "$CORE_LATEST" ]; then
+            MOVED="${MOVED:+$MOVED, }mlx-swift"
+          fi
+          echo "moved=$MOVED" >> "$GITHUB_OUTPUT"
+
+          BRANCH="deps/mlx-swift-${LM_LATEST:0:12}-core${CORE_LATEST:-na}"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+          if [ "${FORCE:-false}" = "true" ]; then
+            echo "::notice::Forced run — regenerating the lock on macOS regardless of upstream."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          elif [ -z "$MOVED" ]; then
+            echo "::notice::MLX upstream unchanged — nothing to do."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          elif git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "::notice::Branch $BRANCH already exists — bump already proposed. Skipping."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::MLX upstream moved: $MOVED."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  resolve:
+    needs: detect
+    if: needs.detect.outputs.proceed == 'true'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+          fetch-depth: 0
+
+      - name: Show toolchain
+        run: swift --version
+
+      - name: Update MLX pins (regenerate Package.resolved)
+        id: update
+        run: |
+          set -euo pipefail
+
+          # Update only the MLX upstreams; fall back to lm-only if this SwiftPM
+          # won't take the transitive core package by name. `swift package update`
+          # resolves + checks out — it does NOT build (MLX is validated on a mac).
+          swift package --package-path mlx_bridge update mlx-swift-lm mlx-swift \
+            || swift package --package-path mlx_bridge update mlx-swift-lm
+
+          if git diff --quiet -- mlx_bridge/Package.resolved; then
+            echo "::notice::swift package update produced no Package.resolved change — skipping PR."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+          LM_NEW=$(jq -r '.pins[] | select(.identity=="mlx-swift-lm") | .state.revision' mlx_bridge/Package.resolved)
+          CORE_NEW=$(jq -r '.pins[] | select(.identity=="mlx-swift") | .state.version' mlx_bridge/Package.resolved)
+          echo "lm_new=$LM_NEW" >> "$GITHUB_OUTPUT"
+          echo "core_new=$CORE_NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Stage spindll patch version
+        id: bump
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # `^version = ` matches only the [package] version (deps use inline
+          # `{ version = ... }`). macOS runner => BSD sed, so `-i ''`.
+          SP_CURRENT=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          SP_NEW=$(echo "$SP_CURRENT" | awk -F. '{printf "%d.%d.%d", $1, $2, $3 + 1}')
+          sed -i '' -E "s/^version = \"[^\"]+\"/version = \"$SP_NEW\"/" Cargo.toml
+          echo "sp_current=$SP_CURRENT" >> "$GITHUB_OUTPUT"
+          echo "sp_new=$SP_NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Open pull request
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ needs.detect.outputs.branch }}
+          MOVED: ${{ needs.detect.outputs.moved }}
+          LM_CURRENT: ${{ needs.detect.outputs.lm_current }}
+          CORE_CURRENT: ${{ needs.detect.outputs.core_current }}
+          LM_NEW: ${{ steps.update.outputs.lm_new }}
+          CORE_NEW: ${{ steps.update.outputs.core_new }}
+          SP_CURRENT: ${{ steps.bump.outputs.sp_current }}
+          SP_NEW: ${{ steps.bump.outputs.sp_new }}
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add mlx_bridge/Package.resolved Cargo.toml
+          git commit -m "chore(deps): update mlx-swift upstream" \
+                     -m "mlx-swift-lm ${LM_CURRENT:0:12} -> ${LM_NEW:0:12}; mlx-swift $CORE_CURRENT -> $CORE_NEW." \
+                     -m "Stage spindll $SP_CURRENT -> $SP_NEW (patch) for the release."
+          git push origin "$BRANCH"
+
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          {
+            echo "Automated by \`.github/workflows/mlx-swift-upgrade.yml\` (daily upstream check)."
+            echo
+            echo "⚠️ **Draft — MLX is not built in CI (Apple-only).** Validate on a mac before merging."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| mlx-swift-lm (main) | \`${LM_CURRENT:0:12}\` → \`${LM_NEW:0:12}\` |"
+            echo "| mlx-swift (tag) | \`$CORE_CURRENT\` → \`$CORE_NEW\` |"
+            echo "| spindll version | \`$SP_CURRENT\` → \`$SP_NEW\` (patch, staged) |"
+            echo "| moved | \`${MOVED:-—}\` |"
+            echo "| verification | none in CI — run \`scripts/mlx-validate.sh\` on a mac |"
+            echo
+            echo "### Before merging / releasing"
+            echo "- Run \`scripts/mlx-validate.sh\` on an Apple-Silicon mac (build + MLX tests). This PR was **not** built in CI."
+            echo "- Review the upstream deltas:"
+            echo "  - mlx-swift-lm: $LM_REPO/commits/main"
+            echo "  - mlx-swift: $CORE_REPO/releases"
+            echo "- Releases are tag-driven (\`release.yml\`): the spindll **patch** bump is staged, so push \`v$SP_NEW\` to release (promote to a **minor** first if the delta warrants it)."
+            echo "- This PR changes \`mlx_bridge/Package.resolved\` + \`Cargo.toml\` only; it does not push to \`$BASE_BRANCH\` or tag."
+            echo
+            echo "_[Workflow run]($RUN_URL)_"
+          } > /tmp/pr-body.md
+
+          # Always a draft: MLX must be mac-validated before it can be release-ready.
+          PR_URL=$(gh pr create --draft \
+            --base "$BASE_BRANCH" --head "$BRANCH" \
+            --title "chore(deps): update mlx-swift upstream" \
+            --body-file /tmp/pr-body.md)
+          echo "Opened $PR_URL"
+
+          # Labels are best-effort: ensure they exist, then attach.
+          for L in dependencies mlx-validate-required; do
+            gh label create "$L" -c ededed >/dev/null 2>&1 || true
+            gh pr edit "$PR_URL" --add-label "$L" >/dev/null 2>&1 || true
+          done
