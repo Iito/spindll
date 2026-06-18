@@ -29,9 +29,11 @@ enum Commands {
     },
 
     /// List local models
+    #[command(visible_alias = "ls")]
     List,
 
     /// Delete a local model
+    #[command(visible_alias = "remove")]
     Rm {
         /// Model name to delete
         model: String,
