@@ -1,20 +1,28 @@
 //! Backend-agnostic tool-calling support.
 //!
-//! Spindll owns tool-call *emission* (templating + constrained decoding +
-//! parsing); the *execution* loop belongs to the consumer. This module is the
-//! shared vocabulary so the HTTP (`/v1/chat/completions`) and gRPC (`Chat`)
-//! surfaces speak the same types instead of each re-implementing parsing.
+//! Spindll owns tool-call *emission* (prompt rendering + parsing); the
+//! *execution* loop belongs to the consumer. This module is the shared
+//! vocabulary so the HTTP (`/v1/chat/completions`) and gRPC (`Chat`) surfaces
+//! speak the same types and behave identically.
+//!
+//! Tool calls are driven by **prompt injection**: the specs are rendered into
+//! the system prompt and the model is asked to emit `<tool_call>{…}</tool_call>`
+//! JSON, which [`parse_tool_calls`] extracts. Model-native, grammar-constrained
+//! decoding is **not** wired today: `llama-cpp-2` exposed an OpenAI-compatible
+//! template + GBNF-grammar helper through 0.1.146 but **removed it in 0.1.150**,
+//! so there is currently no upstream way to derive a grammar from the tool
+//! schemas. Revisit if a later llama-cpp-2 restores that API.
 //!
 //! - [`ToolSpec`] / [`ToolChoice`] / [`ToolCall`] — the neutral request/response
 //!   types each API surface converts into.
-//! - [`tools_to_oai_json`] — render specs into the OpenAI-compatible tool array
-//!   string that `llama_cpp_2`'s `apply_chat_template_with_tools_oaicompat`
-//!   consumes (it returns a model-correct prompt + GBNF grammar).
+//! - [`tools_to_prompt`] — render specs + `tool_choice` into the system-prompt
+//!   preamble used for injection (the one place either surface describes tools).
+//! - [`tools_to_oai_json`] — render specs into the OpenAI `tools` JSON array
+//!   (embedded in that preamble; also handy for logging).
 //! - [`parse_tool_calls`] — extract calls from raw model output. Aware of the
 //!   common model wrappers (Hermes `<tool_call>`, Llama-3.1 `<|python_tag|>`,
-//!   Mistral `[TOOL_CALLS]`) with a balanced-JSON scan as the fallback. This is
-//!   the source of truth for extraction on every backend; on llama.cpp the
-//!   grammar makes the body reliable, but the wrapper tokens are model-specific.
+//!   Mistral `[TOOL_CALLS]`) with a balanced-JSON scan as the fallback. Source
+//!   of truth for extraction on every backend.
 
 use serde_json::Value;
 
@@ -79,19 +87,23 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
-/// Generate an OpenAI-style call id (`call_<hex>`).
+/// Generate an OpenAI-style call id (`call_<hex>`). Unique even when several
+/// calls are minted in the same nanosecond — a coarse clock (e.g. Windows) can
+/// repeat, so a process-wide sequence is mixed in.
 pub fn new_call_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("call_{nanos:016x}")
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("call_{nanos:016x}{seq:08x}")
 }
 
-/// Render specs into the OpenAI-compatible `tools` JSON array string consumed
-/// by `llama_cpp_2::LlamaModel::apply_chat_template_with_tools_oaicompat`.
-/// Returns `None` when there are no tools (so the caller passes `None` through
-/// and gets the plain, no-grammar template).
+/// Render specs into the OpenAI-compatible `tools` JSON array string. Embedded
+/// in the prompt by [`tools_to_prompt`] (and handy for logging/clients).
+/// Returns `None` when there are no tools.
 pub fn tools_to_oai_json(tools: &[ToolSpec]) -> Option<String> {
     if tools.is_empty() {
         return None;
@@ -115,6 +127,34 @@ pub fn tools_to_oai_json(tools: &[ToolSpec]) -> Option<String> {
         })
         .collect();
     serde_json::to_string(&arr).ok()
+}
+
+/// Render a system-prompt preamble describing the available tools and how to
+/// call them, honoring `tool_choice`. This is the prompt-injection path used by
+/// every backend (see the module docs — model-native grammar isn't available on
+/// llama-cpp-2 0.1.150). Returns `None` when there are no tools or `tool_choice`
+/// is [`ToolChoice::None`] — the caller then injects nothing and treats the turn
+/// as a plain completion.
+pub fn tools_to_prompt(tools: &[ToolSpec], choice: &ToolChoice) -> Option<String> {
+    if matches!(choice, ToolChoice::None) {
+        return None;
+    }
+    let tools_json = tools_to_oai_json(tools)?;
+    let directive = match choice {
+        ToolChoice::Required => {
+            "You MUST call one of the tools above before answering.".to_string()
+        }
+        ToolChoice::Named(name) => format!("You MUST call the tool \"{name}\"."),
+        _ => "Call a tool only when it helps answer the request; otherwise answer normally."
+            .to_string(),
+    };
+    Some(format!(
+        "You have access to the following tools (OpenAI JSON):\n{tools_json}\n\
+         {directive}\n\
+         To call a tool, emit a block exactly like \
+         <tool_call>{{\"name\": <tool name>, \"arguments\": <json object>}}</tool_call>. \
+         Multiple <tool_call> blocks are allowed."
+    ))
 }
 
 /// Extract tool calls from raw model output.
@@ -188,19 +228,24 @@ fn scan_json_calls(text: &str) -> (Vec<ToolCall>, String) {
     let mut search_from = 0;
 
     while search_from < text.len() {
-        if let Some(rel) = text[search_from..].find('{') {
-            let abs = search_from + rel;
-            if let Some(end) = find_json_end(text, abs)
-                && let Some(call) = call_from_json_str(&text[abs..end])
-            {
-                remaining.push_str(&text[search_from..abs]);
-                search_from = end;
-                calls.push(call);
-                continue;
-            }
+        let Some(rel) = text[search_from..].find('{') else {
+            // No more braces — the rest is plain text.
+            remaining.push_str(&text[search_from..]);
+            break;
+        };
+        let abs = search_from + rel;
+        if let Some(end) = find_json_end(text, abs)
+            && let Some(call) = call_from_json_str(&text[abs..end])
+        {
+            remaining.push_str(&text[search_from..abs]);
+            calls.push(call);
+            search_from = end;
+        } else {
+            // A `{` that doesn't open a valid tool call — keep it as text and
+            // resume scanning just past it, so a later real call isn't missed.
+            remaining.push_str(&text[search_from..=abs]);
+            search_from = abs + 1;
         }
-        remaining.push_str(&text[search_from..]);
-        break;
     }
 
     (calls, remaining.trim().to_string())
@@ -319,6 +364,22 @@ mod tests {
     }
 
     #[test]
+    fn tools_to_prompt_none_and_empty_are_none() {
+        let tools = vec![ToolSpec { name: "f".into(), description: None, parameters: None }];
+        assert_eq!(tools_to_prompt(&tools, &ToolChoice::None), None);
+        assert_eq!(tools_to_prompt(&[], &ToolChoice::Auto), None);
+    }
+
+    #[test]
+    fn tools_to_prompt_named_and_required_demand_a_call() {
+        let tools = vec![ToolSpec { name: "get_weather".into(), description: None, parameters: None }];
+        let named = tools_to_prompt(&tools, &ToolChoice::Named("get_weather".into())).unwrap();
+        assert!(named.contains("get_weather") && named.contains("<tool_call>"));
+        let required = tools_to_prompt(&tools, &ToolChoice::Required).unwrap();
+        assert!(required.contains("MUST call"));
+    }
+
+    #[test]
     fn parse_bare_object() {
         let (calls, rest) = parse_tool_calls(r#"{"name": "f", "arguments": {"x": 1}}"#);
         assert_eq!(calls.len(), 1);
@@ -395,6 +456,25 @@ mod tests {
         let (calls, rest) = parse_tool_calls(r#"{"foo": "bar"}"#);
         assert!(calls.is_empty());
         assert_eq!(rest, r#"{"foo": "bar"}"#);
+    }
+
+    #[test]
+    fn parse_skips_noncall_object_before_call() {
+        // A non-call JSON object must not abort the scan and swallow a later call.
+        let (calls, _) =
+            parse_tool_calls(r#"{"foo": "bar"} {"name": "f", "arguments": {"x": 1}}"#);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "f");
+        assert_eq!(calls[0].arguments, r#"{"x":1}"#);
+    }
+
+    #[test]
+    fn new_call_id_is_unique_per_call() {
+        // Back-to-back ids must differ even within a single nanosecond.
+        let a = new_call_id();
+        let b = new_call_id();
+        assert_ne!(a, b);
+        assert!(a.starts_with("call_") && b.starts_with("call_"));
     }
 
     #[test]
