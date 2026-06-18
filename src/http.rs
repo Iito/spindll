@@ -479,7 +479,7 @@ async fn oai_status(State(state): State<AppState>) -> impl IntoResponse {
 
     Json(serde_json::json!({
         "status": "ok",
-        "version": "0.6.0",
+        "version": env!("CARGO_PKG_VERSION"),
         "models": {
             "total": total_models,
             "loaded": loaded_models.len(),
