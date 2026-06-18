@@ -10,10 +10,13 @@ let package = Package(
     dependencies: [
         .package(
             url: "https://github.com/ml-explore/mlx-swift-lm",
-            // Pinned to a revision (not branch: "main") for reproducible builds.
-            // Must include upstream #268, which adds `@preconcurrency import
+            // Pinned to a main revision (not a tag) for reproducible builds:
+            // upstream's tags lag main by weeks, and the latest tag (3.31.3,
+            // 2026-04-15) predates #268, which adds `@preconcurrency import
             // CoreImage` so MLXVLM compiles under Swift 6 strict concurrency.
-            revision: "a47894a1e7e963b24bd48c030f5fc1d1627e60e9"
+            // This revision (main @ 2026-06-17) keeps #268 and adds the
+            // Gemma 4 / VLM-prefill / Qwen3.5 batch.
+            revision: "0767814d29254017f348e4b97b770d974e291d0e"
         ),
         // Needed so `import Tokenizers` is in scope when `#huggingFaceTokenizerLoader()` expands.
         .package(
