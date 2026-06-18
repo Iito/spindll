@@ -9,9 +9,10 @@
 #        - new minor/major, or any failure            -> DRAFT PR, labelled for a
 #          human decision (this is the "whether we bump minor depends" gate).
 #
-# It never bumps the spindll version, never pushes to `next`, and never tags a
-# release. Releases stay tag-driven (see release.yml): a human sets Cargo.toml
-# `version` (patch vs minor) and pushes `vX.Y.Z`.
+# It bumps spindll's own patch version to stage a release, but never pushes to
+# `next` and never tags. Releases stay tag-driven (see release.yml): a human
+# reviews/merges this PR, then pushes the matching `vX.Y.Z` tag (promote it to a
+# minor first if the upstream delta warrants — the PR body says so).
 #
 # Requirements:
 #   - Settings > Actions > General > "Allow GitHub Actions to create and approve
@@ -115,7 +116,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.ver.outputs.proceed == 'true'
 
-      - name: Bump llama-cpp-2
+      - name: Bump llama-cpp-2 and stage spindll patch version
+        id: bump
         if: steps.ver.outputs.proceed == 'true'
         env:
           LATEST: ${{ steps.ver.outputs.latest }}
@@ -134,7 +136,16 @@ jobs:
           cargo update -p llama-cpp-2 --precise "$LATEST"
           cargo update -p llama-cpp-sys-2 --precise "$LATEST" || true
 
-          echo "---- Cargo.toml ----"; grep -n 'llama-cpp' Cargo.toml || true
+          # Stage a spindll patch bump so the release version is ready on merge.
+          # `^version = ` matches only the [package] version (deps use inline
+          # `{ version = ... }`), so the lone top-level version line is safe to edit.
+          SP_CURRENT=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          SP_NEW=$(echo "$SP_CURRENT" | awk -F. '{printf "%d.%d.%d", $1, $2, $3 + 1}')
+          sed -i -E "s/^version = \"[^\"]+\"/version = \"$SP_NEW\"/" Cargo.toml
+          echo "sp_current=$SP_CURRENT" >> "$GITHUB_OUTPUT"
+          echo "sp_new=$SP_NEW" >> "$GITHUB_OUTPUT"
+
+          echo "---- Cargo.toml ----"; grep -nE '^version|llama-cpp' Cargo.toml || true
           echo "---- Cargo.lock ----"; grep -A1 '^name = "llama-cpp-2"' Cargo.lock || true
 
       - name: Verify (test + clippy)
@@ -155,6 +166,8 @@ jobs:
           CLASS: ${{ steps.ver.outputs.class }}
           BRANCH: ${{ steps.ver.outputs.branch }}
           VERIFY: ${{ steps.verify.outcome }}
+          SP_CURRENT: ${{ steps.bump.outputs.sp_current }}
+          SP_NEW: ${{ steps.bump.outputs.sp_new }}
         run: |
           set -euo pipefail
 
@@ -167,7 +180,8 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "$BRANCH"
           git add Cargo.toml Cargo.lock
-          git commit -m "chore(deps): bump llama-cpp-2 $CURRENT -> $LATEST"
+          git commit -m "chore(deps): bump llama-cpp-2 $CURRENT -> $LATEST" \
+                     -m "Stage spindll $SP_CURRENT -> $SP_NEW (patch) for the release."
           git push origin "$BRANCH"
 
           # Ready only for an in-range patch that passed the gate; everything
@@ -179,7 +193,7 @@ jobs:
           else
             DRAFT=1
             if [ "$CLASS" != "patch" ]; then
-              STATUS_LINES+=("⚠️ **${CLASS}** bump (outside the current \`${CURRENT%.*}\` requirement). Decide whether to take it, and whether spindll's own release bumps **minor**.")
+              STATUS_LINES+=("⚠️ **${CLASS}** bump (outside the current \`${CURRENT%.*}\` requirement). Decide whether to take it, and whether to promote the staged spindll **patch** bump to a **minor**.")
             fi
             if [ "$VERIFY" != "success" ]; then
               STATUS_LINES+=("❌ \`test\`/\`clippy\` failed on this bump — see the run logs. Not release-ready.")
@@ -193,6 +207,7 @@ jobs:
             echo "| | |"
             echo "|---|---|"
             echo "| llama-cpp-2 | \`$CURRENT\` → \`$LATEST\` |"
+            echo "| spindll version | \`$SP_CURRENT\` → \`$SP_NEW\` (patch, staged) |"
             echo "| class | \`$CLASS\` |"
             echo "| verification | \`$VERIFY\` (test + clippy -D warnings, features \`cli,http\`) |"
             echo
@@ -200,8 +215,8 @@ jobs:
             echo "### Before merging / releasing"
             echo "- Review the upstream delta (and the bundled llama.cpp version): https://github.com/utilityai/llama-cpp-rs/releases"
             echo "- MLX was **not** built here (Apple-only). If the bump touches shared engine paths, run \`scripts/mlx-validate.sh\` on a mac."
-            echo "- Releases are tag-driven (\`release.yml\`): set \`Cargo.toml\` \`version\` (patch vs minor — your call) to match a \`vX.Y.Z\` tag, then push the tag."
-            echo "- This PR only changes \`Cargo.toml\` / \`Cargo.lock\`; it does not bump the spindll version, push to \`$BASE_BRANCH\`, or tag."
+            echo "- Releases are tag-driven (\`release.yml\`): the spindll **patch** bump is already staged, so push \`v$SP_NEW\` to release. Promote it to a **minor** first (edit \`Cargo.toml\` \`version\`) if this upstream delta warrants it."
+            echo "- This PR changes \`Cargo.toml\` / \`Cargo.lock\` only (llama-cpp-2 lock + staged spindll version); it does not push to \`$BASE_BRANCH\` or tag."
             echo
             echo "_[Workflow run]($RUN_URL)_"
           } > /tmp/pr-body.md
