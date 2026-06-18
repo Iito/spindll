@@ -341,7 +341,8 @@ impl BackendModel for LlamaCppModel {
         // Create bitmaps from image bytes.
         let bitmaps: Vec<MtmdBitmap> = image_bytes.iter()
             .map(|data| {
-                MtmdBitmap::from_buffer(mtmd_ctx, data)
+                // placeholder = false → decode the actual pixels (preserves pre-0.1.150 behavior)
+                MtmdBitmap::from_buffer(mtmd_ctx, data, false)
                     .map_err(|e| anyhow::anyhow!("failed to create bitmap: {e}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
