@@ -161,6 +161,12 @@ impl Engine {
 }
 
 /// Apply a model's chat template, falling back to ChatML if none is embedded.
+///
+/// Some templates — notably Gemma's — reject a standalone `system` role and make
+/// llama.cpp's apply return an FFI error (`ffi error -1`). When that happens and
+/// a system message is present, retry with the system content folded into the
+/// first user turn (the shape those models expect) instead of failing the
+/// request.
 pub(crate) fn apply_chat_template_with_fallback(
     model: &LlamaModel,
     messages: &[(String, String)],
@@ -176,6 +182,31 @@ pub(crate) fn apply_chat_template_with_fallback(
         }
     };
 
+    match render_chat(model, &tmpl, messages) {
+        Ok(rendered) => Ok(rendered),
+        Err(first_err) if has_system_message(messages) => {
+            tracing::debug!(
+                "chat template rejected the system role; folding it into the first user turn"
+            );
+            render_chat(model, &tmpl, &fold_system_into_user(messages)).map_err(|retry_err| {
+                anyhow::anyhow!(
+                    "failed to apply chat template: {first_err} \
+                     (also failed after folding the system role into the user turn: {retry_err})"
+                )
+            })
+        }
+        Err(e) => Err(anyhow::anyhow!("failed to apply chat template: {e}")),
+    }
+}
+
+/// Build `LlamaChatMessage`s and render them with `tmpl` (assistant generation
+/// prompt appended). Returns the raw backend error so the caller can decide
+/// whether to retry.
+fn render_chat(
+    model: &LlamaModel,
+    tmpl: &llama_cpp_2::model::LlamaChatTemplate,
+    messages: &[(String, String)],
+) -> anyhow::Result<String> {
     let chat_messages: Vec<llama_cpp_2::model::LlamaChatMessage> = messages
         .iter()
         .map(|(role, content)| {
@@ -183,10 +214,42 @@ pub(crate) fn apply_chat_template_with_fallback(
                 .map_err(|e| anyhow::anyhow!("invalid chat message: {e}"))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(model.apply_chat_template(tmpl, &chat_messages, true)?)
+}
 
-    model
-        .apply_chat_template(&tmpl, &chat_messages, true)
-        .map_err(|e| anyhow::anyhow!("failed to apply chat template: {e}"))
+/// True if any message carries the `system` role.
+fn has_system_message(messages: &[(String, String)]) -> bool {
+    messages.iter().any(|(role, _)| role == "system")
+}
+
+/// Fold every `system` message into the first following `user` turn — the shape
+/// Gemma-style templates (which forbid a standalone system role) expect. System
+/// text is prepended to the first user message; with no user message present it
+/// becomes one.
+fn fold_system_into_user(messages: &[(String, String)]) -> Vec<(String, String)> {
+    let mut system_parts: Vec<&str> = Vec::new();
+    let mut rest: Vec<(String, String)> = Vec::new();
+    for (role, content) in messages {
+        if role == "system" {
+            if !content.is_empty() {
+                system_parts.push(content);
+            }
+        } else {
+            rest.push((role.clone(), content.clone()));
+        }
+    }
+    if system_parts.is_empty() {
+        return rest;
+    }
+    let system_text = system_parts.join("\n\n");
+    match rest.iter().position(|(role, _)| role == "user") {
+        Some(idx) => {
+            let merged = format!("{system_text}\n\n{}", rest[idx].1);
+            rest[idx].1 = merged;
+        }
+        None => rest.insert(0, ("user".to_string(), system_text)),
+    }
+    rest
 }
 
 /// Suppress llama.cpp's built-in stderr logging.
@@ -228,5 +291,59 @@ unsafe extern "C" fn noop_llama_log(
         tracing::error!(target: "llama_cpp", "{msg}");
     } else {
         tracing::warn!(target: "llama_cpp", "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod chat_template_tests {
+    use super::{fold_system_into_user, has_system_message};
+
+    fn m(role: &str, content: &str) -> (String, String) {
+        (role.to_string(), content.to_string())
+    }
+
+    #[test]
+    fn folds_system_into_first_user() {
+        let folded = fold_system_into_user(&[
+            m("system", "Be terse."),
+            m("user", "Hi"),
+            m("assistant", "Hello"),
+            m("user", "Bye"),
+        ]);
+        assert_eq!(folded.len(), 3);
+        assert_eq!(folded[0], m("user", "Be terse.\n\nHi"));
+        assert_eq!(folded[1].0, "assistant");
+        assert_eq!(folded[2], m("user", "Bye"));
+        assert!(!has_system_message(&folded));
+    }
+
+    #[test]
+    fn system_only_becomes_user() {
+        assert_eq!(
+            fold_system_into_user(&[m("system", "Rules.")]),
+            vec![m("user", "Rules.")]
+        );
+    }
+
+    #[test]
+    fn system_without_user_inserts_user_turn() {
+        let folded = fold_system_into_user(&[m("system", "Ctx"), m("assistant", "ok")]);
+        assert_eq!(folded[0], m("user", "Ctx"));
+        assert_eq!(folded[1], m("assistant", "ok"));
+    }
+
+    #[test]
+    fn multiple_systems_joined() {
+        assert_eq!(
+            fold_system_into_user(&[m("system", "A"), m("system", "B"), m("user", "Q")]),
+            vec![m("user", "A\n\nB\n\nQ")]
+        );
+    }
+
+    #[test]
+    fn no_system_left_unchanged() {
+        let msgs = vec![m("user", "Hi"), m("assistant", "Hello")];
+        assert_eq!(fold_system_into_user(&msgs), msgs);
+        assert!(!has_system_message(&msgs));
     }
 }
