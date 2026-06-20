@@ -87,6 +87,29 @@ fn resolve_n_ctx(
     resolve_n_ctx_pure(requested, n_ctx_train, kv_bytes_per_token(model), weights, memory_budget)
 }
 
+/// Look for a sidecar chat-template file next to the model and return its
+/// contents, to be used as a chat-template override.
+///
+/// Convention: a file named `<model-file-name>.jinja` in the same directory as
+/// the model (e.g. `model.gguf.jinja`). The contents may be a raw Jinja
+/// template or a built-in template name such as `gemma` or `chatml` — both are
+/// accepted by `LlamaChatTemplate`. This mirrors llama.cpp's
+/// `--chat-template-file` / Ollama's `TEMPLATE` and lets a model shipping a
+/// broken template be fixed in place. Returns `None` when no sidecar exists.
+fn load_chat_template_override(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    let sidecar = path.with_file_name(format!("{file_name}.jinja"));
+    let contents = std::fs::read_to_string(&sidecar).ok()?;
+    if contents.trim().is_empty() {
+        return None;
+    }
+    tracing::info!(
+        template_file = %sidecar.display(),
+        "using sidecar chat-template override"
+    );
+    Some(contents.trim().to_string())
+}
+
 pub struct LlamaCppBackend;
 
 impl LlamaCppBackend {
@@ -160,6 +183,7 @@ impl InferenceBackend for LlamaCppBackend {
             n_ctx_train,
             size_bytes,
             gpu_layers,
+            chat_template_override: load_chat_template_override(path),
             #[cfg(feature = "vision")]
             mtmd_ctx,
         }))
@@ -176,6 +200,9 @@ pub struct LlamaCppModel {
     n_ctx_train: u32,
     size_bytes: u64,
     gpu_layers: u32,
+    /// Optional chat-template override loaded from a sidecar `.jinja` file next
+    /// to the model. Takes precedence over the GGUF's embedded template.
+    chat_template_override: Option<String>,
     #[cfg(feature = "vision")]
     mtmd_ctx: Option<MtmdContext>,
 }
@@ -217,7 +244,7 @@ impl BackendModel for LlamaCppModel {
         &self,
         messages: &[(String, String)],
     ) -> anyhow::Result<String> {
-        apply_chat_template_with_fallback(&self.model, messages)
+        apply_chat_template_with_fallback(&self.model, messages, self.chat_template_override.as_deref())
     }
 
     fn n_ctx(&self) -> u32 {
@@ -336,7 +363,11 @@ impl BackendModel for LlamaCppModel {
         }
 
         // Apply the model's chat template to get the final prompt string.
-        let prompt = apply_chat_template_with_fallback(&self.model, &template_messages)?;
+        let prompt = apply_chat_template_with_fallback(
+            &self.model,
+            &template_messages,
+            self.chat_template_override.as_deref(),
+        )?;
 
         // Create bitmaps from image bytes.
         let bitmaps: Vec<MtmdBitmap> = image_bytes.iter()
