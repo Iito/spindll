@@ -32,7 +32,7 @@ Models are loaded automatically on first request, or explicitly via the `Load` R
 - **Multi-model** -- multiple models loaded concurrently, LRU eviction when budget exceeded
 - **Continuous batching** -- concurrent requests to the same model share a single context via sequence IDs
 - **KV cache** -- disk-backed prefix caching with optional ChaCha20-Poly1305 encryption at rest
-- **Chat template fallback** -- reads template from GGUF metadata, falls back to ChatML for models without one
+- **Chat templates** -- reads the template from GGUF metadata, falls back to ChatML, and honors a `<model>.jinja` sidecar override (raw Jinja or a built-in name like `gemma`) for models shipping a broken or missing template
 - **GGUF metadata** -- extracts model name, description, and architecture from file headers
 - **Memory-aware** -- configurable budget; budget-aware n_ctx auto-resolution at load time prevents silent OOMs
 - **GPU acceleration** -- Metal (macOS) auto-detected, CUDA / Vulkan (Linux) supported
