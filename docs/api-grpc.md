@@ -22,7 +22,7 @@ See [`proto/spindll.proto`](../proto/spindll.proto) for full message definitions
 
 **Generate** -- streaming text completion from a raw prompt.
 
-**Chat** -- streaming chat completion from a message history. Applies the model's built-in chat template (falls back to ChatML). Supports an optional `encryption_key` for encrypted KV cache isolation.
+**Chat** -- streaming chat completion from a message history. Applies the model's built-in chat template (falls back to ChatML). Supports tool calling (`tools` / `tool_choice` in, `tool_calls` out — see [Tool calling](#tool-calling)) and an optional `encryption_key` for encrypted KV cache isolation.
 
 **Prefill** -- encode a prompt into the KV cache without generating tokens. Used by orchestrators to pre-warm the cache before the user's request arrives.
 
@@ -52,3 +52,35 @@ enum EvictionPriority {
 **Pull** -- download a model. `PullRequest.quantization` is honored when set; empty triggers the q4_k_m-first priority picker. The server handler always uses `FormatPreference::Auto` (MLX-first on Apple Silicon, GGUF fallback).
 
 **Status** -- returns loaded models, memory info (RAM/VRAM), device list, and engine metrics (cache hit rate, tokens/second, request counts).
+
+## Tool calling
+
+`ChatRequest` carries the same tool calling as the OpenAI `/v1` surface — prompt-injection based (see [api-openai.md](api-openai.md)):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tools` | repeated `Tool` | Tool definitions (`name`, `description`, `parameters_json` — a JSON Schema string) |
+| `tool_choice` | string | `"none"` / `"auto"` / `"required"` / a function name |
+
+Parsed calls arrive on the final `ChatResponse` (the `done: true` frame):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tool_calls` | repeated `ToolCall` | Parsed calls (`id`, `name`, `arguments` JSON string) |
+| `finish_reason` | string | `"tool_calls"` when a call fired, else `"stop"` |
+
+```protobuf
+message Tool {
+  string name = 1;
+  string description = 2;      // optional
+  string parameters_json = 3;  // JSON Schema for the arguments (optional)
+}
+
+message ToolCall {
+  string id = 1;
+  string name = 2;
+  string arguments = 3;  // JSON string (OpenAI shape)
+}
+```
+
+Tokens stream as usual; when tools are active the server buffers output, parses the calls, and emits them (plus any leftover prose) on the final frame.

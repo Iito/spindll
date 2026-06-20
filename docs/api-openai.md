@@ -93,11 +93,11 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 | `top_p` | float | no | 0.95 |
 | `seed` | integer | no | 42 |
 | `tools` | array of tool objects | no | |
-| `tool_choice` | string or object | no | (accepted, not yet enforced) |
+| `tool_choice` | string or object | no | `"auto"` when tools present |
 
 ### Tool / function calling
 
-Pass `tools` to enable function calling. Tool definitions are injected into the prompt and the model's output is parsed for tool call JSON.
+Pass `tools` to enable function calling. Tool definitions are injected into the system prompt (Spindll uses prompt injection, not a model-native grammar — see the note below) and the model's output is parsed back into tool calls, recognizing the common wrapper formats (Hermes `<tool_call>`, Llama-3.1 `<|python_tag|>`, Mistral `[TOOL_CALLS]`) as well as bare JSON.
 
 ```bash
 curl -X POST http://localhost:8080/v1/chat/completions \
@@ -158,9 +158,10 @@ Send tool results back as a `tool` role message:
 ```
 
 **Notes:**
-- Tool calling works best with models fine-tuned for it (Llama 3.1+, Qwen 2.5+, Mistral v0.3+)
-- `tool_choice` is accepted for compatibility but not yet used to constrain selection
-- When streaming with tools, output is buffered to parse tool calls before sending
+- Tool calling works best with models fine-tuned for it (Llama 3.1+, Qwen 2.5+, Mistral v0.3+).
+- `tool_choice` is honored: `"none"` disables tools entirely (no injection, no parsing); `"auto"` (the default when `tools` is present) lets the model decide; `"required"` and `{"type": "function", "function": {"name": …}}` instruct the model to call a tool. Without a grammar these are prompt-level guidance, not a hard constraint.
+- Emission is **prompt-injection only** — llama.cpp's OpenAI-compatible chat-template + GBNF-grammar helper was removed in llama-cpp-2 0.1.150, so there is no model-native grammar constraint today.
+- Streaming with tools: output is buffered to parse the calls, then emitted as OpenAI-style **incremental** `tool_calls` deltas (per-call `index`, then `id`/`name`, then `arguments`).
 
 ## POST /v1/completions
 
