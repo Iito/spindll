@@ -43,8 +43,8 @@ Models are loaded automatically on first request, or explicitly via the `Load` R
 ```
 spindll search <query> [--limit N]     # search HuggingFace + Ollama, ranked by hardware
 spindll pull <model> [flags]          # pull from Ollama registry or HuggingFace
-spindll list                          # show local models with metadata
-spindll rm <model> [flags]            # delete a local model (prompts for external sources)
+spindll list                          # show local models with metadata (alias: ls)
+spindll rm <model> [flags]            # delete a local model, alias: remove (prompts for external sources)
 spindll run <model> "prompt" [flags]   # one-shot inference (no server)
 spindll bench <model> [other]         # benchmark one or two models (debug builds only)
 spindll serve [options]               # start gRPC + HTTP server

@@ -12,44 +12,17 @@ All notable changes to this project will be documented in this file.
   - `GET /v1/models/{id}` endpoint for per-model config queries
   - `GET /v1/status` endpoint for server status with model inventory
 - **Run command chat template and system prompt** — `spindll run` now uses the model's chat template (via `generate_chat`) and injects a default system prompt ("You are a helpful assistant."). Add `--system` flag to override, `--max-tokens` to control output length.
+- **Tool / function calling** — `tools` and `tool_choice` on the OpenAI `/v1/chat/completions` API and the gRPC `Chat` RPC. Prompt-injection based: tool specs are rendered into the system prompt and the model's output (`<tool_call>` / Hermes / Llama-3.1 / Mistral wrappers) is parsed back into OpenAI-shaped calls. `tool_choice` is honored (`none` disables tools; `required` / named instruct the model); streaming emits incremental `tool_calls` deltas.
+- **CLI `ls` / `remove` aliases** — `spindll ls` aliases `list`; `spindll remove` aliases `rm`.
 
 ### Refactored
 
 - **Budget calculation clarity** — extracted `MemoryBudget::load_budget_with_scheduler()` method to clarify the interaction between configured budgets, available RAM, and scheduler overhead. Added regression tests for default-mode clamping behavior (PR #47 follow-up).
 - **Max-tokens default handling** — `--max-tokens` in run command is optional (no clap default) to avoid duplicating `GenerateParams::default().max_tokens` (512). Falls back to library default when not provided (PR #46 follow-up).
-
-## [0.6.0] - 2026-05-30
-
-### Added
-
-- **Model source tracking** — registry tracks how each model entered Spindll (downloaded from Ollama/HuggingFace, imported from local Ollama/HF cache, or manually imported). Five source types enable multi-engine compatibility.
-- **Extended import command** — `spindll import --from-hf` discovers models in local HuggingFace cache; `spindll import "/path/to/model"` validates and symlinks arbitrary GGUF/MLX files.
-- **Smart model cleanup** — `spindll rm` auto-deletes models Spindll owns, prompts for externally-managed models. `--purge` flag skips confirmation; users can respond "no" to keep models registered.
-- **Registry v2 migration** — auto-detects and infers source types for existing models on first load, ensuring backward compatibility with 0.5.1 registries.
-- **Embeddings support** — `POST /v1/embeddings` OpenAI-compatible endpoint; MLX and GGUF embedding extraction with input validation and rate limiting.
-- **MLX prompt cache disk tier** — extends prompt cache beyond RAM with adaptive quantization; longest-prefix-match reuse (not exact match); freshest cache kept near-lossless.
-- **Search command** — `spindll search <query>` across HuggingFace + Ollama with hardware-aware ranking, quant-aware sizing, FITS column, and `--format`/`--sort` flags.
-- **Device/GPU selection** — `--device` flag for serve/run commands; device-aware backend selection and per-model GPU pinning.
-- **Improved benchmarking** — before-after merge gate mode, separate decode tok/s from total tok/s, auto-detect platform features.
 
 ### Fixed
 
-- **KV cache hardening** — fixed cross-tenant RAM leak, sampling crashes (hit and miss paths), hardened restore paths.
-- **Embeddings refinements** — array-len cap, right-size n_batch, OpenAI compat fixes, separate error counters.
-- **Search ranking** — rank by total system RAM on dedicated GPU, current available on shared; backfill HF model sizes from API and safetensors metadata.
-
-### Added
-
-- **AnythingLLM native provider support** — enhanced OpenAI API with per-model metadata:
-  - `GET /v1/models` now includes architecture, context_length, format, size_bytes, capabilities, created timestamp
-  - `GET /v1/models/{id}` endpoint for per-model config queries
-  - `GET /v1/status` endpoint for server status with model inventory
-- **Run command chat template and system prompt** — `spindll run` now uses the model's chat template (via `generate_chat`) and injects a default system prompt ("You are a helpful assistant."). Add `--system` flag to override, `--max-tokens` to control output length.
-
-### Refactored
-
-- **Budget calculation clarity** — extracted `MemoryBudget::load_budget_with_scheduler()` method to clarify the interaction between configured budgets, available RAM, and scheduler overhead. Added regression tests for default-mode clamping behavior (PR #47 follow-up).
-- **Max-tokens default handling** — `--max-tokens` in run command is optional (no clap default) to avoid duplicating `GenerateParams::default().max_tokens` (512). Falls back to library default when not provided (PR #46 follow-up).
+- **Gemma chat template** — fold the `system` role into the first user turn when the model's template rejects a standalone system role, fixing `failed to apply chat template: ffi error -1` on Gemma. Also unblocks tool calling on Gemma (which injects a system preamble).
 
 ## [0.6.0] - 2026-05-30
 
