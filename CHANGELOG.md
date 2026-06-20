@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
 - **Run command chat template and system prompt** — `spindll run` now uses the model's chat template (via `generate_chat`) and injects a default system prompt ("You are a helpful assistant."). Add `--system` flag to override, `--max-tokens` to control output length.
 - **Tool / function calling** — `tools` and `tool_choice` on the OpenAI `/v1/chat/completions` API and the gRPC `Chat` RPC. Prompt-injection based: tool specs are rendered into the system prompt and the model's output (`<tool_call>` / Hermes / Llama-3.1 / Mistral wrappers) is parsed back into OpenAI-shaped calls. `tool_choice` is honored (`none` disables tools; `required` / named instruct the model); streaming emits incremental `tool_calls` deltas.
 - **CLI `ls` / `remove` aliases** — `spindll ls` aliases `list`; `spindll remove` aliases `rm`.
+- **Sidecar chat-template override** — the llama.cpp backend now loads a `<model-file>.jinja` sidecar next to the model and uses it in place of the GGUF's embedded chat template. Contents may be a raw Jinja template or a built-in name (e.g. `gemma`, `chatml`). Mirrors llama.cpp's `--chat-template-file` and lets a model shipping a broken or unusable template be corrected without re-quantizing.
 
 ### Refactored
 

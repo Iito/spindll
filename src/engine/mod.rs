@@ -111,7 +111,7 @@ impl Engine {
         &self,
         messages: &[(String, String)],
     ) -> anyhow::Result<String> {
-        apply_chat_template_with_fallback(&self.model, messages)
+        apply_chat_template_with_fallback(&self.model, messages, None)
     }
 
     /// Enable the disk-backed KV cache with the given maximum size in bytes.
@@ -167,19 +167,30 @@ impl Engine {
 /// a system message is present, retry with the system content folded into the
 /// first user turn (the shape those models expect) instead of failing the
 /// request.
+///
+/// `override_tmpl`, when set, takes precedence over the model's embedded
+/// template. It may be a raw Jinja template or a built-in template name (e.g.
+/// "gemma", "chatml") — `LlamaChatTemplate::new` accepts both. This lets a
+/// model that ships a broken or unusable chat template be corrected without
+/// re-quantizing it (see the sidecar `.jinja` convention in the llama.cpp backend).
 pub(crate) fn apply_chat_template_with_fallback(
     model: &LlamaModel,
     messages: &[(String, String)],
+    override_tmpl: Option<&str>,
 ) -> anyhow::Result<String> {
     use llama_cpp_2::model::LlamaChatTemplate;
 
-    let tmpl = match model.chat_template(None) {
-        Ok(t) => t,
-        Err(_) => {
-            tracing::debug!("model has no chat template, using ChatML fallback");
-            LlamaChatTemplate::new("chatml")
-                .map_err(|e| anyhow::anyhow!("failed to create ChatML template: {e}"))?
-        }
+    let tmpl = match override_tmpl {
+        Some(t) => LlamaChatTemplate::new(t)
+            .map_err(|e| anyhow::anyhow!("invalid chat-template override: {e}"))?,
+        None => match model.chat_template(None) {
+            Ok(t) => t,
+            Err(_) => {
+                tracing::debug!("model has no chat template, using ChatML fallback");
+                LlamaChatTemplate::new("chatml")
+                    .map_err(|e| anyhow::anyhow!("failed to create ChatML template: {e}"))?
+            }
+        },
     };
 
     match render_chat(model, &tmpl, messages) {
