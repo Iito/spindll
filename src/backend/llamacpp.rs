@@ -7,9 +7,15 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
+#[cfg(feature = "vision")]
+use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText, mtmd_default_marker};
+#[cfg(feature = "vision")]
+use llama_cpp_2::sampling::LlamaSampler;
 
 use crate::engine::streaming::{GenerateParams, GenerateResult, generate_streaming};
 use crate::engine::apply_chat_template_with_fallback;
+#[cfg(feature = "vision")]
+use crate::engine::multimodal::{ContentPart, MultimodalMessage};
 use super::traits::{BackendLoadParams, BackendModel, EmbedResult, InferenceBackend};
 
 static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
@@ -81,6 +87,29 @@ fn resolve_n_ctx(
     resolve_n_ctx_pure(requested, n_ctx_train, kv_bytes_per_token(model), weights, memory_budget)
 }
 
+/// Look for a sidecar chat-template file next to the model and return its
+/// contents, to be used as a chat-template override.
+///
+/// Convention: a file named `<model-file-name>.jinja` in the same directory as
+/// the model (e.g. `model.gguf.jinja`). The contents may be a raw Jinja
+/// template or a built-in template name such as `gemma` or `chatml` — both are
+/// accepted by `LlamaChatTemplate`. This mirrors llama.cpp's
+/// `--chat-template-file` / Ollama's `TEMPLATE` and lets a model shipping a
+/// broken template be fixed in place. Returns `None` when no sidecar exists.
+fn load_chat_template_override(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    let sidecar = path.with_file_name(format!("{file_name}.jinja"));
+    let contents = std::fs::read_to_string(&sidecar).ok()?;
+    if contents.trim().is_empty() {
+        return None;
+    }
+    tracing::info!(
+        template_file = %sidecar.display(),
+        "using sidecar chat-template override"
+    );
+    Some(contents.trim().to_string())
+}
+
 pub struct LlamaCppBackend;
 
 impl LlamaCppBackend {
@@ -134,12 +163,29 @@ impl InferenceBackend for LlamaCppBackend {
             "model loaded"
         );
 
+        #[cfg(feature = "vision")]
+        let mtmd_ctx = if let Some(ref mmproj_path) = params.mmproj_path {
+            let mmproj_str = mmproj_path.to_str()
+                .ok_or_else(|| anyhow::anyhow!("mmproj path is not valid UTF-8"))?;
+            let mtmd_params = MtmdContextParams::default();
+            let ctx = MtmdContext::init_from_file(mmproj_str, &model, &mtmd_params)
+                .map_err(|e| anyhow::anyhow!("failed to init multimodal context: {e}"))?;
+            anyhow::ensure!(ctx.support_vision(), "mmproj loaded but model does not support vision");
+            tracing::info!(mmproj = %mmproj_path.display(), "vision pipeline initialised");
+            Some(ctx)
+        } else {
+            None
+        };
+
         Ok(Box::new(LlamaCppModel {
             model,
             n_ctx,
             n_ctx_train,
             size_bytes,
             gpu_layers,
+            chat_template_override: load_chat_template_override(path),
+            #[cfg(feature = "vision")]
+            mtmd_ctx,
         }))
     }
 
@@ -154,6 +200,11 @@ pub struct LlamaCppModel {
     n_ctx_train: u32,
     size_bytes: u64,
     gpu_layers: u32,
+    /// Optional chat-template override loaded from a sidecar `.jinja` file next
+    /// to the model. Takes precedence over the GGUF's embedded template.
+    chat_template_override: Option<String>,
+    #[cfg(feature = "vision")]
+    mtmd_ctx: Option<MtmdContext>,
 }
 
 impl LlamaCppModel {
@@ -193,7 +244,7 @@ impl BackendModel for LlamaCppModel {
         &self,
         messages: &[(String, String)],
     ) -> anyhow::Result<String> {
-        apply_chat_template_with_fallback(&self.model, messages)
+        apply_chat_template_with_fallback(&self.model, messages, self.chat_template_override.as_deref())
     }
 
     fn n_ctx(&self) -> u32 {
@@ -271,6 +322,142 @@ impl BackendModel for LlamaCppModel {
         Ok(EmbedResult {
             embedding,
             prompt_tokens: n_tokens as u32,
+        })
+    }
+
+    #[cfg(feature = "vision")]
+    fn supports_vision(&self) -> bool {
+        self.mtmd_ctx.is_some()
+    }
+
+    #[cfg(feature = "vision")]
+    fn generate_multimodal(
+        &self,
+        messages: &[MultimodalMessage],
+        params: &GenerateParams,
+        on_token: &mut dyn FnMut(&str) -> bool,
+    ) -> anyhow::Result<GenerateResult> {
+        let mtmd_ctx = self.mtmd_ctx.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("model was not loaded with a multimodal projector"))?;
+
+        let marker = mtmd_default_marker();
+
+        // Build (role, text_with_markers) pairs for the chat template, and
+        // collect image bytes in the order markers appear.
+        let mut template_messages: Vec<(String, String)> = Vec::with_capacity(messages.len());
+        // Borrow, don't clone: `from_buffer` copies internally; `messages` outlives use.
+        let mut image_bytes: Vec<&[u8]> = Vec::new();
+
+        for msg in messages {
+            let mut text = String::new();
+            for part in &msg.content {
+                match part {
+                    ContentPart::Text(t) => text.push_str(t),
+                    ContentPart::ImageBytes { data, .. } => {
+                        text.push_str(marker);
+                        image_bytes.push(data.as_slice());
+                    }
+                }
+            }
+            template_messages.push((msg.role.clone(), text));
+        }
+
+        // Apply the model's chat template to get the final prompt string.
+        let prompt = apply_chat_template_with_fallback(
+            &self.model,
+            &template_messages,
+            self.chat_template_override.as_deref(),
+        )?;
+
+        // Create bitmaps from image bytes.
+        let bitmaps: Vec<MtmdBitmap> = image_bytes.iter()
+            .map(|data| {
+                // placeholder = false → decode the actual pixels (preserves pre-0.1.150 behavior)
+                MtmdBitmap::from_buffer(mtmd_ctx, data, false)
+                    .map_err(|e| anyhow::anyhow!("failed to create bitmap: {e}"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let bitmap_refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
+
+        // Tokenize prompt + images into interleaved chunks.
+        let input_text = MtmdInputText {
+            text: prompt,
+            add_special: true,
+            parse_special: true,
+        };
+        let chunks = mtmd_ctx.tokenize(input_text, &bitmap_refs)
+            .map_err(|e| anyhow::anyhow!("multimodal tokenization failed: {e}"))?;
+
+        let prompt_tokens = chunks.total_tokens() as u32;
+        tracing::info!(prompt_tokens, n_chunks = chunks.len(), "multimodal tokenized");
+
+        // Create a fresh context for this request.
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(self.n_ctx))
+            .with_n_batch(self.n_ctx);
+        let mut ctx = self.model
+            .new_context(shared_backend(), ctx_params)
+            .map_err(|e| anyhow::anyhow!("failed to create context: {e}"))?;
+
+        // Evaluate all chunks (text + image embeddings) into the context.
+        let n_past = chunks.eval_chunks(
+            mtmd_ctx,
+            &ctx,
+            0,                    // n_past
+            0,                    // seq_id
+            self.n_ctx as i32,    // n_batch
+            true,                 // logits_last
+        ).map_err(|e| anyhow::anyhow!("multimodal eval failed: {e}"))?;
+
+        if params.prefill_only {
+            return Ok(GenerateResult {
+                prompt_tokens,
+                completion_tokens: 0,
+                cache_hit: false,
+            });
+        }
+
+        // Sampling loop — identical to the text path.
+        let mut sampler = LlamaSampler::chain_simple([
+            LlamaSampler::temp(params.temperature),
+            LlamaSampler::top_k(params.top_k),
+            LlamaSampler::top_p(params.top_p, 1),
+            LlamaSampler::dist(params.seed),
+        ]);
+
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut completion_tokens = 0u32;
+
+        // `n_cur` is the KV-cache position of the token being decoded; it starts
+        // just past the prompt (`n_past`) and advances one slot per generated token.
+        for (n_cur, _) in (n_past..).zip(0..params.max_tokens) {
+            // -1 = last logits row. `eval_chunks` emits logits only at the final
+            // position; the single-token decodes below put theirs there too.
+            let token = sampler.sample(&ctx, -1);
+            sampler.accept(token);
+
+            if self.model.is_eog_token(token) {
+                break;
+            }
+
+            completion_tokens += 1;
+            let piece = self.model
+                .token_to_piece(token, &mut decoder, true, None)
+                .map_err(|e| anyhow::anyhow!("token decode error: {e}"))?;
+
+            if !on_token(&piece) {
+                break;
+            }
+
+            let mut batch = llama_cpp_2::llama_batch::LlamaBatch::new(1, 1);
+            batch.add(token, n_cur, &[0], true)?;
+            ctx.decode(&mut batch)?;
+        }
+
+        Ok(GenerateResult {
+            prompt_tokens,
+            completion_tokens,
+            cache_hit: false,
         })
     }
 }

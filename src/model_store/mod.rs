@@ -16,8 +16,10 @@ use std::path::PathBuf;
 
 /// Caller-specified format preference for `pull()`.
 #[derive(Debug, Clone, PartialEq)]
+#[derive(Default)]
 pub enum FormatPreference {
     /// Let the platform decide: MLX on Apple Silicon, GGUF elsewhere.
+    #[default]
     Auto,
     /// Force GGUF regardless of platform.
     Gguf,
@@ -25,11 +27,6 @@ pub enum FormatPreference {
     Mlx,
 }
 
-impl Default for FormatPreference {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
 
 /// Local model store backed by `~/.spindll` (or a custom directory).
 ///
@@ -168,6 +165,7 @@ impl ModelStore {
             format: registry::ModelFormat::Mlx,
             base_model,
             source: registry::ModelSource::HfSourceDownloaded,
+            mmproj_path: None,
         });
         reg.save(&self.registry_path())?;
 
@@ -180,13 +178,13 @@ impl ModelStore {
         let is_hf = model.contains('/');
 
         // --- Download & detect format ---
-        let (path, size_bytes, key, digest, format) = if is_hf {
+        let (path, size_bytes, key, digest, format, mmproj_path) = if is_hf {
             let dest_dir = self.model_dir(model);
             match download::download_hf_auto(model, quant, &dest_dir)? {
-                download::HfDownload::Gguf { path, filename, size, digest } => {
+                download::HfDownload::Gguf { path, filename, size, digest, mmproj_path } => {
                     download::validate_gguf(&path)?;
                     let key = format!("{}/{}", model, filename);
-                    (path, size, key, digest, registry::ModelFormat::Gguf)
+                    (path, size, key, digest, registry::ModelFormat::Gguf, mmproj_path)
                 }
                 download::HfDownload::Mlx { dir, size, digest } => {
                     if strict_gguf {
@@ -201,7 +199,7 @@ impl ModelStore {
                         );
                     }
                     let key = model.to_string();
-                    (dir, size, key, digest, registry::ModelFormat::Mlx)
+                    (dir, size, key, digest, registry::ModelFormat::Mlx, None)
                 }
             }
         } else {
@@ -211,7 +209,7 @@ impl ModelStore {
             download::validate_gguf(&path)?;
             let filename = path.file_name().unwrap().to_string_lossy();
             let key = format!("ollama/{name}/{filename}");
-            (path, size, key, digest, registry::ModelFormat::Gguf)
+            (path, size, key, digest, registry::ModelFormat::Gguf, None)
         };
 
         // --- Read metadata ---
@@ -253,6 +251,7 @@ impl ModelStore {
             format,
             base_model,
             source,
+            mmproj_path,
         });
         reg.save(&self.registry_path())?;
 
@@ -304,8 +303,8 @@ impl ModelStore {
         let arch_w  = rows.iter().map(|r| r.3.len()).max().unwrap_or(0).max("ARCH".len()) + PADDING;
 
         println!(
-            "{:<model_w$} {:<5} {:>10}  {:<arch_w$}  {}",
-            "MODEL", "FMT", "SIZE", "ARCH", "DESCRIPTION"
+            "{:<model_w$} {:<5} {:>10}  {:<arch_w$}  DESCRIPTION",
+            "MODEL", "FMT", "SIZE", "ARCH"
         );
         let total_w = model_w + 1 + 5 + 1 + 10 + 2 + arch_w + 2 + "DESCRIPTION".len();
         println!("{}", "-".repeat(total_w));
@@ -354,7 +353,7 @@ impl ModelStore {
         }
 
         // 5. Match by base_model (finds MLX entries for Ollama-style names)
-        let normalized = model.replace(':', "-").replace(' ', "-");
+        let normalized = model.replace([':', ' '], "-");
         if let Some((key, _)) = reg.models.iter().find(|(_, e)| {
             !e.base_model.is_empty() && e.base_model.eq_ignore_ascii_case(&normalized)
         }) {
@@ -389,6 +388,38 @@ impl ModelStore {
         let key = self.resolve_key(model)?;
         let reg = registry::Registry::load(&self.registry_path())?;
         Ok(reg.models[&key].digest.clone())
+    }
+
+    /// Resolve the mmproj path for a model.
+    ///
+    /// Returns the stored `mmproj_path` from the registry entry if present,
+    /// otherwise scans the model's directory for `*mmproj*.gguf` files.
+    pub fn resolve_mmproj_path(&self, model: &str) -> anyhow::Result<Option<PathBuf>> {
+        let key = self.resolve_key(model)?;
+        let reg = registry::Registry::load(&self.registry_path())?;
+        let entry = &reg.models[&key];
+
+        // Return stored path if present and still exists on disk.
+        if let Some(ref stored) = entry.mmproj_path
+            && stored.exists() {
+                return Ok(Some(stored.clone()));
+            }
+
+        // Auto-discover: scan the model's parent directory.
+        let search_dir = if entry.path.is_dir() {
+            // MLX or directory-based model — scan the model directory itself.
+            entry.path.clone()
+        } else {
+            // GGUF file — scan its parent directory.
+            entry.path.parent().map(|p| p.to_path_buf()).unwrap_or_default()
+        };
+
+        if search_dir.is_dir()
+            && let Some(found) = discover_mmproj(&search_dir) {
+                return Ok(Some(found));
+            }
+
+        Ok(None)
     }
 
     /// Import all models from Ollama's local storage.
@@ -467,6 +498,7 @@ impl ModelStore {
                         format: registry::ModelFormat::Gguf,
                         base_model,
                         source: registry::ModelSource::OllamaImported,
+                        mmproj_path: None,
                     },
                 );
                 println!("imported {name}:{tag} ({:.1} GB)", layer.size as f64 / 1_073_741_824.0);
@@ -498,8 +530,9 @@ impl ModelStore {
             // Find GGUF or MLX models in this snapshot
             let gguf_files: Vec<_> = std::fs::read_dir(&snapshot_path)?
                 .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map_or(false, |ext| ext == "gguf"))
+                .filter(|e| is_primary_gguf(&e.path()))
                 .collect();
+            let mmproj_path = discover_mmproj(&snapshot_path);
 
             let is_mlx_dir = snapshot_path.join("model.safetensors").exists()
                 && snapshot_path.join("config.json").exists();
@@ -513,17 +546,19 @@ impl ModelStore {
                     std::fs::create_dir_all(&dest_dir)?;
                     let dest = dest_dir.join(&filename);
 
-                    if !dest.exists() {
-                        #[cfg(unix)]
-                        std::os::unix::fs::symlink(&gguf_path, &dest)?;
-                        #[cfg(windows)]
-                        if std::fs::hard_link(&gguf_path, &dest).is_err() {
-                            std::fs::copy(&gguf_path, &dest)?;
-                        }
-                    }
+                    link_or_copy_if_missing(&gguf_path, &dest)?;
+                    let imported_mmproj_path =
+                        materialize_mmproj(mmproj_path.as_deref(), &dest_dir)?;
 
                     let key = format!("{}/{}", repo_id, filename);
-                    if !reg.models.contains_key(&key) {
+                    if let Some(entry) = reg.models.get_mut(&key) {
+                        if entry.format == registry::ModelFormat::Gguf
+                            && entry.source == registry::ModelSource::HfImported
+                            && imported_mmproj_path.is_some()
+                        {
+                            entry.mmproj_path = imported_mmproj_path;
+                        }
+                    } else {
                         let (gguf_name, gguf_desc, gguf_arch, gguf_ctx) =
                             registry::read_gguf_metadata(&dest);
                         let base_model = derive_base_model(&gguf_name, &repo_id);
@@ -549,6 +584,7 @@ impl ModelStore {
                                 format: registry::ModelFormat::Gguf,
                                 base_model,
                                 source: registry::ModelSource::HfImported,
+                                mmproj_path: imported_mmproj_path,
                             },
                         );
                         println!("imported {}/{}", repo_id, filename);
@@ -559,12 +595,7 @@ impl ModelStore {
                 // MLX model
                 let dest_dir = self.model_dir(&repo_id);
                 if !dest_dir.exists() {
-                    #[cfg(unix)]
-                    std::os::unix::fs::symlink(&snapshot_path, &dest_dir)?;
-                    #[cfg(windows)]
-                    if std::fs::hard_link(&snapshot_path, &dest_dir).is_err() {
-                        std::fs::copy(&snapshot_path, &dest_dir)?;
-                    }
+                    link_or_copy_path(&snapshot_path, &dest_dir)?;
                 }
 
                 let key = repo_id.clone();
@@ -591,6 +622,7 @@ impl ModelStore {
                             format: registry::ModelFormat::Mlx,
                             base_model: repo_id.clone(),
                             source: registry::ModelSource::HfImported,
+                            mmproj_path: None,
                         },
                     );
                     println!("imported mlx model: {}", repo_id);
@@ -644,12 +676,7 @@ impl ModelStore {
         // Symlink the source into the manual namespace. On unix this covers
         // both a GGUF file and an MLX directory; windows falls back to a copy.
         if !dest.exists() {
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&path, &dest)?;
-            #[cfg(windows)]
-            if std::fs::hard_link(&path, &dest).is_err() {
-                std::fs::copy(&path, &dest)?;
-            }
+            link_or_copy_path(&path, &dest)?;
         }
 
         let (model_name, description, architecture, context_length, size) = match format {
@@ -689,6 +716,7 @@ impl ModelStore {
                 format,
                 base_model,
                 source: registry::ModelSource::ManuallyImported,
+                mmproj_path: None,
             },
         );
         reg.save(&self.registry_path())?;
@@ -757,6 +785,7 @@ impl ModelStore {
 ///
 /// - `ollama/nemotron-3-nano/4b.gguf` → `nemotron-3-nano:4b`
 /// - `TheBloke/Llama-3-8B-GGUF/model.gguf` → `TheBloke/Llama-3-8B-GGUF:model`
+///
 /// Derive a canonical base model name from GGUF metadata or the user-provided model string.
 ///
 /// Prefers `general.name` from GGUF metadata (most reliable), falling back to
@@ -797,12 +826,11 @@ pub fn display_name(key: &str, entry: &registry::ModelEntry) -> String {
         registry::ModelFormat::Gguf => {
             // Ollama: registry key is `ollama/<name>/<tag>.gguf` → `<name>:<tag>`.
             let parts: Vec<&str> = key.splitn(3, '/').collect();
-            if let [provider, name, file] = parts.as_slice() {
-                if *provider == "ollama" {
+            if let [provider, name, file] = parts.as_slice()
+                && *provider == "ollama" {
                     let tag = file.strip_suffix(".gguf").unwrap_or(file);
                     return format!("{name}:{tag}");
                 }
-            }
             // HF: `<repo> (<quant>)` when we can detect the quant, else just repo.
             let base = if entry.repo.is_empty() { key } else { entry.repo.as_str() };
             match download::extract_quant(&entry.filename) {
@@ -811,6 +839,94 @@ pub fn display_name(key: &str, entry: &registry::ModelEntry) -> String {
             }
         }
     }
+}
+
+/// Scan a directory for a multimodal projector GGUF file (`*mmproj*.gguf`).
+///
+/// Returns the path to the first match, or `None` if no mmproj file is found.
+pub fn discover_mmproj(dir: &std::path::Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_lower = name.to_string_lossy().to_lowercase();
+        if name_lower.contains("mmproj") && name_lower.ends_with(".gguf") {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
+fn is_primary_gguf(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "gguf")
+        && !path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().to_lowercase().contains("mmproj"))
+}
+
+fn materialize_mmproj(
+    src: Option<&std::path::Path>,
+    dest_dir: &std::path::Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    let Some(src) = src else {
+        return Ok(None);
+    };
+    let file_name = src
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("mmproj path has no file name: {}", src.display()))?;
+    let dest = dest_dir.join(file_name);
+    link_or_copy_if_missing(src, &dest)?;
+    Ok(Some(dest))
+}
+
+fn link_or_copy_if_missing(
+    src: &std::path::Path,
+    dest: &std::path::Path,
+) -> anyhow::Result<()> {
+    let should_link = match std::fs::symlink_metadata(dest) {
+        Ok(meta) if meta.file_type().is_symlink() && !dest.exists() => {
+            std::fs::remove_file(dest)?;
+            true
+        }
+        Ok(_) => false,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(err) => return Err(err.into()),
+    };
+    if should_link {
+        link_or_copy_path(src, dest)?;
+    }
+    Ok(())
+}
+
+fn link_or_copy_path(src: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(src, dest)?;
+    }
+    #[cfg(windows)]
+    {
+        if src.is_dir() {
+            copy_dir_all(src, dest)?;
+        } else if std::fs::hard_link(src, dest).is_err() {
+            std::fs::copy(src, dest)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn copy_dir_all(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let target = dest.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
 }
 
 /// Returns true if this platform should prefer MLX over GGUF.
@@ -840,6 +956,80 @@ mod tests {
         reg.save(path).unwrap();
     }
 
+    #[test]
+    fn primary_gguf_filter_skips_mmproj() {
+        assert!(is_primary_gguf(std::path::Path::new("model-q4_k_m.gguf")));
+        assert!(!is_primary_gguf(std::path::Path::new("mmproj-model-f16.gguf")));
+    }
+
+    #[test]
+    fn materialize_mmproj_stores_projector_next_to_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let hf_cache = dir.path().join("hf-cache");
+        let store_dir = dir.path().join("models/repo");
+        std::fs::create_dir_all(&hf_cache).unwrap();
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let src = hf_cache.join("mmproj-model-f16.gguf");
+        std::fs::write(&src, b"fake").unwrap();
+
+        let stored = materialize_mmproj(Some(&src), &store_dir)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stored, store_dir.join("mmproj-model-f16.gguf"));
+        assert!(stored.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_mmproj_replaces_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let hf_cache = dir.path().join("hf-cache");
+        let store_dir = dir.path().join("models/repo");
+        std::fs::create_dir_all(&hf_cache).unwrap();
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let src = hf_cache.join("mmproj-model-f16.gguf");
+        std::fs::write(&src, b"fake").unwrap();
+        let dest = store_dir.join("mmproj-model-f16.gguf");
+        std::os::unix::fs::symlink(dir.path().join("deleted"), &dest).unwrap();
+
+        let stored = materialize_mmproj(Some(&src), &store_dir)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stored, dest);
+        assert_eq!(std::fs::read(stored).unwrap(), b"fake");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_or_copy_if_missing_replaces_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("model.gguf");
+        let dest = dir.path().join("store/model.gguf");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"fake").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("deleted"), &dest).unwrap();
+
+        link_or_copy_if_missing(&src, &dest).unwrap();
+
+        assert_eq!(std::fs::read(dest).unwrap(), b"fake");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn link_or_copy_path_copies_directory_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let nested = src.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("model.safetensors"), b"fake").unwrap();
+        let dest = dir.path().join("dest");
+
+        link_or_copy_path(&src, &dest).unwrap();
+        assert_eq!(std::fs::read(dest.join("nested/model.safetensors")).unwrap(), b"fake");
+    }
+
     fn mlx_entry(repo: &str, base_model: &str) -> ModelEntry {
         ModelEntry {
             repo: repo.to_string(),
@@ -856,6 +1046,7 @@ mod tests {
             format: ModelFormat::Mlx,
             base_model: base_model.to_string(),
             source: registry::ModelSource::HfSourceDownloaded,
+            mmproj_path: None,
         }
     }
 
@@ -953,6 +1144,7 @@ mod tests {
             format: ModelFormat::Gguf,
             base_model: String::new(),
             source: registry::ModelSource::HfSourceDownloaded,
+            mmproj_path: None,
         }
     }
 

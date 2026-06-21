@@ -244,6 +244,7 @@ async fn run_once_grpc(
         messages: vec![Message {
             role: "user".to_string(),
             content: prompt.to_string(),
+            parts: vec![],
         }],
         params: Some(GenerateParams {
             temperature: Some(args.temperature),
@@ -272,11 +273,10 @@ async fn run_once_grpc(
             text.push_str(&resp.token);
         }
         if resp.done {
-            if let Some(usage) = resp.usage {
-                if usage.completion_tokens > 0 {
+            if let Some(usage) = resp.usage
+                && usage.completion_tokens > 0 {
                     tokens_from_usage = Some(usage.completion_tokens as u32);
                 }
-            }
             break;
         }
     }

@@ -135,61 +135,68 @@ jobs:
   # name: ${{ matrix.artifact }}
   # path: dist/${{ matrix.artifact }}.zip
 
-  # # ---------------------------------------------------------------------------
-  # # Windows Vulkan builds — AMD & Intel (single binary covers both)
-  # # ---------------------------------------------------------------------------
-  # build-windows-vulkan:
-  # name: Windows Vulkan
-  # needs: test
-  # runs-on: windows-latest
-  # steps:
-  # - uses: actions/checkout@v4
-  # with:
-  # submodules: recursive
+  # ---------------------------------------------------------------------------
+  # Windows Vulkan build — AMD & Intel (single binary covers both)
+  # ---------------------------------------------------------------------------
+  build-windows-vulkan:
+    name: Windows Vulkan
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-  # - name: Install Rust
-  # uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
-  # - name: Install protoc
-  # uses: arduino/setup-protoc@v3
-  # with:
-  # repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-  # - name: Install Vulkan SDK
-  # uses: humbletim/setup-vulkan-sdk@v1.2.0
-  # with:
-  # vulkan-query-version: 1.3.290.0
-  # vulkan-components: Vulkan-Headers, Vulkan-Loader
-  # vulkan-use-cache: true
+      - name: Install Vulkan SDK
+        shell: pwsh
+        env:
+          VULKAN_VERSION: 1.3.290.0
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sdkRoot = "C:\VulkanSDK\$env:VULKAN_VERSION"
+          $installer = Join-Path $env:RUNNER_TEMP "VulkanSDK-$env:VULKAN_VERSION-Installer.exe"
+          Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/VulkanSDK-$env:VULKAN_VERSION-Installer.exe" -OutFile $installer
+          & $installer --root $sdkRoot --accept-licenses --default-answer --confirm-command install
+          "VULKAN_SDK=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$sdkRoot\Bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-  # - name: Install LLVM (bindgen)
-  # uses: KyleMayes/install-llvm-action@v2
-  # with:
-  # version: '17'
+      - name: Install LLVM (bindgen)
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: '17'
 
-  # - uses: Swatinem/rust-cache@v2
-  # with:
-  # key: windows-vulkan
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-vulkan
+          cache-targets: false
 
-  # - name: Build
-  # shell: pwsh
-  # env:
-  # LIBCLANG_PATH: ${{ env.LLVM_PATH }}/bin
-  # run: cargo build --release --features cli,http,vulkan
+      - name: Build
+        shell: pwsh
+        env:
+          LIBCLANG_PATH: ${{ env.LLVM_PATH }}/bin
+        run: cargo build --release --features cli,http,vulkan,vision
 
-  # - name: Package binary
-  # shell: bash
-  # run: |
-  # mkdir -p dist
-  # cp target/release/spindll.exe dist/
-  # cd dist
-  # 7z a "spindll-windows-vulkan.zip" spindll.exe
-  # rm spindll.exe
+      - name: Package binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/spindll.exe dist/
+          cd dist
+          7z a "spindll-windows-vulkan.zip" spindll.exe
+          rm spindll.exe
 
-  # - uses: actions/upload-artifact@v4
-  # with:
-  # name: spindll-windows-vulkan
-  # path: dist/spindll-windows-vulkan.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spindll-windows-vulkan
+          path: dist/spindll-windows-vulkan.zip
 
   # # ---------------------------------------------------------------------------
   # # Linux CUDA builds — per NVIDIA architecture
@@ -259,47 +266,47 @@ jobs:
   # name: ${{ matrix.artifact }}
   # path: dist/${{ matrix.artifact }}.tar.gz
 
-  # # ---------------------------------------------------------------------------
-  # # Linux Vulkan builds — AMD & Intel
-  # # ---------------------------------------------------------------------------
-  # build-linux-vulkan:
-  # name: Linux Vulkan
-  # needs: test
-  # runs-on: ubuntu-latest
-  # steps:
-  # - uses: actions/checkout@v4
-  # with:
-  # submodules: recursive
+  # ---------------------------------------------------------------------------
+  # Linux Vulkan build — AMD & Intel
+  # ---------------------------------------------------------------------------
+  build-linux-vulkan:
+    name: Linux Vulkan
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-  # - name: Install Rust
-  # uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
-  # - name: Install system dependencies
-  # run: |
-  # sudo apt-get update && sudo apt-get install -y cmake protobuf-compiler ninja-build libclang-dev libvulkan-dev
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y cmake protobuf-compiler ninja-build libclang-dev libvulkan-dev
 
-  # - uses: Swatinem/rust-cache@v2
-  # with:
-  # key: linux-vulkan
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-vulkan
 
-  # - name: Build
-  # env:
-  # CMAKE_GENERATOR: Ninja
-  # run: cargo build --release --features cli,http,vulkan
+      - name: Build
+        env:
+          CMAKE_GENERATOR: Ninja
+        run: cargo build --release --features cli,http,vulkan,vision
 
-  # - name: Package binary
-  # shell: bash
-  # run: |
-  # mkdir -p dist
-  # cp target/release/spindll dist/
-  # cd dist
-  # tar czf "spindll-linux-vulkan.tar.gz" spindll
-  # rm spindll
+      - name: Package binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/spindll dist/
+          cd dist
+          tar czf "spindll-linux-vulkan.tar.gz" spindll
+          rm spindll
 
-  # - uses: actions/upload-artifact@v4
-  # with:
-  # name: spindll-linux-vulkan
-  # path: dist/spindll-linux-vulkan.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spindll-linux-vulkan
+          path: dist/spindll-linux-vulkan.tar.gz
 
   # # ---------------------------------------------------------------------------
   # # macOS ARM (Metal + MLX)
@@ -324,7 +331,7 @@ jobs:
           key: macos-arm64
 
       - name: Build
-        run: cargo build --release --features cli,http,mlx
+        run: cargo build --release --features cli,http,mlx,vision
 
       - name: Package binary
         shell: bash
@@ -410,7 +417,7 @@ jobs:
   # path: dist/spindll-*
 
   release:
-    needs: [test, build-macos]
+    needs: [build-macos, build-windows-vulkan, build-linux-vulkan]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

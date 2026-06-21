@@ -118,13 +118,11 @@ pub fn discover_hf_models(hf_cache_dir: &Path) -> anyhow::Result<Vec<(String, Pa
 
         // Find the latest snapshot (just pick the first one for now)
         if let Ok(snapshots_iter) = std::fs::read_dir(&snapshots) {
-            for snapshot_entry in snapshots_iter {
-                if let Ok(snapshot_entry) = snapshot_entry {
-                    let snapshot_path = snapshot_entry.path();
-                    if snapshot_entry.file_type()?.is_dir() {
-                        models.push((repo_id.clone(), snapshot_path));
-                        break; // Use only the first snapshot
-                    }
+            for snapshot_entry in snapshots_iter.flatten() {
+                let snapshot_path = snapshot_entry.path();
+                if snapshot_entry.file_type()?.is_dir() {
+                    models.push((repo_id.clone(), snapshot_path));
+                    break; // Use only the first snapshot
                 }
             }
         }

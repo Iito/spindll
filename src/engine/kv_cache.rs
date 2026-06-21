@@ -668,10 +668,10 @@ mod tests {
         let path = dir.path().join("magic_only.llstate");
 
         // Just the magic byte, no payload
-        std::fs::write(&path, &[COMPRESSED_PLAIN_MAGIC]).unwrap();
+        std::fs::write(&path, [COMPRESSED_PLAIN_MAGIC]).unwrap();
         assert!(load_state_from_disk(&path, None).is_none());
 
-        std::fs::write(&path, &[COMPRESSED_ENCRYPTED_MAGIC]).unwrap();
+        std::fs::write(&path, [COMPRESSED_ENCRYPTED_MAGIC]).unwrap();
         let key: [u8; 32] = [0x01; 32];
         assert!(load_state_from_disk(&path, Some(&key)).is_none());
     }
@@ -680,7 +680,7 @@ mod tests {
     fn unknown_magic_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("unknown.llstate");
-        std::fs::write(&path, &[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+        std::fs::write(&path, [0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
         assert!(load_state_from_disk(&path, None).is_none());
     }
 
@@ -716,9 +716,8 @@ mod tests {
         // zstd::decode_all reads exactly one frame; trailing garbage should
         // either be ignored (returning valid data) or cause an error.
         // Either way, it must not panic.
-        match load_state_from_disk(&path, None) {
-            Some(loaded) => assert_eq!(&loaded, data),
-            None => {} // also acceptable
+        if let Some(loaded) = load_state_from_disk(&path, None) {
+            assert_eq!(&loaded, data); // None is also acceptable
         }
     }
 

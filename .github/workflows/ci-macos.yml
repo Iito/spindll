@@ -1,0 +1,63 @@
+# CI coverage for the Apple-Silicon MLX path.
+#
+# The MLX Swift bridge + colocated Metal shaders only build on aarch64 macOS
+# (build.rs gates on target_os="macos", target_arch="aarch64", feature="mlx"),
+# so the ubuntu/windows matrix in ci.yml never exercises them. This job builds
+# `--features cli,http,mlx,vision` and runs the lib tests on macos-15 (arm64) —
+# the same surface scripts/mlx-validate.sh checks by hand, gated in CI so a
+# Swift 6 / MLX compile break can't slip through unnoticed.
+#
+# Path-scoped to MLX-relevant changes (incl. mlx_bridge/**, which ci.yml omits)
+# so a Swift-bridge-only change runs ONLY this job, not the Linux/Windows matrix.
+name: CI (macOS)
+
+on:
+  pull_request:
+    branches: [main, next]
+    paths:
+      - "src/**"
+      - "proto/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "mlx_bridge/**"
+      - ".github/workflows/ci-macos.yml"
+  workflow_dispatch:
+
+# macOS runner minutes bill ~10x Linux — cancel superseded runs on the same ref.
+concurrency:
+  group: ci-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mlx-build:
+    name: build + test (mlx,vision)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: brew install cmake protobuf
+
+      - name: Locate libclang (Xcode toolchain, for bindgen / vision)
+        run: echo "LIBCLANG_PATH=$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-mlx
+
+      - name: Build (mlx + vision)
+        run: cargo build --features cli,http,mlx,vision
+
+      - name: Test (lib)
+        run: cargo test --features cli,http,mlx,vision --lib

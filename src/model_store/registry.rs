@@ -18,8 +18,10 @@ pub enum ModelFormat {
 /// How the model entered Spindll's registry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ModelSource {
     /// Downloaded from Ollama registry via `spindll pull "ollama/model:tag"`.
+    #[default]
     OllamaSourceDownloaded,
     /// Downloaded from HuggingFace via `spindll pull "owner/repo"`.
     HfSourceDownloaded,
@@ -31,11 +33,6 @@ pub enum ModelSource {
     ManuallyImported,
 }
 
-impl Default for ModelSource {
-    fn default() -> Self {
-        Self::OllamaSourceDownloaded
-    }
-}
 
 /// Metadata for a single model tracked in the registry.
 #[derive(Debug, Serialize, Deserialize)]
@@ -80,6 +77,10 @@ pub struct ModelEntry {
     /// Defaults to OllamaSourceDownloaded for backward compatibility.
     #[serde(default)]
     pub source: ModelSource,
+    /// Path to the multimodal projector GGUF, if one was downloaded or
+    /// discovered alongside the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mmproj_path: Option<PathBuf>,
 }
 
 /// Sum the sizes of all files in a directory (non-recursive, follows symlinks).
@@ -178,15 +179,14 @@ impl Registry {
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         if path.exists() {
             let data = std::fs::read_to_string(path)?;
-            if let Ok(on_disk) = serde_json::from_str::<Self>(&data) {
-                if on_disk.version > CURRENT_VERSION {
+            if let Ok(on_disk) = serde_json::from_str::<Self>(&data)
+                && on_disk.version > CURRENT_VERSION {
                     anyhow::bail!(
                         "registry was written by a newer spindll (version {}); \
                          refusing to overwrite — upgrade spindll first",
                         on_disk.version
                     );
                 }
-            }
         }
         let data = serde_json::to_string_pretty(self)?;
         std::fs::write(path, data)?;
@@ -229,19 +229,17 @@ impl Registry {
                 // Check if it's a symlink to external location
                 if let Ok(target) = std::fs::read_link(&entry.path) {
                     // Check Ollama cache
-                    if let Some(ref blobs) = ollama_blobs {
-                        if target.starts_with(blobs) {
+                    if let Some(ref blobs) = ollama_blobs
+                        && target.starts_with(blobs) {
                             entry.source = ModelSource::OllamaImported;
                             continue;
                         }
-                    }
                     // Check HuggingFace cache
-                    if let Some(ref hf) = hf_cache {
-                        if target.starts_with(hf) {
+                    if let Some(ref hf) = hf_cache
+                        && target.starts_with(hf) {
                             entry.source = ModelSource::HfImported;
                             continue;
                         }
-                    }
                 }
 
                 // Infer from repo name for non-symlinks
@@ -279,12 +277,11 @@ impl Registry {
 
             // Backfill missing size for MLX directory entries (size was stored as 0 due to
             // symlink_metadata not following HF hub symlinks).
-            if entry.size_bytes == 0 && entry.format == ModelFormat::Mlx && entry.path.is_dir() {
-                if let Ok(size) = dir_size(&entry.path) {
+            if entry.size_bytes == 0 && entry.format == ModelFormat::Mlx && entry.path.is_dir()
+                && let Ok(size) = dir_size(&entry.path) {
                     entry.size_bytes = size;
                     changed = true;
                 }
-            }
         }
         changed
     }
@@ -359,6 +356,7 @@ mod tests {
             format: ModelFormat::Gguf,
             base_model: String::new(),
             source: ModelSource::OllamaSourceDownloaded,
+            mmproj_path: None,
         });
 
         let result = reg.save(&path);
@@ -392,6 +390,7 @@ mod tests {
             format: ModelFormat::Gguf,
             base_model: "Test-Model-7B".into(),
             source: ModelSource::OllamaSourceDownloaded,
+            mmproj_path: None,
         });
         reg.save(&path).unwrap();
 

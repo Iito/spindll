@@ -43,6 +43,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.os }}
+          cache-targets: ${{ runner.os != 'Windows' }}
 
       - name: Run tests
         run: cargo test --features cli,http,bench
@@ -65,3 +66,43 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --features cli,http
+
+  vision-feature-check:
+    name: vision feature check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake protobuf-compiler libclang-dev
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install LLVM (Windows)
+        if: runner.os == 'Windows'
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: '17'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check vision feature set (Linux)
+        if: runner.os == 'Linux'
+        run: cargo check --features cli,http,vision
+
+      - name: Check vision feature set (Windows)
+        if: runner.os == 'Windows'
+        env:
+          LIBCLANG_PATH: ${{ env.LLVM_PATH }}/bin
+        run: cargo check --features cli,http,vision

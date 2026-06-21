@@ -48,6 +48,9 @@ pub struct LoadOptions {
     pub priority: EvictionPriority,
     /// Reload this long after eviction under VRAM pressure. `None` disables.
     pub idle_reload: Option<Duration>,
+    /// Path to the multimodal projector GGUF. Enables vision on this model.
+    #[cfg(feature = "vision")]
+    pub mmproj_path: Option<PathBuf>,
 }
 
 /// A model that has been loaded into memory and is ready for inference.
@@ -78,6 +81,8 @@ pub struct LoadedModel {
     pub batch_tx: Option<std::sync::mpsc::Sender<BatchRequest>>,
     pub priority: EvictionPriority,
     pub idle_reload: Option<Duration>,
+    #[cfg(feature = "vision")]
+    pub mmproj_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +93,8 @@ struct PendingReload {
     gpu_layers: Option<u32>,
     priority: EvictionPriority,
     idle_reload: Duration,
+    #[cfg(feature = "vision")]
+    mmproj_path: Option<PathBuf>,
 }
 
 /// Multi-model manager with LRU memory budgeting.
@@ -164,7 +171,7 @@ impl ModelManager {
             }
         }
 
-        let default_gpu_layers = gpu_layers.unwrap_or_else(|| {
+        let default_gpu_layers = gpu_layers.unwrap_or({
             if cfg!(target_os = "macos")
                 || cfg!(feature = "cuda")
                 || cfg!(feature = "metal")
@@ -293,6 +300,8 @@ impl ModelManager {
                         gpu_layers: model.requested_gpu_layers,
                         priority: model.priority,
                         idle_reload: d,
+                        #[cfg(feature = "vision")]
+                        mmproj_path: model.mmproj_path.clone(),
                     });
                 }
             }
@@ -356,7 +365,14 @@ impl ModelManager {
         opts: LoadOptions,
     ) -> anyhow::Result<()> {
         self.cancel_watcher(name);
-        let LoadOptions { gpu_layers, digest, priority, idle_reload } = opts;
+        let LoadOptions {
+            gpu_layers,
+            digest,
+            priority,
+            idle_reload,
+            #[cfg(feature = "vision")]
+            mmproj_path,
+        } = opts;
         let format = Self::infer_format(path);
         let backend = self.backend_for_format(&format)?;
         let from_ram_cache = self
@@ -396,15 +412,16 @@ impl ModelManager {
             n_ctx: self.default_n_ctx,
             n_gpu_layers: Some(layers),
             memory_budget: load_budget,
+            #[cfg(feature = "vision")]
+            mmproj_path: mmproj_path.clone(),
         };
 
         let model = backend.load_model(path, load_params)?;
 
-        if from_ram_cache {
-            if let Some(cache) = &self.ram_cache {
+        if from_ram_cache
+            && let Some(cache) = &self.ram_cache {
                 cache.remove(name);
             }
-        }
 
         let n_ctx = model.n_ctx();
         let n_ctx_train = model.n_ctx_train();
@@ -453,6 +470,8 @@ impl ModelManager {
             batch_tx,
             priority,
             idle_reload,
+            #[cfg(feature = "vision")]
+            mmproj_path,
         };
 
         self.models.write().unwrap().insert(name.to_string(), loaded);
@@ -715,8 +734,8 @@ impl ModelManager {
         *loaded.last_used.write().unwrap() = Instant::now();
 
         // KV cache path: GGUF models with cache enabled get the cached generate path.
-        if let Some(cache) = &self.kv_cache {
-            if let Some(llama) = loaded.model.as_any().downcast_ref::<LlamaCppModel>() {
+        if let Some(cache) = &self.kv_cache
+            && let Some(llama) = loaded.model.as_any().downcast_ref::<LlamaCppModel>() {
                 // n_batch == n_ctx so prefill batches always fit. Default n_batch=512
                 // hits GGML_ASSERT and crashes on prompts longer than 512 tokens.
                 let ctx_params = LlamaContextParams::default()
@@ -739,7 +758,6 @@ impl ModelManager {
                     on_token,
                 );
             }
-        }
 
         loaded.model.generate(prompt, params, on_token)
     }
@@ -825,8 +843,8 @@ impl ModelManager {
         *loaded.last_used.write().unwrap() = Instant::now();
 
         // KV cache path: GGUF models need the prompt as a string.
-        if let Some(cache) = &self.kv_cache {
-            if let Some(llama) = loaded.model.as_any().downcast_ref::<LlamaCppModel>() {
+        if let Some(cache) = &self.kv_cache
+            && let Some(llama) = loaded.model.as_any().downcast_ref::<LlamaCppModel>() {
                 let prompt = loaded.model.apply_chat_template(messages)?;
                 let ctx_params = LlamaContextParams::default()
                     .with_n_ctx(NonZeroU32::new(loaded.n_ctx))
@@ -848,10 +866,68 @@ impl ModelManager {
                     on_token,
                 );
             }
-        }
 
         // All other backends (MLX): fused template + generation.
         loaded.model.generate_chat(messages, params, on_token)
+    }
+
+    /// Run multimodal inference (text + images) on a loaded model.
+    ///
+    /// Bypasses the batch scheduler and KV cache — uses a direct per-request
+    /// context only.  Returns an error if the model was not loaded with a
+    /// multimodal projector.
+    #[cfg(feature = "vision")]
+    #[tracing::instrument(
+        skip(self, messages, params, on_token),
+        fields(model = model_name)
+    )]
+    pub fn generate_chat_multimodal(
+        &self,
+        model_name: &str,
+        messages: &[crate::engine::multimodal::MultimodalMessage],
+        params: &GenerateParams,
+        mut on_token: impl FnMut(&str) -> bool,
+    ) -> anyhow::Result<GenerateResult> {
+        let _active = ActiveGuard::new(&self.active_requests);
+        *self.last_activity.write().unwrap() = Instant::now();
+
+        let start = Instant::now();
+        let result = {
+            let models = self.models.read().unwrap();
+            let loaded = models
+                .get(model_name)
+                .ok_or_else(|| anyhow::anyhow!("model '{}' not loaded", model_name))?;
+            *loaded.last_used.write().unwrap() = Instant::now();
+
+            if !loaded.model.supports_vision() {
+                anyhow::bail!("model '{}' does not support vision (no mmproj loaded)", model_name);
+            }
+
+            loaded.model.generate_multimodal(messages, params, &mut on_token)
+        };
+
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        match &result {
+            Ok(stats) => {
+                tracing::info!(
+                    prompt_tokens = stats.prompt_tokens,
+                    completion_tokens = stats.completion_tokens,
+                    elapsed_ms = elapsed_us / 1000,
+                    "multimodal generation complete"
+                );
+                self.metrics.record_generate(
+                    stats.prompt_tokens as u64,
+                    stats.completion_tokens as u64,
+                    elapsed_us,
+                    false,
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, elapsed_ms = elapsed_us / 1000, "multimodal generation failed");
+                self.metrics.record_error();
+            }
+        }
+        result
     }
 
     /// Apply the model's built-in chat template to a list of `(role, content)` messages.
@@ -955,6 +1031,8 @@ async fn reload_watcher(weak: Weak<ModelManager>, spec: PendingReload) {
             digest: spec.digest.clone(),
             priority: spec.priority,
             idle_reload: Some(spec.idle_reload),
+            #[cfg(feature = "vision")]
+            mmproj_path: spec.mmproj_path.clone(),
         };
         let mgr_blocking = mgr.clone();
         let path = spec.path.clone();
@@ -1113,6 +1191,27 @@ mod tests {
         let f = std::fs::File::create(&p).unwrap();
         f.set_len(size).unwrap();
         p
+    }
+
+    #[cfg(feature = "vision")]
+    #[test]
+    fn idle_reload_preserves_mmproj_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(4300);
+        let p_a = fake_model_file(dir.path(), "a.gguf", 100);
+        let p_b = fake_model_file(dir.path(), "b.gguf", 100);
+        let mmproj = dir.path().join("mmproj.gguf");
+
+        mgr.load_model_with_options("a", &p_a, LoadOptions {
+            priority: EvictionPriority::Low,
+            idle_reload: Some(Duration::from_secs(1)),
+            mmproj_path: Some(mmproj.clone()),
+            ..Default::default()
+        }).unwrap();
+        mgr.load_model_with_options("b", &p_b, LoadOptions::default()).unwrap();
+
+        let pending = mgr.evict_for(100).unwrap();
+        assert_eq!(pending[0].mmproj_path.as_deref(), Some(mmproj.as_path()));
     }
 
     #[tokio::test]

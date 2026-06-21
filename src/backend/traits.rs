@@ -1,4 +1,6 @@
 use std::path::Path;
+#[cfg(feature = "vision")]
+use std::path::PathBuf;
 
 use crate::engine::streaming::{GenerateParams, GenerateResult};
 
@@ -11,6 +13,10 @@ pub struct BackendLoadParams {
     /// model's weights are mmap'd. 0 = unlimited. Backends that auto-size
     /// n_ctx use this as the budget ceiling.
     pub memory_budget: u64,
+    /// Path to the multimodal projector GGUF file. When `Some`, the backend
+    /// should initialise its vision pipeline (e.g. `MtmdContext`).
+    #[cfg(feature = "vision")]
+    pub mmproj_path: Option<PathBuf>,
 }
 
 pub trait InferenceBackend: Send + Sync {
@@ -71,6 +77,27 @@ pub trait BackendModel: Send + Sync {
 
     fn embed(&self, _text: &str) -> anyhow::Result<EmbedResult> {
         anyhow::bail!("embeddings not supported by this backend")
+    }
+
+    /// Returns `true` if the model was loaded with a multimodal projector
+    /// and can accept image inputs.
+    #[cfg(feature = "vision")]
+    fn supports_vision(&self) -> bool {
+        false
+    }
+
+    /// Generate a response from a multimodal conversation (text + images).
+    ///
+    /// The default implementation returns an error — backends must override
+    /// this when they support vision.
+    #[cfg(feature = "vision")]
+    fn generate_multimodal(
+        &self,
+        _messages: &[crate::engine::multimodal::MultimodalMessage],
+        _params: &GenerateParams,
+        _on_token: &mut dyn FnMut(&str) -> bool,
+    ) -> anyhow::Result<GenerateResult> {
+        anyhow::bail!("this backend does not support multimodal / vision input")
     }
 }
 

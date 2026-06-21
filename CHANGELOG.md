@@ -2,20 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.7.0] - 2026-06-14
 
 ### Added
 
+- **Vision / multimodal inference** — chat requests can include images over gRPC (`Message.parts` / `ContentPart`) and the OpenAI HTTP API (`image_url` base64 `data:` URIs). GGUF vision via llama.cpp's `mtmd` API; MLX VLM decode path (Qwen2.5-VL) on Apple Silicon. Gated behind a new `vision` Cargo feature; auto-downloads the `mmproj` projector sibling and enforces a 32 MB per-image decode cap.
 - **AnythingLLM native provider support** — enhanced OpenAI API with per-model metadata:
   - `GET /v1/models` now includes architecture, context_length, format, size_bytes, capabilities, created timestamp
   - `GET /v1/models/{id}` endpoint for per-model config queries
   - `GET /v1/status` endpoint for server status with model inventory
 - **Run command chat template and system prompt** — `spindll run` now uses the model's chat template (via `generate_chat`) and injects a default system prompt ("You are a helpful assistant."). Add `--system` flag to override, `--max-tokens` to control output length.
+- **Tool / function calling** — `tools` and `tool_choice` on the OpenAI `/v1/chat/completions` API and the gRPC `Chat` RPC. Prompt-injection based: tool specs are rendered into the system prompt and the model's output (`<tool_call>` / Hermes / Llama-3.1 / Mistral wrappers) is parsed back into OpenAI-shaped calls. `tool_choice` is honored (`none` disables tools; `required` / named instruct the model); streaming emits incremental `tool_calls` deltas.
+- **CLI `ls` / `remove` aliases** — `spindll ls` aliases `list`; `spindll remove` aliases `rm`.
+- **Sidecar chat-template override** — the llama.cpp backend now loads a `<model-file>.jinja` sidecar next to the model and uses it in place of the GGUF's embedded chat template. Contents may be a raw Jinja template or a built-in name (e.g. `gemma`, `chatml`). Mirrors llama.cpp's `--chat-template-file` and lets a model shipping a broken or unusable template be corrected without re-quantizing.
 
 ### Refactored
 
 - **Budget calculation clarity** — extracted `MemoryBudget::load_budget_with_scheduler()` method to clarify the interaction between configured budgets, available RAM, and scheduler overhead. Added regression tests for default-mode clamping behavior (PR #47 follow-up).
 - **Max-tokens default handling** — `--max-tokens` in run command is optional (no clap default) to avoid duplicating `GenerateParams::default().max_tokens` (512). Falls back to library default when not provided (PR #46 follow-up).
+
+### Fixed
+
+- **Gemma chat template** — fold the `system` role into the first user turn when the model's template rejects a standalone system role, fixing `failed to apply chat template: ffi error -1` on Gemma. Also unblocks tool calling on Gemma (which injects a system preamble).
+- **Double BOS on chat prompts** — chat templates emit `bos_token` themselves, so tokenizing the rendered prompt with `AddBos::Always` prepended a second BOS. The duplicate is now collapsed (raw, non-templated prompts still get a BOS). A double BOS degrades output and, on models whose BOS/EOS differ from the Llama defaults (e.g. Gemma), can make the model emit end-of-turn immediately.
 
 ## [0.6.0] - 2026-05-30
 
@@ -47,61 +56,7 @@ All notable changes to this project will be documented in this file.
 
 - **Linux build and runtime dependencies** — documented complete dev build requirements for bare Ubuntu (libssl-dev, clang, libclang-dev, etc.) and end-user runtime dependencies (libssl3, libgomp1) to address CI/bare-Ubuntu parity gaps.
 
-## [0.5.0] - 2026-05-23
-
-### Added
-
-- **Per-model eviction priority + idle-reload watcher** — models can be pinned or
-  deprioritised for eviction; idle-reload watches previously-loaded models and
-  brings them back when memory permits.
-- **MLX prompt KV cache** — prefix caching for MLX models with fused chat generate,
-  matching the GGUF backend's disk-backed cache.
-- **MLX chat template support** — reads Jinja chat templates via the Swift bridge,
-  falling back to ChatML when the model ships without one.
-- **`spindll search`** — search for models across HuggingFace and Ollama registries,
-  ranked by host hardware compatibility (preferred format first, models that fit
-  in available RAM before those that don't, then by download count).
-- `docs/mlx-bridge.md` documenting the `mlx_bridge/` Swift package: C ABI,
-  prompt KV cache, build pipeline, and Rust FFI integration. Linked from the
-  `docs/` index and from a new `mlx_bridge/README.md` pointer.
-
-### Changed
-
-- `bench` command gated from release builds (`#[cfg(debug_assertions)]`).
-- Bench throughput reporting now separates decode tok/s from total tok/s;
-  comparison model is optional for single-model profiling.
-- `run` command routes through `ModelManager` instead of dispatching to backends
-  directly; gains `--ctx-size` and `--budget` flags.
-- Bench memory footprint measurement switched from raw `phys_footprint_mb` FFI to
-  the `memory-stats` crate.
-
-### Fixed
-
-- **MLX KV cache corruption** — quantize cache snapshots before storing to prevent
-  stale float buffers on cache hits; deep-copy `MambaCache` state to prevent
-  shared-buffer corruption across generations.
-- **MLX ChatML fallback** — models without a chat template no longer panic; the
-  bridge falls back to ChatML formatting.
-- MLX pull/run/rm bugs: import path resolution, model removal, incorrect format
-  detection.
-- MLX backend skipped gracefully when metallib not found next to binary.
-- `platform_prefers_mlx` gated on the `mlx` feature flag — no longer suggests MLX
-  format on builds compiled without the feature.
-- Reject MLX pull on unsupported platforms instead of downloading unusable weights.
-- Split GGUF models: download all shards instead of only the first file.
-- Suppress llama.cpp C-level log messages from leaking into terminal output;
-  restore log suppression with correct `ggml` level mapping.
-- Xcode toolchain rpath for Swift concurrency dylib on macOS.
-- Honor `--budget 0` flag and guard registry save against empty model stores.
-- **Linux budget-aware loading** — account for batch scheduler weight in memory
-  budget calculations, add `clamp_budget_to_live` to prevent over-allocation on
-  explicit budgets, use `checked_div` in `resolve_n_ctx` to avoid division by zero
-  on very small budgets.
-- README links to `docs/API.md` (removed in the v0.5.0 docs split) now point to
-  `docs/README.md` and `docs/api-rust.md`.
-
-## [0.5.0] - 2026-04-28
->>>>>>> fb494ff (docs: add search command to README and changelog)
+## [0.5.0] - 2026-05-10
 
 ### Added
 
@@ -164,6 +119,7 @@ All notable changes to this project will be documented in this file.
 - `pull` default GGUF picker prefers q4_k_m (was: first file in repo, often fp16).
 - `bench` command gated from release builds.
 - Bench throughput reporting separates decode tok/s from total tok/s.
+- Bench memory footprint measurement switched from raw `phys_footprint_mb` FFI to the `memory-stats` crate.
 
 ### Fixed
 
@@ -190,6 +146,7 @@ All notable changes to this project will be documented in this file.
 - **Linux budget-aware loading** — batch scheduler weight in memory budget calculations,
   `clamp_budget_to_live` for over-allocation, `checked_div` in `resolve_n_ctx`.
 - macOS available-memory now includes `speculative_count`, recovering 1–2 GB.
+- README links to `docs/API.md` (removed in the v0.5.0 docs split) now point to `docs/README.md` and `docs/api-rust.md`.
 
 ### MLX bridge correctness
 
