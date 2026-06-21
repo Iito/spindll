@@ -24,6 +24,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - **Gemma chat template** — fold the `system` role into the first user turn when the model's template rejects a standalone system role, fixing `failed to apply chat template: ffi error -1` on Gemma. Also unblocks tool calling on Gemma (which injects a system preamble).
+- **Double BOS on chat prompts** — chat templates emit `bos_token` themselves, so tokenizing the rendered prompt with `AddBos::Always` prepended a second BOS. The duplicate is now collapsed (raw, non-templated prompts still get a BOS). A double BOS degrades output and, on models whose BOS/EOS differ from the Llama defaults (e.g. Gemma), can make the model emit end-of-turn immediately.
 
 ## [0.6.0] - 2026-05-30
 

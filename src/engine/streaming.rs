@@ -77,6 +77,27 @@ pub struct GenerateResult {
     pub cache_hit: bool,
 }
 
+/// Tokenize `prompt`, prepending BOS but collapsing a double BOS.
+///
+/// Chat templates emit `bos_token` themselves, so the rendered prompt already
+/// starts with `<bos>` (parsed as the BOS token). Tokenizing with
+/// `AddBos::Always` then prepends a *second* BOS. A double BOS degrades output
+/// and, on models whose BOS/EOS differ from the Llama defaults (e.g. Gemma /
+/// Gemma 4), makes the model emit end-of-turn immediately — empty output. We
+/// keep `AddBos::Always` (so raw, non-templated prompts still get a BOS) and
+/// drop the duplicate when the text already supplied one.
+fn tokenize_prompt(
+    model: &LlamaModel,
+    prompt: &str,
+) -> anyhow::Result<Vec<llama_cpp_2::token::LlamaToken>> {
+    let mut tokens = model.str_to_token(prompt, AddBos::Always)?;
+    let bos = model.token_bos();
+    if tokens.len() >= 2 && tokens[0] == bos && tokens[1] == bos {
+        tokens.remove(1);
+    }
+    Ok(tokens)
+}
+
 /// Generate tokens from a prompt, calling `on_token` for each piece of text produced.
 #[tracing::instrument(skip_all, fields(prompt_tokens, completion_tokens))]
 pub fn generate_streaming(
@@ -86,7 +107,7 @@ pub fn generate_streaming(
     params: &GenerateParams,
     mut on_token: impl FnMut(&str) -> bool, // return false to stop
 ) -> anyhow::Result<GenerateResult> {
-    let tokens = model.str_to_token(prompt, AddBos::Always)?;
+    let tokens = tokenize_prompt(model, prompt)?;
     if tokens.is_empty() {
         anyhow::bail!("prompt produced no tokens");
     }
@@ -193,7 +214,7 @@ pub fn generate_streaming_cached(
     encryption_key: Option<&[u8; 32]>,
     mut on_token: impl FnMut(&str) -> bool,
 ) -> anyhow::Result<GenerateResult> {
-    let tokens = model.str_to_token(prompt, AddBos::Always)?;
+    let tokens = tokenize_prompt(model, prompt)?;
     if tokens.is_empty() {
         anyhow::bail!("prompt produced no tokens");
     }
