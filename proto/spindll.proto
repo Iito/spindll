@@ -51,6 +51,8 @@ message ChatRequest {
   repeated Message messages = 2;
   GenerateParams params = 3;
   bytes encryption_key = 7;
+  repeated Tool tools = 8;   // OpenAI-style tool definitions (optional)
+  string tool_choice = 9;    // "none" | "auto" | "required" | "<function name>"
 }
 
 message PrefillRequest {
@@ -67,6 +69,8 @@ message ChatResponse {
   string token = 1;
   bool done = 2;
   UsageStats usage = 3;  // populated on final message
+  repeated ToolCall tool_calls = 4;  // populated on the final message when tools fired
+  string finish_reason = 5;          // "stop" | "tool_calls" (final message only)
 }
 
 message Message {
@@ -81,6 +85,20 @@ message ContentPart {
   string text = 2;     // populated when type == "text"
   bytes image_data = 3;   // populated when type == "image"
   string media_type = 4;  // e.g. "image/png" (optional)
+}
+
+// --- Tool calling (prompt-injection based; see src/engine/tools.rs) ---
+
+message Tool {
+  string name = 1;
+  string description = 2;      // optional
+  string parameters_json = 3;  // JSON Schema for the arguments (optional)
+}
+
+message ToolCall {
+  string id = 1;
+  string name = 2;
+  string arguments = 3;  // JSON string (OpenAI shape)
 }
 
 message GenerateParams {

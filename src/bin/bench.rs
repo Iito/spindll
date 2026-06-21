@@ -255,6 +255,8 @@ async fn run_once_grpc(
             stop:        vec![],
         }),
         encryption_key: vec![],
+        tools: vec![],
+        tool_choice: String::new(),
     };
 
     let t_start = Instant::now();
