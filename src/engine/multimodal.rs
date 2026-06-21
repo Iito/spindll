@@ -33,11 +33,6 @@ impl MultimodalMessage {
     }
 }
 
-/// Returns `true` if any message in the slice contains image parts.
-pub fn contains_images(messages: &[MultimodalMessage]) -> bool {
-    messages.iter().any(|m| m.has_images())
-}
-
 /// Per-image decoded byte cap shared by the HTTP and gRPC vision entry points.
 /// Bounds request-handler allocation against oversized image payloads.
 pub const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
