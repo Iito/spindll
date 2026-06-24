@@ -242,10 +242,12 @@ impl Spindll for SpindllService {
                 .iter()
                 .map(|m| (m.role.clone(), proto_message_text(m)))
                 .collect();
-            if let Some(preamble) = crate::engine::tools::tools_to_prompt(&tool_specs, &tool_choice) {
+            // Rendered once; reused for the text turn here and the vision path below.
+            let preamble = crate::engine::tools::tools_to_prompt(&tool_specs, &tool_choice);
+            if let Some(ref preamble) = preamble {
                 match messages.iter_mut().find(|(r, _)| r == "system") {
                     Some(sys) => sys.1 = format!("{}\n\n{}", sys.1, preamble),
-                    None => messages.insert(0, ("system".to_string(), preamble)),
+                    None => messages.insert(0, ("system".to_string(), preamble.clone())),
                 }
             }
             let enc_key: Option<[u8; 32]> = (req.encryption_key.len() == 32).then(|| {
@@ -263,14 +265,23 @@ impl Spindll for SpindllService {
 
             #[cfg(feature = "vision")]
             let result = if has_image {
-                let mm_messages = match proto_to_multimodal(&req.messages) {
+                let mut mm_messages = match proto_to_multimodal(&req.messages) {
                     Ok(m) => m,
                     Err(e) => {
                         let _ = tx.blocking_send(Err(Status::invalid_argument(e.to_string())));
                         return;
                     }
                 };
+                // Inject the tool preamble so vision + tools works like the text path,
+                // and buffer output when tools are active so calls can be parsed.
+                if let Some(ref preamble) = preamble {
+                    crate::engine::multimodal::inject_system_text(&mut mm_messages, preamble);
+                }
                 mgr.generate_chat_multimodal(&req.model, &mm_messages, &params, |token| {
+                    if has_tools {
+                        output.push_str(token);
+                        return true;
+                    }
                     tx.blocking_send(Ok(token_resp(token))).is_ok()
                 })
             } else {
