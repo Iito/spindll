@@ -174,16 +174,20 @@ pub fn parse_tool_calls(output: &str) -> (Vec<ToolCall>, String) {
     }
 
     // 2. Mistral `[TOOL_CALLS]` / Llama-3.1 `<|python_tag|>` prefixes: the
-    //    remainder is a JSON object or array of calls. Strip and fall through.
-    let body = trimmed
+    //    remainder is a JSON object or array of calls. The prefix is an explicit
+    //    tool-call signal, so the scan below treats a missing `arguments`
+    //    leniently. Without a prefix the scan stays strict (a stray `{"name": …}`
+    //    in prose must not be misread as a call).
+    let stripped = trimmed
         .strip_prefix("[TOOL_CALLS]")
         .or_else(|| trimmed.strip_prefix("<|python_tag|>"))
-        .map(str::trim)
-        .unwrap_or(trimmed);
+        .map(str::trim);
+    let require_args = stripped.is_none();
+    let body = stripped.unwrap_or(trimmed);
 
     // 3. Balanced-JSON scan: pull every top-level `{...}` that looks like a
     //    call. Handles a bare object, several objects, or text + object.
-    scan_json_calls(body)
+    scan_json_calls(body, require_args)
 }
 
 /// Parse the JSON inside each `<open>...</close>` block.
@@ -194,7 +198,8 @@ fn parse_wrapped(text: &str, open: &str, close: &str) -> Option<Vec<ToolCall>> {
         let after = &rest[start + open.len()..];
         let end = after.find(close)?;
         let inner = after[..end].trim();
-        if let Some(call) = call_from_json_str(inner) {
+        // Explicit wrapper ⇒ lenient: a missing `arguments` defaults to `{}`.
+        if let Some(call) = call_from_json_str(inner, false) {
             calls.push(call);
         }
         rest = &after[end + close.len()..];
@@ -222,7 +227,10 @@ fn strip_wrapped(text: &str, open: &str, close: &str) -> String {
 }
 
 /// Scan for balanced top-level JSON objects that parse as `{name, arguments}`.
-fn scan_json_calls(text: &str) -> (Vec<ToolCall>, String) {
+/// `require_args` is forwarded to [`call_from_json_str`]: `true` for the bare
+/// fallback (an object must carry `arguments` to count as a call), `false` after
+/// an explicit `[TOOL_CALLS]` / `<|python_tag|>` prefix.
+fn scan_json_calls(text: &str, require_args: bool) -> (Vec<ToolCall>, String) {
     let mut calls = Vec::new();
     let mut remaining = String::new();
     let mut search_from = 0;
@@ -235,7 +243,7 @@ fn scan_json_calls(text: &str) -> (Vec<ToolCall>, String) {
         };
         let abs = search_from + rel;
         if let Some(end) = find_json_end(text, abs)
-            && let Some(call) = call_from_json_str(&text[abs..end])
+            && let Some(call) = call_from_json_str(&text[abs..end], require_args)
         {
             remaining.push_str(&text[search_from..abs]);
             calls.push(call);
@@ -253,18 +261,25 @@ fn scan_json_calls(text: &str) -> (Vec<ToolCall>, String) {
 
 /// Build a [`ToolCall`] from a JSON string holding `{"name", "arguments"}`.
 /// `arguments` may be an object (serialized to a string) or already a string.
-fn call_from_json_str(candidate: &str) -> Option<ToolCall> {
+///
+/// `require_args` controls the missing-`arguments` case. Explicit wrapper /
+/// prefix contexts pass `false` so a no-argument call such as `{"name": "now"}`
+/// still parses (arguments default to `{}`). The bare-JSON fallback scan passes
+/// `true` so an arbitrary `{"name": …}` object in prose isn't misread as a call.
+fn call_from_json_str(candidate: &str, require_args: bool) -> Option<ToolCall> {
     let parsed: Value = serde_json::from_str(candidate).ok()?;
     let obj = parsed.as_object()?;
     let name = obj.get("name")?.as_str()?;
-    let arguments = obj.get("arguments")?;
+    let arguments = match obj.get("arguments") {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => serde_json::to_string(other).unwrap_or_default(),
+        None if require_args => return None,
+        None => "{}".to_string(),
+    };
     Some(ToolCall {
         id: new_call_id(),
         name: name.to_string(),
-        arguments: match arguments {
-            Value::String(s) => s.clone(),
-            other => serde_json::to_string(other).unwrap_or_default(),
-        },
+        arguments,
     })
 }
 
@@ -456,6 +471,33 @@ mod tests {
         let (calls, rest) = parse_tool_calls(r#"{"foo": "bar"}"#);
         assert!(calls.is_empty());
         assert_eq!(rest, r#"{"foo": "bar"}"#);
+    }
+
+    #[test]
+    fn parse_wrapped_call_without_arguments_defaults_to_empty_object() {
+        // A no-argument tool inside an explicit wrapper is still a call.
+        let (calls, _) = parse_tool_calls("<tool_call>{\"name\": \"get_time\"}</tool_call>");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_time");
+        assert_eq!(calls[0].arguments, "{}");
+    }
+
+    #[test]
+    fn parse_prefix_call_without_arguments_defaults_to_empty_object() {
+        let (calls, _) = parse_tool_calls(r#"[TOOL_CALLS]{"name": "ping"}"#);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, "{}");
+    }
+
+    #[test]
+    fn parse_bare_name_object_without_arguments_is_not_a_call() {
+        // Without an explicit wrapper/prefix, a `{"name": …}` object lacking
+        // `arguments` is ordinary prose (e.g. a record the model is discussing),
+        // not a tool call — it must be left untouched.
+        let input = r#"{"name": "Alice", "city": "Paris"}"#;
+        let (calls, rest) = parse_tool_calls(input);
+        assert!(calls.is_empty());
+        assert_eq!(rest, input);
     }
 
     #[test]

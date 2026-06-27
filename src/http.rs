@@ -799,17 +799,26 @@ fn oai_has_images(messages: &[OaiMessage]) -> bool {
 /// depending on whether images are present.
 ///
 /// Returns the `GenerateResult` from whichever path was taken.
+///
+/// `tool_preamble` is the rendered tool-calling instructions (when tools are
+/// active). On the vision path it is injected into the multimodal messages so
+/// the model sees the tools — without this the text path's preamble (carried in
+/// `text_messages`) would be dropped and tool calling would silently no-op.
 #[cfg(feature = "vision")]
 fn generate_maybe_multimodal(
     mgr: &ModelManager,
     model: &str,
     oai_messages: &[OaiMessage],
     text_messages: &[(String, String)],
+    tool_preamble: Option<&str>,
     params: &GenerateParams,
     on_token: &mut dyn FnMut(&str) -> bool,
 ) -> anyhow::Result<crate::engine::GenerateResult> {
     if oai_has_images(oai_messages) {
-        let mm = oai_to_multimodal(oai_messages)?;
+        let mut mm = oai_to_multimodal(oai_messages)?;
+        if let Some(preamble) = tool_preamble {
+            crate::engine::multimodal::inject_system_text(&mut mm, preamble);
+        }
         mgr.generate_chat_multimodal(model, &mm, params, on_token)
     } else {
         mgr.generate_chat(model, text_messages, params, None, on_token)
@@ -828,6 +837,19 @@ async fn oai_chat_completions(
     let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty())
         && !matches!(tool_choice, crate::engine::tools::ToolChoice::None);
     let include_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
+
+    // Rendered tool preamble for the vision path. The text path injects its own
+    // copy via `prepare_messages_with_tools`; the multimodal path needs it here
+    // so vision + tools doesn't silently drop the tools. Only built when active.
+    #[cfg(feature = "vision")]
+    let tool_preamble: Option<String> = has_tools
+        .then(|| {
+            crate::engine::tools::tools_to_prompt(
+                &oai_tools_to_specs(req.tools.as_deref().unwrap_or_default()),
+                &tool_choice,
+            )
+        })
+        .flatten();
 
     #[cfg(not(feature = "vision"))]
     if oai_has_images(&req.messages) {
@@ -866,7 +888,7 @@ async fn oai_chat_completions(
                 // When tools are active, collect full output to parse tool calls.
                 let mut output = String::new();
                 #[cfg(feature = "vision")]
-                let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &params, &mut |token| {
+                let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, tool_preamble.as_deref(), &params, &mut |token| {
                     output.push_str(token);
                     true
                 });
@@ -946,7 +968,7 @@ async fn oai_chat_completions(
             } else {
                 // No tools — stream tokens directly as before.
                 #[cfg(feature = "vision")]
-                let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &params, &mut |token| {
+                let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, tool_preamble.as_deref(), &params, &mut |token| {
                     let chunk = serde_json::json!({
                         "id": &completion_id,
                         "object": "chat.completion.chunk",
@@ -1034,7 +1056,7 @@ async fn oai_chat_completions(
 
             let mut output = String::new();
             #[cfg(feature = "vision")]
-            let stats = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &params, &mut |token| {
+            let stats = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, tool_preamble.as_deref(), &params, &mut |token| {
                 output.push_str(token);
                 true
             })?;
