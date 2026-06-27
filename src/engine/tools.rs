@@ -227,7 +227,11 @@ fn parse_wrapped(text: &str, open: &str, close: &str) -> Option<Vec<ToolCall>> {
     let mut rest = text;
     while let Some(start) = rest.find(open) {
         let after = &rest[start + open.len()..];
-        let end = after.find(close)?;
+        let Some(end) = after.find(close) else {
+            // Unclosed block (e.g. the output was truncated mid-call): stop and
+            // keep the calls already parsed rather than discarding all of them.
+            break;
+        };
         let inner = after[..end].trim();
         // Explicit wrapper ⇒ lenient: a missing `arguments` defaults to `{}`.
         if let Some(call) = call_from_json_str(inner, false) {
@@ -473,6 +477,15 @@ mod tests {
                    <tool_call>{\"name\":\"b\",\"arguments\":{}}</tool_call>";
         let (calls, _) = parse_tool_calls(out);
         assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
+    fn parse_wrapped_keeps_valid_block_when_later_block_is_truncated() {
+        // Output cut off mid-second-call must not discard the first, complete one.
+        let out = "<tool_call>{\"name\":\"a\",\"arguments\":{}}</tool_call><tool_call>{\"name\":\"b\"";
+        let (calls, _rest) = parse_tool_calls(out);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "a");
     }
 
     #[test]
