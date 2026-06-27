@@ -7,18 +7,17 @@ use std::time::Instant;
 
 struct RamCacheEntry {
     path: PathBuf,
-    #[allow(dead_code)]
-    data: Vec<u8>,
     size_bytes: u64,
     evicted_at: Instant,
 }
 
-/// Holds recently-evicted model file data in RAM so re-loading skips disk I/O.
+/// Pre-warms recently-evicted model files in the OS page cache so a re-load
+/// skips disk I/O.
 ///
-/// When a model is unloaded from GPU, its GGUF file is read into a userspace
-/// buffer. The OS page cache keeps these pages resident, so a subsequent
-/// `LlamaModel::load_from_file` on the same path hits RAM instead of disk.
-/// The buffer is dropped (and pages released) when evicted from this cache.
+/// When a model is unloaded from GPU, its GGUF file is read once to pull its
+/// pages into the OS page cache; a subsequent `LlamaModel::load_from_file` on
+/// the same path then hits RAM instead of disk. This cache tracks only which
+/// files have been warmed (within a size budget) — it does not retain the bytes.
 pub struct RamCache {
     entries: Mutex<HashMap<String, RamCacheEntry>>,
     max_bytes: u64,
@@ -32,7 +31,7 @@ impl RamCache {
         }
     }
 
-    /// Read a model file into RAM to keep its pages warm in the OS page cache.
+    /// Read a model file once to pull its pages into the OS page cache.
     /// Silently drops the oldest entry if the budget would be exceeded.
     pub fn warm(&self, name: &str, path: &Path) {
         let size = match std::fs::metadata(path) {
@@ -44,6 +43,8 @@ impl RamCache {
             return;
         }
 
+        // Reading the file pulls its pages into the OS page cache; the buffer is
+        // then discarded — the cache only tracks which files have been warmed.
         let mut buf = Vec::new();
         let Ok(mut file) = File::open(path) else { return };
         if file.read_to_end(&mut buf).is_err() {
@@ -58,7 +59,6 @@ impl RamCache {
             name.to_string(),
             RamCacheEntry {
                 path: path.to_path_buf(),
-                data: buf,
                 size_bytes: size,
                 evicted_at: Instant::now(),
             },

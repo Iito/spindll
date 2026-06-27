@@ -515,9 +515,8 @@ struct OaiChatRequest {
     seed: Option<u32>,
     #[serde(default)]
     tools: Option<Vec<OaiTool>>,
-    /// Accepted for API compatibility; not yet used for constrained selection.
+    /// OpenAI `tool_choice`: `"none"` | `"auto"` | `"required"` | `{function}`.
     #[serde(default)]
-    #[allow(dead_code)]
     tool_choice: Option<serde_json::Value>,
     #[serde(default)]
     stream_options: Option<StreamOptions>,
@@ -699,140 +698,54 @@ struct OaiToolCallFunction {
     arguments: String,
 }
 
-/// Build a system prompt section describing available tools.
-fn format_tools_for_prompt(tools: &[OaiTool]) -> String {
-    let mut out = String::from(
-        "You have access to the following tools. To call a tool, respond with a JSON object \
-         in this exact format:\n\n\
-         {\"name\": \"function_name\", \"arguments\": {\"param\": \"value\"}}\n\n\
-         Available tools:\n\n",
-    );
-    for tool in tools {
-        out.push_str(&format!("### {}\n", tool.function.name));
-        if let Some(desc) = &tool.function.description {
-            out.push_str(&format!("{desc}\n"));
-        }
-        if let Some(params) = &tool.function.parameters {
-            out.push_str(&format!("Parameters: {}\n", serde_json::to_string(params).unwrap_or_default()));
-        }
-        out.push('\n');
-    }
-    out
+/// Convert OpenAI tool definitions into the shared [`ToolSpec`] vocabulary.
+fn oai_tools_to_specs(tools: &[OaiTool]) -> Vec<crate::engine::tools::ToolSpec> {
+    tools
+        .iter()
+        .map(|t| crate::engine::tools::ToolSpec {
+            name: t.function.name.clone(),
+            description: t.function.description.clone(),
+            parameters: t.function.parameters.clone(),
+        })
+        .collect()
 }
 
-/// Try to extract tool calls from model output.
-///
-/// Looks for JSON objects containing `"name"` and `"arguments"` keys, which is the
-/// format most tool-calling models produce. Returns extracted calls and any remaining
-/// text content.
+/// Extract tool calls from model output, adapting the shared engine parser
+/// (`engine::tools::parse_tool_calls`) to the OpenAI response shape. The shared
+/// parser also understands the Hermes / Llama-3.1 / Mistral wrappers, so this
+/// is strictly more capable than the old HTTP-local JSON scan it replaced.
 fn parse_tool_calls(output: &str) -> (Vec<OaiToolCallMessage>, String) {
-    let mut calls = Vec::new();
-    let mut remaining = String::new();
-    let trimmed = output.trim();
-
-    // Try to find JSON objects in the output
-    let mut search_from = 0;
-    while search_from < trimmed.len() {
-        if let Some(start) = trimmed[search_from..].find('{') {
-            let abs_start = search_from + start;
-            // Try increasingly larger slices to find valid JSON
-            if let Some(call) = extract_tool_call_at(trimmed, abs_start) {
-                remaining.push_str(&trimmed[search_from..abs_start]);
-                let json_len = find_json_end(trimmed, abs_start).unwrap_or(trimmed.len()) - abs_start;
-                search_from = abs_start + json_len;
-                calls.push(call);
-                continue;
-            }
-        }
-        remaining.push_str(&trimmed[search_from..]);
-        break;
-    }
-
-    (calls, remaining.trim().to_string())
-}
-
-fn extract_tool_call_at(text: &str, start: usize) -> Option<OaiToolCallMessage> {
-    let end = find_json_end(text, start)?;
-    let candidate = &text[start..end];
-    let parsed: serde_json::Value = serde_json::from_str(candidate).ok()?;
-    let obj = parsed.as_object()?;
-
-    let name = obj.get("name")?.as_str()?;
-    let arguments = obj.get("arguments")?;
-
-    let call_id = format!("call_{:016x}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
-
-    Some(OaiToolCallMessage {
-        id: call_id,
-        r#type: "function".to_string(),
-        function: OaiToolCallFunction {
-            name: name.to_string(),
-            arguments: if arguments.is_string() {
-                arguments.as_str().unwrap().to_string()
-            } else {
-                serde_json::to_string(arguments).unwrap_or_default()
+    let (calls, remaining) = crate::engine::tools::parse_tool_calls(output);
+    let calls = calls
+        .into_iter()
+        .map(|c| OaiToolCallMessage {
+            id: c.id,
+            r#type: "function".to_string(),
+            function: OaiToolCallFunction {
+                name: c.name,
+                arguments: c.arguments,
             },
-        },
-    })
+        })
+        .collect();
+    (calls, remaining)
 }
 
-/// Find the end of a balanced JSON object starting at `start`.
-fn find_json_end(text: &str, start: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    if bytes.get(start)? != &b'{' {
-        return None;
-    }
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escape = false;
-    for (i, &ch) in bytes.iter().enumerate().skip(start) {
-        if escape {
-            escape = false;
-            continue;
-        }
-        if ch == b'\\' && in_string {
-            escape = true;
-            continue;
-        }
-        if ch == b'"' {
-            in_string = !in_string;
-            continue;
-        }
-        if in_string {
-            continue;
-        }
-        if ch == b'{' {
-            depth += 1;
-        } else if ch == b'}' {
-            depth -= 1;
-            if depth == 0 {
-                return Some(i + 1);
-            }
-        }
-    }
-    None
-}
-
-/// Prepare messages for template application, injecting tool descriptions when present.
+/// Prepare messages for template application, injecting the pre-rendered tool
+/// preamble (`engine::tools::tools_to_prompt`, built once by the caller and
+/// `None` when tools are inactive) into the system turn. Returns `(role,
+/// content)` pairs for the chat template.
 fn prepare_messages_with_tools(
     messages: &[OaiMessage],
-    tools: &Option<Vec<OaiTool>>,
+    tool_preamble: Option<&str>,
 ) -> Vec<(String, String)> {
     let mut result: Vec<(String, String)> = Vec::new();
-
-    // If tools are provided, prepend tool descriptions to the system message.
-    let tool_preamble = tools.as_ref()
-        .filter(|t| !t.is_empty())
-        .map(|t| format_tools_for_prompt(t));
-
     let mut system_injected = false;
 
     for msg in messages {
         let content = msg.content.as_ref().map(|c| c.as_text()).unwrap_or_default();
 
         if msg.role == "system" && !system_injected {
-            if let Some(ref preamble) = tool_preamble {
+            if let Some(preamble) = tool_preamble {
                 result.push(("system".to_string(), format!("{content}\n\n{preamble}")));
             } else {
                 result.push(("system".to_string(), content));
@@ -863,7 +776,7 @@ fn prepare_messages_with_tools(
     // If there was no system message but we have tools, inject one
     if !system_injected
         && let Some(preamble) = tool_preamble {
-            result.insert(0, ("system".to_string(), preamble));
+            result.insert(0, ("system".to_string(), preamble.to_string()));
         }
 
     result
@@ -878,17 +791,26 @@ fn oai_has_images(messages: &[OaiMessage]) -> bool {
 /// depending on whether images are present.
 ///
 /// Returns the `GenerateResult` from whichever path was taken.
+///
+/// `tool_preamble` is the rendered tool-calling instructions (when tools are
+/// active). On the vision path it is injected into the multimodal messages so
+/// the model sees the tools — without this the text path's preamble (carried in
+/// `text_messages`) would be dropped and tool calling would silently no-op.
 #[cfg(feature = "vision")]
 fn generate_maybe_multimodal(
     mgr: &ModelManager,
     model: &str,
     oai_messages: &[OaiMessage],
     text_messages: &[(String, String)],
+    tool_preamble: Option<&str>,
     params: &GenerateParams,
     on_token: &mut dyn FnMut(&str) -> bool,
 ) -> anyhow::Result<crate::engine::GenerateResult> {
     if oai_has_images(oai_messages) {
-        let mm = oai_to_multimodal(oai_messages)?;
+        let mut mm = oai_to_multimodal(oai_messages)?;
+        if let Some(preamble) = tool_preamble {
+            crate::engine::multimodal::inject_system_text(&mut mm, preamble);
+        }
         mgr.generate_chat_multimodal(model, &mm, params, on_token)
     } else {
         mgr.generate_chat(model, text_messages, params, None, on_token)
@@ -902,8 +824,24 @@ async fn oai_chat_completions(
     let model_id = req.model.clone();
     let mgr = state.manager.clone();
     let store = state.store.clone();
-    let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+    let tool_choice = crate::engine::tools::ToolChoice::from_oai(req.tool_choice.as_ref());
+    // tool_choice "none" disables tools entirely: no preamble, no parsing.
+    let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty())
+        && !matches!(tool_choice, crate::engine::tools::ToolChoice::None);
     let include_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
+
+    // Render the tool preamble once and share it: the text path injects it via
+    // `prepare_messages_with_tools`, and the vision path injects it into the
+    // multimodal messages so vision + tools doesn't silently drop the tools.
+    // Only built when tools are active (`None` otherwise → no injection).
+    let tool_preamble: Option<String> = has_tools
+        .then(|| {
+            crate::engine::tools::tools_to_prompt(
+                &oai_tools_to_specs(req.tools.as_deref().unwrap_or_default()),
+                &tool_choice,
+            )
+        })
+        .flatten();
 
     #[cfg(not(feature = "vision"))]
     if oai_has_images(&req.messages) {
@@ -923,7 +861,7 @@ async fn oai_chat_completions(
                 return;
             }
 
-            let messages = prepare_messages_with_tools(&req.messages, &req.tools);
+            let messages = prepare_messages_with_tools(&req.messages, tool_preamble.as_deref());
             let params = GenerateParams {
                 max_tokens: req.max_tokens.unwrap_or(512),
                 temperature: req.temperature.unwrap_or(0.8),
@@ -938,11 +876,22 @@ async fn oai_chat_completions(
             let created = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
 
+            // OpenAI's first streamed chunk announces the assistant role; emit it
+            // before any content or tool-call deltas (either branch below) so
+            // accumulating clients set the message role.
+            let _ = tx.blocking_send(Ok(sse_data(&serde_json::json!({
+                "id": &completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": &req.model,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+            }))));
+
             if has_tools {
                 // When tools are active, collect full output to parse tool calls.
                 let mut output = String::new();
                 #[cfg(feature = "vision")]
-                let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &params, &mut |token| {
+                let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, tool_preamble.as_deref(), &params, &mut |token| {
                     output.push_str(token);
                     true
                 });
@@ -955,13 +904,12 @@ async fn oai_chat_completions(
                 match result {
                     Ok(ref stats) => {
                         let (tool_calls, remaining) = parse_tool_calls(&output);
-                        if !tool_calls.is_empty() {
-                            // Send tool calls as a single chunk
-                            let delta: serde_json::Value = if remaining.is_empty() {
-                                serde_json::json!({"tool_calls": tool_calls})
-                            } else {
-                                serde_json::json!({"content": remaining, "tool_calls": tool_calls})
-                            };
+                        // One delta per chunk, keyed by `index`, matching OpenAI's
+                        // streaming shape: id+name first, then arguments, so clients
+                        // accumulate calls correctly. Arguments arrive in a single
+                        // fragment — calls are parsed from the completed output, not
+                        // token-by-token (no streaming parser on 0.1.150).
+                        let emit = |delta: serde_json::Value| {
                             let chunk = serde_json::json!({
                                 "id": &completion_id,
                                 "object": "chat.completion.chunk",
@@ -970,16 +918,24 @@ async fn oai_chat_completions(
                                 "choices": [{"index": 0, "delta": delta, "finish_reason": null}]
                             });
                             let _ = tx.blocking_send(Ok(sse_data(&chunk)));
-                        } else {
-                            // No tool calls detected — send as regular content
-                            let chunk = serde_json::json!({
-                                "id": &completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": &req.model,
-                                "choices": [{"index": 0, "delta": {"content": output}, "finish_reason": null}]
-                            });
-                            let _ = tx.blocking_send(Ok(sse_data(&chunk)));
+                        };
+                        // Leftover prose (trimmed) goes first as a content delta;
+                        // with no calls this is the whole answer, and a blank one
+                        // is dropped rather than streamed as stray whitespace.
+                        if !remaining.is_empty() {
+                            emit(serde_json::json!({ "content": remaining }));
+                        }
+                        for (i, call) in tool_calls.iter().enumerate() {
+                            emit(serde_json::json!({ "tool_calls": [{
+                                "index": i,
+                                "id": call.id,
+                                "type": "function",
+                                "function": { "name": call.function.name, "arguments": "" }
+                            }]}));
+                            emit(serde_json::json!({ "tool_calls": [{
+                                "index": i,
+                                "function": { "arguments": call.function.arguments }
+                            }]}));
                         }
                         let finish = if !tool_calls.is_empty() { "tool_calls" } else { "stop" };
                         let done_chunk = serde_json::json!({
@@ -1014,7 +970,7 @@ async fn oai_chat_completions(
             } else {
                 // No tools — stream tokens directly as before.
                 #[cfg(feature = "vision")]
-                let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &params, &mut |token| {
+                let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, tool_preamble.as_deref(), &params, &mut |token| {
                     let chunk = serde_json::json!({
                         "id": &completion_id,
                         "object": "chat.completion.chunk",
@@ -1089,7 +1045,7 @@ async fn oai_chat_completions(
         let result = tokio::task::spawn_blocking(move || {
             auto_load(&mgr, &store, &req.model)?;
 
-            let messages = prepare_messages_with_tools(&req.messages, &req.tools);
+            let messages = prepare_messages_with_tools(&req.messages, tool_preamble.as_deref());
 
             let params = GenerateParams {
                 max_tokens: req.max_tokens.unwrap_or(512),
@@ -1102,7 +1058,7 @@ async fn oai_chat_completions(
 
             let mut output = String::new();
             #[cfg(feature = "vision")]
-            let stats = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &params, &mut |token| {
+            let stats = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, tool_preamble.as_deref(), &params, &mut |token| {
                 output.push_str(token);
                 true
             })?;
@@ -1133,7 +1089,8 @@ async fn oai_chat_completions(
                         };
                         (msg, "tool_calls")
                     } else {
-                        (serde_json::json!({"role": "assistant", "content": content}), "stop")
+                        // No call detected — return the parsed (call-free) content.
+                        (serde_json::json!({"role": "assistant", "content": remaining}), "stop")
                     }
                 } else {
                     (serde_json::json!({"role": "assistant", "content": content}), "stop")

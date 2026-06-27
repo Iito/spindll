@@ -33,9 +33,21 @@ impl MultimodalMessage {
     }
 }
 
-/// Returns `true` if any message in the slice contains image parts.
-pub fn contains_images(messages: &[MultimodalMessage]) -> bool {
-    messages.iter().any(|m| m.has_images())
+/// Merge a system-level text block (e.g. the tool-calling preamble) into a
+/// multimodal message list. Appends to the first existing `system` message,
+/// otherwise inserts a new one at the front. Mirrors the text-path injection
+/// used by the HTTP/gRPC chat handlers so vision requests honor tool calling too.
+pub fn inject_system_text(messages: &mut Vec<MultimodalMessage>, text: &str) {
+    match messages.iter_mut().find(|m| m.role == "system") {
+        Some(sys) => sys.content.push(ContentPart::Text(format!("\n\n{text}"))),
+        None => messages.insert(
+            0,
+            MultimodalMessage {
+                role: "system".to_string(),
+                content: vec![ContentPart::Text(text.to_string())],
+            },
+        ),
+    }
 }
 
 /// Per-image decoded byte cap shared by the HTTP and gRPC vision entry points.

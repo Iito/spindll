@@ -303,63 +303,6 @@ pub fn read_mlx_metadata(dir: &Path) -> (String, String) {
 }
 
 // ---------------------------------------------------------------------------
-// Kept for backward compatibility (used by the Ollama pull path)
-// ---------------------------------------------------------------------------
-
-/// Download a GGUF model from HuggingFace and symlink it into the local store.
-pub fn download_gguf(repo_id: &str, quant: Option<&str>, dest_dir: &Path) -> anyhow::Result<PathBuf> {
-    let api = Api::new()?;
-    let repo = api.model(repo_id.to_string());
-
-    let info = repo.info()?;
-    // Exclude mmproj GGUFs (vision adapter, not language weights).
-    let gguf_files: Vec<_> = info
-        .siblings
-        .iter()
-        .filter(|s| {
-            let name = s.rfilename.as_str();
-            name.ends_with(".gguf") && !name.to_lowercase().contains("mmproj")
-        })
-        .collect();
-
-    if gguf_files.is_empty() {
-        anyhow::bail!("no GGUF files found in {repo_id}");
-    }
-
-    let target = if let Some(q) = quant {
-        gguf_files
-            .iter()
-            .find(|s| s.rfilename.contains(q))
-            .ok_or_else(|| anyhow::anyhow!("no file matching quantization '{q}' in {repo_id}"))?
-    } else {
-        // No quant specified — pick the lowest-ranked variant. Stable: ties
-        // resolve in API order via min_by_key's first-wins semantics.
-        let picked = gguf_files
-            .iter()
-            .min_by_key(|s| rank_quant(&s.rfilename))
-            .expect("non-empty checked above");
-        tracing::info!(
-            file = %picked.rfilename,
-            "no --quant specified, picked default by quant priority (q4_k_m > q5_k_m > q4_0 > … > fp16); pass --quant to override"
-        );
-        picked
-    };
-
-    tracing::info!(file = %target.rfilename, "downloading");
-    let cached_path = repo.get(&target.rfilename)?;
-
-    std::fs::create_dir_all(dest_dir)?;
-    let dest = dest_dir.join(&target.rfilename);
-    if !dest.exists() {
-        link_or_copy(&cached_path, &dest)?;
-    }
-
-    validate_gguf(&cached_path)?;
-    tracing::info!(path = %dest.display(), "download complete");
-    Ok(dest)
-}
-
-// ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 

@@ -69,6 +69,28 @@ fn proto_message_text(m: &crate::proto::Message) -> String {
     }
 }
 
+/// A streaming (non-final) chat token frame.
+fn token_resp(token: &str) -> ChatResponse {
+    ChatResponse {
+        token: token.to_string(),
+        done: false,
+        usage: None,
+        tool_calls: Vec::new(),
+        finish_reason: String::new(),
+    }
+}
+
+/// Map a gRPC `tool_choice` string onto the shared [`ToolChoice`].
+fn grpc_tool_choice(s: &str) -> crate::engine::tools::ToolChoice {
+    use crate::engine::tools::ToolChoice;
+    match s {
+        "" | "auto" => ToolChoice::Auto,
+        "none" => ToolChoice::None,
+        "required" => ToolChoice::Required,
+        other => ToolChoice::Named(other.to_string()),
+    }
+}
+
 /// Convert proto `Message` list with `parts` into engine `MultimodalMessage` list.
 ///
 /// Enforces the same per-image byte cap as the HTTP path so the gRPC entry
@@ -196,81 +218,123 @@ impl Spindll for SpindllService {
             let params = proto_params_to_engine(req.params);
             let start = std::time::Instant::now();
 
+            // Tool calling (prompt injection — mirrors the HTTP `/v1` surface; no
+            // model-native grammar on llama-cpp-2 0.1.150). When active, the text
+            // path buffers output so calls can be parsed from the full response.
+            let tool_specs: Vec<crate::engine::tools::ToolSpec> = req
+                .tools
+                .iter()
+                .map(|t| crate::engine::tools::ToolSpec {
+                    name: t.name.clone(),
+                    description: (!t.description.is_empty()).then(|| t.description.clone()),
+                    parameters: serde_json::from_str(&t.parameters_json).ok(),
+                })
+                .collect();
+            let tool_choice = grpc_tool_choice(&req.tool_choice);
+            let has_tools = !tool_specs.is_empty()
+                && !matches!(tool_choice, crate::engine::tools::ToolChoice::None);
+            let mut output = String::new();
+
+            // Text messages (role, content); tool preamble merged into the system
+            // turn when active.
+            let mut messages: Vec<(String, String)> = req
+                .messages
+                .iter()
+                .map(|m| (m.role.clone(), proto_message_text(m)))
+                .collect();
+            // Rendered once; reused for the text turn here and the vision path below.
+            let preamble = crate::engine::tools::tools_to_prompt(&tool_specs, &tool_choice);
+            if let Some(ref preamble) = preamble {
+                match messages.iter_mut().find(|(r, _)| r == "system") {
+                    Some(sys) => sys.1 = format!("{}\n\n{}", sys.1, preamble),
+                    None => messages.insert(0, ("system".to_string(), preamble.clone())),
+                }
+            }
+            let enc_key: Option<[u8; 32]> = (req.encryption_key.len() == 32).then(|| {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&req.encryption_key);
+                arr
+            });
+
             // Vision path only if ≥1 image part. Text-only `parts` stay on text path.
             #[cfg(feature = "vision")]
-            let has_image = req.messages.iter().any(|m| {
-                m.parts.iter().any(|p| p.r#type == "image")
-            });
+            let has_image = req
+                .messages
+                .iter()
+                .any(|m| m.parts.iter().any(|p| p.r#type == "image"));
 
             #[cfg(feature = "vision")]
             let result = if has_image {
-                let mm_messages = match proto_to_multimodal(&req.messages) {
+                let mut mm_messages = match proto_to_multimodal(&req.messages) {
                     Ok(m) => m,
                     Err(e) => {
                         let _ = tx.blocking_send(Err(Status::invalid_argument(e.to_string())));
                         return;
                     }
                 };
+                // Inject the tool preamble so vision + tools works like the text path,
+                // and buffer output when tools are active so calls can be parsed.
+                if let Some(ref preamble) = preamble {
+                    crate::engine::multimodal::inject_system_text(&mut mm_messages, preamble);
+                }
                 mgr.generate_chat_multimodal(&req.model, &mm_messages, &params, |token| {
-                    let resp = ChatResponse {
-                        token: token.to_string(),
-                        done: false,
-                        usage: None,
-                    };
-                    tx.blocking_send(Ok(resp)).is_ok()
+                    if has_tools {
+                        output.push_str(token);
+                        return true;
+                    }
+                    tx.blocking_send(Ok(token_resp(token))).is_ok()
                 })
             } else {
-                let messages: Vec<_> = req.messages.iter()
-                    .map(|m| (m.role.clone(), proto_message_text(m)))
-                    .collect();
-                let enc_key: Option<[u8; 32]> = if req.encryption_key.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&req.encryption_key);
-                    Some(arr)
-                } else {
-                    None
-                };
                 mgr.generate_chat(&req.model, &messages, &params, enc_key.as_ref(), |token| {
-                    let resp = ChatResponse {
-                        token: token.to_string(),
-                        done: false,
-                        usage: None,
-                    };
-                    tx.blocking_send(Ok(resp)).is_ok()
+                    if has_tools {
+                        output.push_str(token);
+                        return true;
+                    }
+                    tx.blocking_send(Ok(token_resp(token))).is_ok()
                 })
             };
 
             #[cfg(not(feature = "vision"))]
-            let result = {
-                let messages: Vec<_> = req.messages.iter()
-                    .map(|m| (m.role.clone(), proto_message_text(m)))
-                    .collect();
-                let enc_key: Option<[u8; 32]> = if req.encryption_key.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&req.encryption_key);
-                    Some(arr)
-                } else {
-                    None
-                };
+            let result =
                 mgr.generate_chat(&req.model, &messages, &params, enc_key.as_ref(), |token| {
-                    let resp = ChatResponse {
-                        token: token.to_string(),
-                        done: false,
-                        usage: None,
-                    };
-                    tx.blocking_send(Ok(resp)).is_ok()
-                })
-            };
+                    if has_tools {
+                        output.push_str(token);
+                        return true;
+                    }
+                    tx.blocking_send(Ok(token_resp(token))).is_ok()
+                });
 
             match result {
                 Err(e) => {
                     let _ = tx.blocking_send(Err(Status::internal(e.to_string())));
                 }
                 Ok(stats) => {
+                    // When tools are active, parse calls from the buffered output and
+                    // emit them (plus any prose) on the final frame.
+                    let (tool_calls, finish_reason) = if has_tools {
+                        let (calls, remaining) = crate::engine::tools::parse_tool_calls(&output);
+                        if !remaining.is_empty() {
+                            let _ = tx.blocking_send(Ok(token_resp(&remaining)));
+                        }
+                        let finish = if calls.is_empty() { "stop" } else { "tool_calls" };
+                        let proto_calls = calls
+                            .into_iter()
+                            .map(|c| crate::proto::ToolCall {
+                                id: c.id,
+                                name: c.name,
+                                arguments: c.arguments,
+                            })
+                            .collect();
+                        (proto_calls, finish.to_string())
+                    } else {
+                        (Vec::new(), "stop".to_string())
+                    };
                     let _ = tx.blocking_send(Ok(ChatResponse {
                         token: String::new(),
                         done: true,
                         usage: Some(send_usage(stats, start.elapsed().as_secs_f32())),
+                        tool_calls,
+                        finish_reason,
                     }));
                 }
             }
