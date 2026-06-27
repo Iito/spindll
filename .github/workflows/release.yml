@@ -283,7 +283,7 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y cmake protobuf-compiler ninja-build libclang-dev libvulkan-dev
+          sudo apt-get update && sudo apt-get install -y cmake protobuf-compiler ninja-build libclang-dev libvulkan-dev glslc
 
       - uses: Swatinem/rust-cache@v2
         with:
