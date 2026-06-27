@@ -168,10 +168,33 @@ jobs:
           "VULKAN_SDK=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "$sdkRoot\Bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
+      # The LunarG SDK ships SPIRV-Headers but not its CMake package config, which
+      # `find_package(SPIRV-Headers CONFIG REQUIRED)` in ggml-vulkan needs. Install
+      # it from source (header-only) and expose it via CMAKE_PREFIX_PATH.
+      - name: Install SPIRV-Headers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = "$env:RUNNER_TEMP\SPIRV-Headers"
+          $prefix = "$env:RUNNER_TEMP\spirv-headers"
+          git clone --depth 1 --branch vulkan-sdk-1.4.313.0 https://github.com/KhronosGroup/SPIRV-Headers.git $src
+          cmake -S $src -B "$src\build" -DCMAKE_INSTALL_PREFIX="$prefix"
+          cmake --build "$src\build" --target install --config Release
+          "CMAKE_PREFIX_PATH=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Install LLVM (bindgen)
         uses: KyleMayes/install-llvm-action@v2
         with:
           version: '17'
+
+      # Build the Vulkan backend with Ninja, not the Visual Studio generator:
+      # vulkan-shaders-gen is a nested ExternalProject whose install step breaks
+      # on the multi-config VS generator. Ninja needs the MSVC env.
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Ninja
+        run: choco install ninja -y
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -182,6 +205,12 @@ jobs:
         shell: pwsh
         env:
           LIBCLANG_PATH: ${{ env.LLVM_PATH }}/bin
+          CMAKE_GENERATOR: Ninja
+          # Force MSVC for the C/C++ build so the nested vulkan-shaders-gen
+          # ExternalProject doesn't auto-pick the bindgen Clang (too old for the
+          # VS18 STL). libclang is still used by bindgen via LIBCLANG_PATH.
+          CC: cl
+          CXX: cl
         run: cargo build --release --features cli,http,vulkan,vision
 
       - name: Package binary
@@ -283,7 +312,7 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y cmake protobuf-compiler ninja-build libclang-dev libvulkan-dev glslc
+          sudo apt-get update && sudo apt-get install -y cmake protobuf-compiler ninja-build libclang-dev libvulkan-dev glslc glslang-tools spirv-tools spirv-headers
 
       - uses: Swatinem/rust-cache@v2
         with:
