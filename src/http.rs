@@ -730,30 +730,22 @@ fn parse_tool_calls(output: &str) -> (Vec<OaiToolCallMessage>, String) {
     (calls, remaining)
 }
 
-/// Prepare messages for template application, injecting a shared tool-description
-/// preamble (`engine::tools::tools_to_prompt`, honoring `tool_choice`) when tools
-/// are active. Returns `(role, content)` pairs for the chat template.
+/// Prepare messages for template application, injecting the pre-rendered tool
+/// preamble (`engine::tools::tools_to_prompt`, built once by the caller and
+/// `None` when tools are inactive) into the system turn. Returns `(role,
+/// content)` pairs for the chat template.
 fn prepare_messages_with_tools(
     messages: &[OaiMessage],
-    tools: &Option<Vec<OaiTool>>,
-    tool_choice: &crate::engine::tools::ToolChoice,
+    tool_preamble: Option<&str>,
 ) -> Vec<(String, String)> {
     let mut result: Vec<(String, String)> = Vec::new();
-
-    // Render the tool preamble once via the shared renderer. Returns None when
-    // there are no tools or tool_choice is "none".
-    let tool_preamble = tools
-        .as_ref()
-        .filter(|t| !t.is_empty())
-        .and_then(|t| crate::engine::tools::tools_to_prompt(&oai_tools_to_specs(t), tool_choice));
-
     let mut system_injected = false;
 
     for msg in messages {
         let content = msg.content.as_ref().map(|c| c.as_text()).unwrap_or_default();
 
         if msg.role == "system" && !system_injected {
-            if let Some(ref preamble) = tool_preamble {
+            if let Some(preamble) = tool_preamble {
                 result.push(("system".to_string(), format!("{content}\n\n{preamble}")));
             } else {
                 result.push(("system".to_string(), content));
@@ -784,7 +776,7 @@ fn prepare_messages_with_tools(
     // If there was no system message but we have tools, inject one
     if !system_injected
         && let Some(preamble) = tool_preamble {
-            result.insert(0, ("system".to_string(), preamble));
+            result.insert(0, ("system".to_string(), preamble.to_string()));
         }
 
     result
@@ -838,10 +830,10 @@ async fn oai_chat_completions(
         && !matches!(tool_choice, crate::engine::tools::ToolChoice::None);
     let include_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
 
-    // Rendered tool preamble for the vision path. The text path injects its own
-    // copy via `prepare_messages_with_tools`; the multimodal path needs it here
-    // so vision + tools doesn't silently drop the tools. Only built when active.
-    #[cfg(feature = "vision")]
+    // Render the tool preamble once and share it: the text path injects it via
+    // `prepare_messages_with_tools`, and the vision path injects it into the
+    // multimodal messages so vision + tools doesn't silently drop the tools.
+    // Only built when tools are active (`None` otherwise → no injection).
     let tool_preamble: Option<String> = has_tools
         .then(|| {
             crate::engine::tools::tools_to_prompt(
@@ -869,7 +861,7 @@ async fn oai_chat_completions(
                 return;
             }
 
-            let messages = prepare_messages_with_tools(&req.messages, &req.tools, &tool_choice);
+            let messages = prepare_messages_with_tools(&req.messages, tool_preamble.as_deref());
             let params = GenerateParams {
                 max_tokens: req.max_tokens.unwrap_or(512),
                 temperature: req.temperature.unwrap_or(0.8),
@@ -883,6 +875,17 @@ async fn oai_chat_completions(
                 .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
             let created = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+
+            // OpenAI's first streamed chunk announces the assistant role; emit it
+            // before any content or tool-call deltas (either branch below) so
+            // accumulating clients set the message role.
+            let _ = tx.blocking_send(Ok(sse_data(&serde_json::json!({
+                "id": &completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": &req.model,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+            }))));
 
             if has_tools {
                 // When tools are active, collect full output to parse tool calls.
@@ -916,24 +919,23 @@ async fn oai_chat_completions(
                             });
                             let _ = tx.blocking_send(Ok(sse_data(&chunk)));
                         };
-                        if tool_calls.is_empty() {
-                            emit(serde_json::json!({ "content": output }));
-                        } else {
-                            if !remaining.is_empty() {
-                                emit(serde_json::json!({ "content": remaining }));
-                            }
-                            for (i, call) in tool_calls.iter().enumerate() {
-                                emit(serde_json::json!({ "tool_calls": [{
-                                    "index": i,
-                                    "id": call.id,
-                                    "type": "function",
-                                    "function": { "name": call.function.name, "arguments": "" }
-                                }]}));
-                                emit(serde_json::json!({ "tool_calls": [{
-                                    "index": i,
-                                    "function": { "arguments": call.function.arguments }
-                                }]}));
-                            }
+                        // Leftover prose (trimmed) goes first as a content delta;
+                        // with no calls this is the whole answer, and a blank one
+                        // is dropped rather than streamed as stray whitespace.
+                        if !remaining.is_empty() {
+                            emit(serde_json::json!({ "content": remaining }));
+                        }
+                        for (i, call) in tool_calls.iter().enumerate() {
+                            emit(serde_json::json!({ "tool_calls": [{
+                                "index": i,
+                                "id": call.id,
+                                "type": "function",
+                                "function": { "name": call.function.name, "arguments": "" }
+                            }]}));
+                            emit(serde_json::json!({ "tool_calls": [{
+                                "index": i,
+                                "function": { "arguments": call.function.arguments }
+                            }]}));
                         }
                         let finish = if !tool_calls.is_empty() { "tool_calls" } else { "stop" };
                         let done_chunk = serde_json::json!({
@@ -1043,7 +1045,7 @@ async fn oai_chat_completions(
         let result = tokio::task::spawn_blocking(move || {
             auto_load(&mgr, &store, &req.model)?;
 
-            let messages = prepare_messages_with_tools(&req.messages, &req.tools, &tool_choice);
+            let messages = prepare_messages_with_tools(&req.messages, tool_preamble.as_deref());
 
             let params = GenerateParams {
                 max_tokens: req.max_tokens.unwrap_or(512),
@@ -1087,7 +1089,8 @@ async fn oai_chat_completions(
                         };
                         (msg, "tool_calls")
                     } else {
-                        (serde_json::json!({"role": "assistant", "content": content}), "stop")
+                        // No call detected — return the parsed (call-free) content.
+                        (serde_json::json!({"role": "assistant", "content": remaining}), "stop")
                     }
                 } else {
                     (serde_json::json!({"role": "assistant", "content": content}), "stop")
