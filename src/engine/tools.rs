@@ -185,9 +185,40 @@ pub fn parse_tool_calls(output: &str) -> (Vec<ToolCall>, String) {
     let require_args = stripped.is_none();
     let body = stripped.unwrap_or(trimmed);
 
+    // 2a. After an explicit prefix the body is commonly a JSON *array* of calls
+    //     (`[{…}, …]`, the documented Mistral shape). Parse it as a whole so the
+    //     array's brackets and commas don't leak into the remaining content.
+    if stripped.is_some()
+        && let Some(result) = parse_json_array_calls(body)
+    {
+        return result;
+    }
+
     // 3. Balanced-JSON scan: pull every top-level `{...}` that looks like a
     //    call. Handles a bare object, several objects, or text + object.
     scan_json_calls(body, require_args)
+}
+
+/// Parse a JSON array of call objects (`[{…}, …]`) — the Mistral / Llama-3.1
+/// prefix form. Returns `Some((calls, trailing_text))` when `text` begins with a
+/// JSON array that yields at least one call (any text after the array becomes
+/// content); `None` otherwise, so the caller falls back to the object scan. The
+/// prefix is an explicit tool-call signal, so a missing `arguments` defaults to
+/// `{}` (lenient), matching the wrapped/prefix object paths.
+fn parse_json_array_calls(text: &str) -> Option<(Vec<ToolCall>, String)> {
+    let mut stream = serde_json::Deserializer::from_str(text).into_iter::<Value>();
+    let Value::Array(items) = stream.next()?.ok()? else {
+        return None;
+    };
+    let calls: Vec<ToolCall> = items
+        .iter()
+        .filter_map(|item| call_from_value(item, false))
+        .collect();
+    if calls.is_empty() {
+        return None;
+    }
+    let trailing = text[stream.byte_offset()..].trim().to_string();
+    Some((calls, trailing))
 }
 
 /// Parse the JSON inside each `<open>...</close>` block.
@@ -235,26 +266,26 @@ fn scan_json_calls(text: &str, require_args: bool) -> (Vec<ToolCall>, String) {
     let mut remaining = String::new();
     let mut search_from = 0;
 
-    while search_from < text.len() {
-        let Some(rel) = text[search_from..].find('{') else {
-            // No more braces — the rest is plain text.
-            remaining.push_str(&text[search_from..]);
+    while let Some(rel) = text[search_from..].find('{') {
+        let abs = search_from + rel;
+        let Some(end) = find_json_end(text, abs) else {
+            // No balanced object starts here, so the rest of the text has
+            // unbalanced braces. Keep it as plain text and stop: re-scanning
+            // every following `{` of an unterminated tail is O(n²) and a wall
+            // of `{` from a degenerate decode would stall the request thread.
             break;
         };
-        let abs = search_from + rel;
-        if let Some(end) = find_json_end(text, abs)
-            && let Some(call) = call_from_json_str(&text[abs..end], require_args)
-        {
-            remaining.push_str(&text[search_from..abs]);
-            calls.push(call);
-            search_from = end;
-        } else {
-            // A `{` that doesn't open a valid tool call — keep it as text and
-            // resume scanning just past it, so a later real call isn't missed.
-            remaining.push_str(&text[search_from..=abs]);
-            search_from = abs + 1;
+        remaining.push_str(&text[search_from..abs]);
+        match call_from_json_str(&text[abs..end], require_args) {
+            Some(call) => calls.push(call),
+            // A complete JSON object that isn't a call: keep it verbatim and
+            // resume *past* it. Re-entering would let a nested `{"name",
+            // "arguments"}` be misread as a call and leave broken JSON behind.
+            None => remaining.push_str(&text[abs..end]),
         }
+        search_from = end;
     }
+    remaining.push_str(&text[search_from..]);
 
     (calls, remaining.trim().to_string())
 }
@@ -268,6 +299,13 @@ fn scan_json_calls(text: &str, require_args: bool) -> (Vec<ToolCall>, String) {
 /// `true` so an arbitrary `{"name": …}` object in prose isn't misread as a call.
 fn call_from_json_str(candidate: &str, require_args: bool) -> Option<ToolCall> {
     let parsed: Value = serde_json::from_str(candidate).ok()?;
+    call_from_value(&parsed, require_args)
+}
+
+/// Build a [`ToolCall`] from an already-parsed JSON value. Shares the
+/// `require_args` contract documented on [`call_from_json_str`]; used directly by
+/// the JSON-array path so each element isn't re-serialized and re-parsed.
+fn call_from_value(parsed: &Value, require_args: bool) -> Option<ToolCall> {
     let obj = parsed.as_object()?;
     let name = obj.get("name")?.as_str()?;
     let arguments = match obj.get("arguments") {
@@ -508,6 +546,58 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "f");
         assert_eq!(calls[0].arguments, r#"{"x":1}"#);
+    }
+
+    #[test]
+    fn parse_mistral_array_form_has_no_bracket_junk() {
+        // Mistral's documented shape is a JSON array after the prefix; the array
+        // delimiters must not leak into the remaining content.
+        let out = r#"[TOOL_CALLS][{"name": "a", "arguments": {}}, {"name": "b", "arguments": {"k": "v"}}]"#;
+        let (calls, rest) = parse_tool_calls(out);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "a");
+        assert_eq!(calls[1].name, "b");
+        assert_eq!(calls[1].arguments, r#"{"k":"v"}"#);
+        assert!(rest.is_empty(), "array punctuation leaked as content: {rest:?}");
+    }
+
+    #[test]
+    fn parse_python_tag_array_form() {
+        let out = r#"<|python_tag|>[{"name": "f", "arguments": {"a": 1}}]"#;
+        let (calls, rest) = parse_tool_calls(out);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "f");
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn parse_array_form_keeps_trailing_text() {
+        let out = r#"[TOOL_CALLS][{"name": "f", "arguments": {}}] all done"#;
+        let (calls, rest) = parse_tool_calls(out);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(rest, "all done");
+    }
+
+    #[test]
+    fn parse_nested_call_shaped_object_is_not_a_call() {
+        // A bare object that merely *contains* a {name, arguments} sub-object is
+        // not a call; it must be returned verbatim, not mined for the inner
+        // object (which would also leave broken JSON in the content).
+        let input = r#"{"data": {"name": "f", "arguments": {}}}"#;
+        let (calls, rest) = parse_tool_calls(input);
+        assert!(calls.is_empty());
+        assert_eq!(rest, input);
+    }
+
+    #[test]
+    fn parse_unbalanced_braces_terminates_without_calls() {
+        // A wall of opening braces (degenerate decode) must not be read as calls
+        // and must return promptly — the scan stops at the first unterminated
+        // object instead of rescanning every brace (O(n²)).
+        let input = "{".repeat(4096);
+        let (calls, rest) = parse_tool_calls(&input);
+        assert!(calls.is_empty());
+        assert_eq!(rest, input);
     }
 
     #[test]
