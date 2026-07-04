@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Iito <https://github.com/Iito> and sarmientoF <https://github.com/sarmientoF>
+
 //! Rust FFI wrapper for the `MlxBridge` Swift static library.
 //!
 //! Mirrors the `Engine::generate` signature so the two backends are

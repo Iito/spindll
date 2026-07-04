@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Iito <https://github.com/Iito> and sarmientoF <https://github.com/sarmientoF>
+
 //! Backend-agnostic tool-calling support.
 //!
 //! Spindll owns tool-call *emission* (prompt rendering + parsing); the

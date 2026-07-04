@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Iito <https://github.com/Iito> and sarmientoF <https://github.com/sarmientoF>
+
 //! In-memory KV state cache for the llama.cpp backend.
 //!
 //! Entries are keyed by exact prompt hash, so hits require the same prompt and

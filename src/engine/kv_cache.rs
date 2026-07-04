@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Iito <https://github.com/Iito> and sarmientoF <https://github.com/sarmientoF>
+
 use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
     AeadCore, ChaCha20Poly1305,

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Iito <https://github.com/Iito> and sarmientoF <https://github.com/sarmientoF>
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Proto codegen — always runs.
     println!("cargo:rerun-if-changed=proto/spindll.proto");

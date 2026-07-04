@@ -217,4 +217,6 @@ macOS release binaries are self-contained; no runtime dependencies.
 
 ## License
 
-Apache 2.0
+Licensed under the Apache License, Version 2.0 — see [LICENSE](LICENSE).
+
+Copyright 2026 [Iito](https://github.com/Iito) and [sarmientoF](https://github.com/sarmientoF).

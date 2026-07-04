@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Iito <https://github.com/Iito> and sarmientoF <https://github.com/sarmientoF>
+
 //! Internal types for multimodal (vision) message handling.
 //!
 //! These types represent the engine's canonical form for messages that mix
