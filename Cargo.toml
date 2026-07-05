@@ -63,6 +63,12 @@ sysinfo      = "0.35"
 memory-stats = "1"
 libc         = "0.2"
 urlencoding  = "2"
+# Chat templating — render the model's embedded Hugging Face Jinja template
+# faithfully. minijinja is the engine llama-cpp-2's own docs recommend for
+# templates its legacy formatter can't handle; the pycompat contrib supplies the
+# Python string methods (`.strip()`, `.startswith()`, …) HF templates call.
+minijinja         = "2"
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 # vision (optional)
 base64 = { version = "0.22", optional = true }

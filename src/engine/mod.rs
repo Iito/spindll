@@ -1,6 +1,7 @@
 //! Inference engine — model loading, text generation, KV caching, and metrics.
 
 pub mod batch;
+pub(crate) mod chat_template;
 pub mod kv_cache;
 pub mod kv_ram_cache;
 pub mod manager;
@@ -162,20 +163,103 @@ impl Engine {
     }
 }
 
-/// Apply a model's chat template, falling back to ChatML if none is embedded.
+/// Apply a model's chat template to `messages`, producing a prompt.
 ///
-/// Some templates — notably Gemma's — reject a standalone `system` role and make
-/// llama.cpp's apply return an FFI error (`ffi error -1`). When that happens and
-/// a system message is present, retry with the system content folded into the
-/// first user turn (the shape those models expect) instead of failing the
-/// request.
+/// Prefers **faithful Jinja rendering** of the template baked into the GGUF
+/// (`tokenizer.chat_template`) via [`chat_template::render`] — this handles
+/// arbitrary/unknown templates, thinking tags, and native tool formatting that
+/// llama.cpp's legacy substring formatter cannot. Falls back to the legacy
+/// formatter (with a ChatML default) when the model ships no Jinja template or
+/// minijinja can't render it.
+///
+/// Some templates — notably Gemma's — reject a standalone `system` role. When
+/// that happens and a system message is present, we retry with the system
+/// content folded into the first user turn (the shape those models expect)
+/// before giving up.
 ///
 /// `override_tmpl`, when set, takes precedence over the model's embedded
-/// template. It may be a raw Jinja template or a built-in template name (e.g.
-/// "gemma", "chatml") — `LlamaChatTemplate::new` accepts both. This lets a
-/// model that ships a broken or unusable chat template be corrected without
-/// re-quantizing it (see the sidecar `.jinja` convention in the llama.cpp backend).
+/// template. A raw Jinja override is rendered by minijinja; a built-in template
+/// *name* (e.g. "gemma", "chatml") is resolved by the legacy formatter. This
+/// lets a model that ships a broken template be corrected without re-quantizing
+/// it (see the sidecar `.jinja` convention in the llama.cpp backend).
 pub(crate) fn apply_chat_template_with_fallback(
+    model: &LlamaModel,
+    messages: &[(String, String)],
+    override_tmpl: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(source) = jinja_template_source(model, override_tmpl) {
+        match try_render_jinja(model, &source, messages) {
+            Ok(rendered) => return Ok(rendered),
+            Err(e) => tracing::debug!(
+                "Jinja chat template render failed ({e}); falling back to legacy formatter"
+            ),
+        }
+    }
+    apply_legacy_chat_template(model, messages, override_tmpl)
+}
+
+/// The raw Jinja template to render, if one is available. A raw-Jinja override
+/// wins; otherwise the model's embedded `tokenizer.chat_template`. Returns
+/// `None` for a built-in-name override or a model with no embedded template —
+/// both of which the legacy formatter handles.
+fn jinja_template_source(model: &LlamaModel, override_tmpl: Option<&str>) -> Option<String> {
+    match override_tmpl {
+        Some(t) if looks_like_jinja(t) => Some(t.to_string()),
+        Some(_) => None, // built-in template name — resolved by the legacy path
+        None => model
+            .meta_val_str("tokenizer.chat_template")
+            .ok()
+            .filter(|t| looks_like_jinja(t)),
+    }
+}
+
+/// A template string is Jinja (rather than a built-in name like "chatml") if it
+/// contains Jinja delimiters.
+fn looks_like_jinja(t: &str) -> bool {
+    t.contains("{{") || t.contains("{%")
+}
+
+/// Render `source` with minijinja, retrying with the system role folded into the
+/// first user turn if the template rejects a standalone system message.
+fn try_render_jinja(
+    model: &LlamaModel,
+    source: &str,
+    messages: &[(String, String)],
+) -> anyhow::Result<String> {
+    let bos = special_token_text(model, model.token_bos());
+    let eos = special_token_text(model, model.token_eos());
+
+    match chat_template::render(source, messages, &bos, &eos, true) {
+        Ok(rendered) => Ok(rendered),
+        Err(first_err) if has_system_message(messages) => {
+            tracing::debug!(
+                "Jinja template rejected the system role; folding it into the first user turn"
+            );
+            chat_template::render(source, &fold_system_into_user(messages), &bos, &eos, true)
+                .map_err(|retry_err| {
+                    anyhow::anyhow!(
+                        "{first_err} (also failed after folding the system role into the user turn: {retry_err})"
+                    )
+                })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The textual form of a special token (e.g. `<s>`, `<|begin_of_text|>`) for the
+/// Jinja context. `special = true` renders the token's special-token text rather
+/// than plaintext. Empty if the model can't render it.
+fn special_token_text(model: &LlamaModel, token: llama_cpp_2::token::LlamaToken) -> String {
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    model
+        .token_to_piece(token, &mut decoder, true, None)
+        .unwrap_or_default()
+}
+
+/// llama.cpp's built-in (non-Jinja) formatter: substring-detects the format or
+/// resolves an explicit built-in template name, with a ChatML default and the
+/// system-role fold recovery. The fallback when Jinja rendering isn't available.
+fn apply_legacy_chat_template(
     model: &LlamaModel,
     messages: &[(String, String)],
     override_tmpl: Option<&str>,
