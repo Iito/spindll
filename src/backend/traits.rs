@@ -3,6 +3,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::engine::streaming::{GenerateParams, GenerateResult};
+use crate::engine::tools::{ToolChoice, ToolSpec};
 
 pub struct BackendLoadParams {
     /// Requested context size. 0 = auto-resolve to the largest n_ctx that
@@ -37,9 +38,14 @@ pub trait BackendModel: Send + Sync {
         on_token: &mut dyn FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult>;
 
+    /// Render the chat template for `messages`. When `tools` is non-empty and
+    /// `tool_choice` isn't [`ToolChoice::None`], the specs are rendered through
+    /// the model's tool-aware template (or injected as a preamble as a fallback).
     fn apply_chat_template(
         &self,
         messages: &[(String, String)],
+        tools: &[ToolSpec],
+        tool_choice: &ToolChoice,
     ) -> anyhow::Result<String>;
 
     /// Apply the chat template and generate in one call.
@@ -50,10 +56,12 @@ pub trait BackendModel: Send + Sync {
     fn generate_chat(
         &self,
         messages: &[(String, String)],
+        tools: &[ToolSpec],
+        tool_choice: &ToolChoice,
         params: &GenerateParams,
         on_token: &mut dyn FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
-        let prompt = self.apply_chat_template(messages)?;
+        let prompt = self.apply_chat_template(messages, tools, tool_choice)?;
         self.generate(&prompt, params, on_token)
     }
 
