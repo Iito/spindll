@@ -114,7 +114,7 @@ impl Engine {
         &self,
         messages: &[(String, String)],
     ) -> anyhow::Result<String> {
-        apply_chat_template_with_fallback(&self.model, messages, None)
+        apply_chat_template_with_fallback(&self.model, messages, &[], &ToolChoice::None, None)
     }
 
     /// Enable the disk-backed KV cache with the given maximum size in bytes.
@@ -177,6 +177,11 @@ impl Engine {
 /// content folded into the first user turn (the shape those models expect)
 /// before giving up.
 ///
+/// When `tools` are active, they are rendered through the template's `tools`
+/// variable if the template supports it (the model's trained tool format);
+/// otherwise the tool preamble is injected into the messages. Exactly one of the
+/// two paths runs, so native and injected tool descriptions never both appear.
+///
 /// `override_tmpl`, when set, takes precedence over the model's embedded
 /// template. A raw Jinja override is rendered by minijinja; a built-in template
 /// *name* (e.g. "gemma", "chatml") is resolved by the legacy formatter. This
@@ -185,17 +190,69 @@ impl Engine {
 pub(crate) fn apply_chat_template_with_fallback(
     model: &LlamaModel,
     messages: &[(String, String)],
+    tools: &[ToolSpec],
+    tool_choice: &ToolChoice,
     override_tmpl: Option<&str>,
 ) -> anyhow::Result<String> {
+    // Tools are "active" only when present and not explicitly disabled.
+    let tools_active = !tools.is_empty() && !matches!(tool_choice, ToolChoice::None);
+
     if let Some(source) = jinja_template_source(model, override_tmpl) {
-        match try_render_jinja(model, &source, messages) {
+        // Render `tools` natively only when the template actually consumes them
+        // (references `tools`); otherwise fall back to injecting the preamble.
+        // Never both — a single tool-system avoids native/injected drift.
+        let native_tools = (tools_active && source.contains("tools"))
+            .then(|| tools_to_oai_value(tools))
+            .flatten();
+        let injected;
+        let msgs = if tools_active && native_tools.is_none() {
+            injected = inject_tool_preamble(messages, tools, tool_choice);
+            injected.as_slice()
+        } else {
+            messages
+        };
+
+        match try_render_jinja(model, &source, msgs, native_tools.as_ref()) {
             Ok(rendered) => return Ok(rendered),
             Err(e) => tracing::debug!(
                 "Jinja chat template render failed ({e}); falling back to legacy formatter"
             ),
         }
     }
-    apply_legacy_chat_template(model, messages, override_tmpl)
+
+    // The legacy substring formatter can't render tools natively — inject.
+    if tools_active {
+        let injected = inject_tool_preamble(messages, tools, tool_choice);
+        apply_legacy_chat_template(model, &injected, override_tmpl)
+    } else {
+        apply_legacy_chat_template(model, messages, override_tmpl)
+    }
+}
+
+/// The OpenAI `tools` array as a JSON value for the template's `tools` variable.
+fn tools_to_oai_value(tools: &[ToolSpec]) -> Option<serde_json::Value> {
+    let json = tools::tools_to_oai_json(tools)?;
+    serde_json::from_str(&json).ok()
+}
+
+/// Fold the tool-injection preamble into `messages` (merged into the first system
+/// turn, or prepended as one) — the fallback for templates/formatters that can't
+/// render `tools` natively. Keeps a single tool-system so native and injected
+/// tool descriptions never both appear.
+fn inject_tool_preamble(
+    messages: &[(String, String)],
+    tools: &[ToolSpec],
+    choice: &ToolChoice,
+) -> Vec<(String, String)> {
+    let Some(preamble) = tools::tools_to_prompt(tools, choice) else {
+        return messages.to_vec();
+    };
+    let mut out = messages.to_vec();
+    match out.iter_mut().find(|(role, _)| role == "system") {
+        Some((_, content)) => *content = format!("{content}\n\n{preamble}"),
+        None => out.insert(0, ("system".to_string(), preamble)),
+    }
+    out
 }
 
 /// The raw Jinja template to render, if one is available. A raw-Jinja override
@@ -225,17 +282,18 @@ fn try_render_jinja(
     model: &LlamaModel,
     source: &str,
     messages: &[(String, String)],
+    tools: Option<&serde_json::Value>,
 ) -> anyhow::Result<String> {
     let bos = special_token_text(model, model.token_bos());
     let eos = special_token_text(model, model.token_eos());
 
-    match chat_template::render(source, messages, &bos, &eos, true) {
+    match chat_template::render(source, messages, tools, &bos, &eos, true) {
         Ok(rendered) => Ok(rendered),
         Err(first_err) if has_system_message(messages) => {
             tracing::debug!(
                 "Jinja template rejected the system role; folding it into the first user turn"
             );
-            chat_template::render(source, &fold_system_into_user(messages), &bos, &eos, true)
+            chat_template::render(source, &fold_system_into_user(messages), tools, &bos, &eos, true)
                 .map_err(|retry_err| {
                     anyhow::anyhow!(
                         "{first_err} (also failed after folding the system role into the user turn: {retry_err})"

@@ -25,9 +25,14 @@ use minijinja::{Environment, Error, ErrorKind, Value, context};
 /// model's special-token strings (templates reference them directly, e.g.
 /// `{{ bos_token }}`). With `add_generation_prompt` the template appends the
 /// opening of an assistant turn so the model continues from there.
+///
+/// `tools`, when `Some`, is the OpenAI `[{"type":"function","function":{…}}]`
+/// array bound to the template's `tools` variable so tool-aware templates emit
+/// the model's trained tool-calling format.
 pub(crate) fn render(
     template: &str,
     messages: &[(String, String)],
+    tools: Option<&serde_json::Value>,
     bos_token: &str,
     eos_token: &str,
     add_generation_prompt: bool,
@@ -60,8 +65,14 @@ pub(crate) fn render(
         .map(|(role, content)| serde_json::json!({ "role": role, "content": content }))
         .collect();
 
+    // `tools` (the OpenAI `[{type, function}]` array) is exposed only when
+    // present; left undefined otherwise so `{% if tools %}` is falsy and
+    // tool-aware templates render their model-native tool preamble.
+    let tools_ctx = tools.map(Value::from_serialize).unwrap_or(Value::UNDEFINED);
+
     tmpl.render(context! {
         messages => Value::from_serialize(&msgs),
+        tools => tools_ctx,
         add_generation_prompt => add_generation_prompt,
         bos_token => bos_token,
         eos_token => eos_token,
@@ -108,6 +119,7 @@ mod tests {
         let out = render(
             CHATML,
             &msgs(&[("system", "You are helpful."), ("user", "Hi")]),
+            None,
             "<s>",
             "</s>",
             true,
@@ -123,7 +135,7 @@ mod tests {
 
     #[test]
     fn omits_generation_prompt_when_disabled() {
-        let out = render(CHATML, &msgs(&[("user", "Hi")]), "<s>", "</s>", false).unwrap();
+        let out = render(CHATML, &msgs(&[("user", "Hi")]), None, "<s>", "</s>", false).unwrap();
         assert_eq!(out, "<|im_start|>user\nHi<|im_end|>\n");
     }
 
@@ -133,6 +145,7 @@ mod tests {
         let out = render(
             "{{ messages[0]['content'].strip().upper() }}",
             &msgs(&[("user", "  hi there  ")]),
+            None,
             "<s>",
             "</s>",
             false,
@@ -146,6 +159,7 @@ mod tests {
         let out = render(
             "{{ bos_token }}{{ messages[0]['content'] }}",
             &msgs(&[("user", "x")]),
+            None,
             "<|begin_of_text|>",
             "</s>",
             false,
@@ -158,7 +172,8 @@ mod tests {
     fn raise_exception_becomes_render_error() {
         let tmpl = "{% if messages[0]['role'] == 'system' %}\
                     {{ raise_exception('System role not supported') }}{% endif %}ok";
-        let err = render(tmpl, &msgs(&[("system", "hello")]), "<s>", "</s>", false).unwrap_err();
+        let err = render(tmpl, &msgs(&[("system", "hello")]), None, "<s>", "</s>", false)
+            .unwrap_err();
         assert!(
             err.to_string().contains("System role not supported"),
             "error should carry the template's message, got: {err}"
@@ -171,7 +186,7 @@ mod tests {
         // after a `%}`, so block tags on their own lines don't inject blank
         // lines between turns.
         let tmpl = "{% for m in messages %}\n{{ m['content'] }}\n{% endfor %}";
-        let out = render(tmpl, &msgs(&[("user", "a"), ("assistant", "b")]), "<s>", "</s>", false)
+        let out = render(tmpl, &msgs(&[("user", "a"), ("assistant", "b")]), None, "<s>", "</s>", false)
             .unwrap();
         assert_eq!(out, "a\nb\n");
     }
@@ -184,6 +199,7 @@ mod tests {
         let out = render(
             "x\n    {% if true %}y{% endif %}",
             &msgs(&[("user", "unused")]),
+            None,
             "<s>",
             "</s>",
             false,
@@ -194,8 +210,37 @@ mod tests {
 
     #[test]
     fn invalid_template_is_an_error_not_a_panic() {
-        let err = render("{% for x in %}", &msgs(&[("user", "hi")]), "<s>", "</s>", false)
+        let err = render("{% for x in %}", &msgs(&[("user", "hi")]), None, "<s>", "</s>", false)
             .unwrap_err();
         assert!(err.to_string().contains("chat template"));
+    }
+
+    #[test]
+    fn tools_are_exposed_to_tool_aware_templates() {
+        // A tool-aware template renders the model-native tool preamble from the
+        // `tools` array (OpenAI `{type, function}` shape).
+        let tmpl = "{% if tools %}{% for t in tools %}<tool>{{ t.function.name }}</tool>{% endfor %}{% endif %}{{ messages[0]['content'] }}";
+        let tools = serde_json::json!([
+            {"type": "function", "function": {"name": "get_weather", "parameters": {}}}
+        ]);
+        let out = render(
+            tmpl,
+            &msgs(&[("user", "hi")]),
+            Some(&tools),
+            "<s>",
+            "</s>",
+            false,
+        )
+        .unwrap();
+        assert_eq!(out, "<tool>get_weather</tool>hi");
+    }
+
+    #[test]
+    fn absent_tools_are_falsy_not_an_error() {
+        // With no tools, `{% if tools %}` must be false (undefined, not an empty
+        // sequence that errors) so ordinary turns render unchanged.
+        let tmpl = "{% if tools %}TOOLS{% endif %}{{ messages[0]['content'] }}";
+        let out = render(tmpl, &msgs(&[("user", "hi")]), None, "<s>", "</s>", false).unwrap();
+        assert_eq!(out, "hi");
     }
 }

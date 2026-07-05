@@ -14,6 +14,7 @@ use llama_cpp_2::sampling::LlamaSampler;
 
 use crate::engine::streaming::{GenerateParams, GenerateResult, generate_streaming};
 use crate::engine::apply_chat_template_with_fallback;
+use crate::engine::tools::{ToolChoice, ToolSpec};
 #[cfg(feature = "vision")]
 use crate::engine::multimodal::{ContentPart, MultimodalMessage};
 use super::traits::{BackendLoadParams, BackendModel, EmbedResult, InferenceBackend};
@@ -243,8 +244,16 @@ impl BackendModel for LlamaCppModel {
     fn apply_chat_template(
         &self,
         messages: &[(String, String)],
+        tools: &[ToolSpec],
+        tool_choice: &ToolChoice,
     ) -> anyhow::Result<String> {
-        apply_chat_template_with_fallback(&self.model, messages, self.chat_template_override.as_deref())
+        apply_chat_template_with_fallback(
+            &self.model,
+            messages,
+            tools,
+            tool_choice,
+            self.chat_template_override.as_deref(),
+        )
     }
 
     fn n_ctx(&self) -> u32 {
@@ -363,9 +372,13 @@ impl BackendModel for LlamaCppModel {
         }
 
         // Apply the model's chat template to get the final prompt string.
+        // Vision + tools still inject the tool preamble upstream (into the
+        // multimodal messages), so no tools are rendered natively here.
         let prompt = apply_chat_template_with_fallback(
             &self.model,
             &template_messages,
+            &[],
+            &ToolChoice::None,
             self.chat_template_override.as_deref(),
         )?;
 

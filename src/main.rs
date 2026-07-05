@@ -637,12 +637,20 @@ async fn main() -> anyhow::Result<()> {
                 params.max_tokens = max;
             }
 
-            manager.generate_chat(&model, &messages, &params, None, |token| {
-                use std::io::Write;
-                print!("{token}");
-                std::io::stdout().flush().ok();
-                true
-            })?;
+            manager.generate_chat(
+                &model,
+                &messages,
+                &[],
+                &spindll::engine::ToolChoice::None,
+                &params,
+                None,
+                |token| {
+                    use std::io::Write;
+                    print!("{token}");
+                    std::io::stdout().flush().ok();
+                    true
+                },
+            )?;
             println!();
         }
         #[cfg(feature = "bench")]
