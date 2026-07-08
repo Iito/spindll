@@ -1459,6 +1459,7 @@ mod tests {
         let mut token_count = 0u32;
         let result = mgr.generate_chat("test-mlx",
             &[("user".into(), "Hello".into())],
+            &[], &crate::engine::tools::ToolChoice::None,
             &params, None, |_| { token_count += 1; true },
         ).unwrap();
         assert_eq!(result.completion_tokens, 0);
@@ -1479,6 +1480,7 @@ mod tests {
         let mut token_count = 0u32;
         let _ = mgr.generate_chat("test-mlx",
             &[("user".into(), "Count from 1 to 50".into())],
+            &[], &crate::engine::tools::ToolChoice::None,
             &params, None, |_| { token_count += 1; false },
         );
         assert!(token_count <= 1, "expected at most 1 token, got {token_count}");

@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::mpsc;
 
 use crate::engine::streaming::{GenerateParams, GenerateResult};
+use crate::engine::tools::{ToolChoice, ToolSpec};
 use super::traits::{BackendLoadParams, BackendModel, EmbedResult, InferenceBackend};
 
 // ---------------------------------------------------------------------------
@@ -37,6 +38,7 @@ unsafe extern "C" {
     fn mlx_chat_generate(
         handle:        *mut MlxModelHandle,
         messages_json: *const c_char,
+        tools_json:    *const c_char,
         max_tokens:    u32,
         temperature:   f32,
         top_p:         f32,
@@ -62,6 +64,7 @@ unsafe extern "C" {
     fn mlx_apply_chat_template(
         handle:        *mut MlxModelHandle,
         messages_json: *const c_char,
+        tools_json:    *const c_char,
     ) -> *const c_char;
 
     fn mlx_free_string(s: *const c_char);
@@ -108,6 +111,17 @@ unsafe extern "C" fn token_callback(token: *const c_char, ctx: *mut c_void) -> c
     }
     let s = unsafe { CStr::from_ptr(token) }.to_string_lossy().into_owned();
     if sender.tx.send(s).is_err() { 0 } else { 1 }
+}
+
+/// Encode active tool specs as an OpenAI JSON array `CString` for the Swift
+/// bridge's `applyChatTemplate(messages:tools:)`. `None` (→ null pointer) when
+/// tools are inactive: empty specs or `tool_choice` = [`ToolChoice::None`].
+fn encode_tools(tools: &[ToolSpec], tool_choice: &ToolChoice) -> Option<CString> {
+    if tools.is_empty() || matches!(tool_choice, ToolChoice::None) {
+        return None;
+    }
+    let json = crate::engine::tools::tools_to_oai_json(tools)?;
+    CString::new(json).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +240,8 @@ impl MlxSwiftEngine {
     fn chat_generate_dyn(
         &self,
         messages: &[(String, String)],
+        tools: &[ToolSpec],
+        tool_choice: &ToolChoice,
         params: &GenerateParams,
         on_token: &mut dyn FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
@@ -236,6 +252,9 @@ impl MlxSwiftEngine {
         let json_str = serde_json::to_string(&json)
             .map_err(|e| anyhow::anyhow!("failed to encode chat messages: {e}"))?;
         let c_json = CString::new(json_str)?;
+        // Active tools, encoded as the OpenAI JSON array for swift-transformers'
+        // `applyChatTemplate(messages:tools:)`; null when tools are off.
+        let c_tools = encode_tools(tools, tool_choice);
 
         let (tx, rx) = mpsc::sync_channel::<String>(64);
         let sender = Box::new(TokenSender { tx });
@@ -251,10 +270,12 @@ impl MlxSwiftEngine {
         let join = std::thread::spawn(move || {
             let h = handle_addr as *mut MlxModelHandle;
             let s = sender_addr as *mut TokenSender;
+            let tools_ptr = c_tools.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
             let result = unsafe {
                 mlx_chat_generate(
                     h,
                     c_json.as_ptr(),
+                    tools_ptr,
                     max_tok,
                     temp,
                     top_p,
@@ -552,6 +573,8 @@ impl BackendModel for MlxSwiftEngine {
     fn generate_chat(
         &self,
         messages: &[(String, String)],
+        tools: &[ToolSpec],
+        tool_choice: &ToolChoice,
         params: &GenerateParams,
         on_token: &mut dyn FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
@@ -559,15 +582,17 @@ impl BackendModel for MlxSwiftEngine {
         if params.prefill_only {
             return Ok(GenerateResult { prompt_tokens: 0, completion_tokens: 0, cache_hit: false });
         }
-        self.chat_generate_dyn(messages, params, on_token)
+        self.chat_generate_dyn(messages, tools, tool_choice, params, on_token)
     }
 
     fn apply_chat_template(
         &self,
         messages: &[(String, String)],
+        tools: &[ToolSpec],
+        tool_choice: &ToolChoice,
     ) -> anyhow::Result<String> {
         // Encode messages as JSON for the Swift bridge. swift-transformers'
-        // applyChatTemplate(messages:) takes [[String: String]] — the same
+        // applyChatTemplate(messages:tools:) takes [[String: String]] — the same
         // {role, content} shape the OpenAI/HF ecosystem uses everywhere.
         let json: Vec<serde_json::Value> = messages
             .iter()
@@ -578,8 +603,11 @@ impl BackendModel for MlxSwiftEngine {
         let json_str = serde_json::to_string(&json)
             .map_err(|e| anyhow::anyhow!("failed to encode chat messages: {e}"))?;
         let c_json = CString::new(json_str)?;
+        // Active tools as the OpenAI JSON array (null pointer when off).
+        let c_tools = encode_tools(tools, tool_choice);
+        let tools_ptr = c_tools.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
 
-        let raw = unsafe { mlx_apply_chat_template(self.handle, c_json.as_ptr()) };
+        let raw = unsafe { mlx_apply_chat_template(self.handle, c_json.as_ptr(), tools_ptr) };
         if raw.is_null() {
             anyhow::bail!(
                 "MLX tokenizer returned no chat template — model may lack \
