@@ -38,6 +38,11 @@ mlx    = []
 bench  = ["cli"]
 # Vision / multimodal support via llama.cpp's mtmd (multimodal) API.
 vision = ["llama-cpp-2/mtmd", "dep:base64"]
+# Grammar-constrained decoding (GBNF via llama.cpp's json-schema-to-grammar and
+# lazy grammar sampler). Opt-in: pulls in llama-cpp-2's `common` library, which
+# compiles llama.cpp's common/ C++ sources (adds build time). Forces a valid
+# tool call when `tool_choice` is `required` or names a function.
+grammar = ["llama-cpp-2/common"]
 
 [dependencies]
 # Core — always compiled

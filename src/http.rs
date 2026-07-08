@@ -225,6 +225,7 @@ async fn chat(
                 top_k: p.top_k.unwrap_or(40),
                 seed: p.seed.unwrap_or(42),
                 prefill_only: false,
+                ..Default::default()
             },
             None => GenerateParams::default(),
         };
@@ -871,6 +872,7 @@ async fn oai_chat_completions(
                 top_k: 40,
                 seed: req.seed.unwrap_or(42),
                 prefill_only: false,
+                ..Default::default()
             };
 
             let completion_id = format!("chatcmpl-{:016x}", std::time::SystemTime::now()
@@ -1056,6 +1058,7 @@ async fn oai_chat_completions(
                 top_k: 40,
                 seed: req.seed.unwrap_or(42),
                 prefill_only: false,
+                ..Default::default()
             };
 
             let mut output = String::new();
@@ -1172,6 +1175,7 @@ async fn oai_completions(
                 top_k: 40,
                 seed: req.seed.unwrap_or(42),
                 prefill_only: false,
+                ..Default::default()
             };
 
             let completion_id = format!("cmpl-{:016x}", std::time::SystemTime::now()
@@ -1229,6 +1233,7 @@ async fn oai_completions(
                 top_k: 40,
                 seed: req.seed.unwrap_or(42),
                 prefill_only: false,
+                ..Default::default()
             };
 
             let mut output = String::new();
