@@ -678,6 +678,7 @@ impl ModelManager {
                 top_k: params.top_k,
                 seed: params.seed,
                 prefill_only: params.prefill_only,
+                ..Default::default()
             },
             response_tx: resp_tx,
         };
@@ -792,6 +793,14 @@ impl ModelManager {
             })
         };
         *self.last_activity.write().unwrap() = Instant::now();
+
+        // Under the `grammar` feature, attach a lazy GBNF grammar that forces a
+        // valid tool call when tool_choice requires one (no-op otherwise). Done
+        // here so every llama.cpp path (batch, KV cache, direct) inherits it.
+        #[cfg(feature = "grammar")]
+        let grammared = params.clone().with_tool_grammar(tools, tool_choice);
+        #[cfg(feature = "grammar")]
+        let params = &grammared;
 
         let start = Instant::now();
         let result = if let Some(tx) = batch_tx {

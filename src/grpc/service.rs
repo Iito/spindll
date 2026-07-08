@@ -33,6 +33,7 @@ fn proto_params_to_engine(p: Option<crate::proto::GenerateParams>) -> GeneratePa
             top_k:       p.top_k      .unwrap_or(40),
             seed:        p.seed       .map(|v| v as u32).unwrap_or(42),
             prefill_only: false,
+            ..Default::default()
         },
         None => GenerateParams::default(),
     }

@@ -2,6 +2,8 @@
 
 pub mod batch;
 pub(crate) mod chat_template;
+#[cfg(feature = "grammar")]
+pub(crate) mod grammar;
 pub mod kv_cache;
 pub mod kv_ram_cache;
 pub mod manager;
