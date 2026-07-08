@@ -566,12 +566,41 @@ public func mlxGenerate(
 /// Models whose `tokenizer_config.json` omits the `chat_template` field
 /// (common with multimodal models like Qwen-VL) will hit the fallback
 /// path: messages are formatted in ChatML and encoded directly.
+/// Recursively convert a `JSONSerialization` value into a `Sendable` value.
+/// swift-transformers' `ToolSpec` is `[String: any Sendable]`, but
+/// `JSONSerialization` yields non-`Sendable` nested `NSDictionary`/`NSArray`, so
+/// rebuild the structure with Sendable containers.
+private func jsonToSendable(_ value: Any) -> any Sendable {
+    switch value {
+    case let s as String: return s
+    case let n as NSNumber: return n
+    case let a as [Any]: return a.map(jsonToSendable)
+    case let d as [String: Any]: return d.mapValues(jsonToSendable)
+    default: return ""  // JSON null / unexpected → empty string (Sendable)
+    }
+}
+
+/// Decode a JSON array of OpenAI tool specs (`[{type, function}]`) into the
+/// `[[String: any Sendable]]` (== `[ToolSpec]`) shape that
+/// `applyChatTemplate(messages:tools:)` expects. Returns nil for a
+/// null/empty/invalid pointer so no `tools` variable is bound in the template.
+private func decodeTools(_ toolsJson: UnsafePointer<CChar>?) -> [[String: any Sendable]]? {
+    guard let toolsJson,
+          let data = String(cString: toolsJson).data(using: .utf8),
+          let parsed = try? JSONSerialization.jsonObject(with: data),
+          let arr = parsed as? [Any]
+    else { return nil }
+    let tools = arr.compactMap { ($0 as? [String: Any])?.mapValues(jsonToSendable) }
+    return tools.isEmpty ? nil : tools
+}
+
 private func applyChatTemplateWithFallback(
     tokenizer: any MLXLMCommon.Tokenizer,
-    messages: [[String: String]]
+    messages: [[String: String]],
+    tools: [[String: any Sendable]]?
 ) throws -> [Int] {
     do {
-        return try tokenizer.applyChatTemplate(messages: messages)
+        return try tokenizer.applyChatTemplate(messages: messages, tools: tools)
     } catch is MLXLMCommon.TokenizerError {
         fputs("[mlx-bridge] model has no chat template, using ChatML fallback\n", stderr)
         var chatML = ""
@@ -643,6 +672,7 @@ private func snapshotCache(_ cache: [any KVCache], bits: Int) -> [any KVCache] {
 public func mlxChatGenerate(
     _ handle:      UnsafeMutableRawPointer?,
     _ messagesJson: UnsafePointer<CChar>?,
+    _ toolsJson:   UnsafePointer<CChar>?,
     _ maxTokens:   UInt32,
     _ temperature: Float,
     _ topP:        Float,
@@ -653,6 +683,7 @@ public func mlxChatGenerate(
     guard let handle, let messagesJson else { return -1 }
     let state = Unmanaged<ModelState>.fromOpaque(handle).takeUnretainedValue()
     let json = String(cString: messagesJson)
+    let tools = decodeTools(toolsJson)
 
     guard
         let data = json.data(using: .utf8),
@@ -675,7 +706,7 @@ public func mlxChatGenerate(
             try await state.container.perform(nonSendable: messages) { context, msgs in
                 // Apply the chat template once → token IDs. No decode → encode round-trip.
                 let rawIds  = try applyChatTemplateWithFallback(
-                    tokenizer: context.tokenizer, messages: msgs)
+                    tokenizer: context.tokenizer, messages: msgs, tools: tools)
                 let tokenIds = rawIds.map { Int32($0) }
 
                 // --- Prompt KV cache (prefix reuse) ---
@@ -1055,11 +1086,13 @@ public func mlxChatGenerateVision(
 @_cdecl("mlx_apply_chat_template")
 public func mlxApplyChatTemplate(
     _ handle: UnsafeMutableRawPointer?,
-    _ messagesJson: UnsafePointer<CChar>?
+    _ messagesJson: UnsafePointer<CChar>?,
+    _ toolsJson: UnsafePointer<CChar>?
 ) -> UnsafePointer<CChar>? {
     guard let handle, let messagesJson else { return nil }
     let state = Unmanaged<ModelState>.fromOpaque(handle).takeUnretainedValue()
     let json = String(cString: messagesJson)
+    let tools = decodeTools(toolsJson)
 
     // Decode JSON → [[String: String]] (the shape Tokenizers' applyChatTemplate expects).
     guard
@@ -1079,7 +1112,7 @@ public func mlxApplyChatTemplate(
                 // tokenizer (the MLX path then re-tokenizes via UserInput).
                 // add_generation_prompt is on by default in swift-transformers.
                 let ids = try applyChatTemplateWithFallback(
-                    tokenizer: context.tokenizer, messages: messages)
+                    tokenizer: context.tokenizer, messages: messages, tools: tools)
                 box.value = context.tokenizer.decode(tokenIds: ids)
             }
         } catch {
