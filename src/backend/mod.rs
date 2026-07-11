@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Iito <https://github.com/Iito> and sarmientoF <https://github.com/sarmientoF>
+
 mod traits;
 pub mod llamacpp;
 pub use traits::{BackendLoadParams, BackendModel, EmbedResult, InferenceBackend};

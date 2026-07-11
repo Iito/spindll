@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Iito <https://github.com/Iito> and sarmientoF <https://github.com/sarmientoF>
+
 //! Model store — download, import, and resolve model files.
 //!
 //! Supports pulling from HuggingFace repos and the Ollama registry, importing

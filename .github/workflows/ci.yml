@@ -106,3 +106,101 @@ jobs:
         env:
           LIBCLANG_PATH: ${{ env.LLVM_PATH }}/bin
         run: cargo check --features cli,http,vision
+
+  # Vulkan is only built in the release workflow (on tag); build it here too so
+  # toolchain breakage (e.g. the SPIRV-Headers / glslc shader deps) is caught on
+  # a PR instead of at release time. `cargo check` still runs the llama-cpp-sys-2
+  # build script, which is where the Vulkan CMake configure happens.
+  vulkan-feature-check:
+    name: vulkan feature check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y \
+            cmake protobuf-compiler ninja-build libclang-dev \
+            libvulkan-dev glslc glslang-tools spirv-tools spirv-headers
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Vulkan SDK (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VULKAN_VERSION: 1.3.290.0
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sdkRoot = "C:\VulkanSDK\$env:VULKAN_VERSION"
+          $installer = Join-Path $env:RUNNER_TEMP "VulkanSDK-$env:VULKAN_VERSION-Installer.exe"
+          Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/VulkanSDK-$env:VULKAN_VERSION-Installer.exe" -OutFile $installer
+          & $installer --root $sdkRoot --accept-licenses --default-answer --confirm-command install
+          "VULKAN_SDK=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$sdkRoot\Bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # The LunarG SDK ships SPIRV-Headers but not its CMake package config, which
+      # `find_package(SPIRV-Headers CONFIG REQUIRED)` in ggml-vulkan needs. Install
+      # it from source (header-only) and expose it via CMAKE_PREFIX_PATH.
+      - name: Install SPIRV-Headers (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = "$env:RUNNER_TEMP\SPIRV-Headers"
+          $prefix = "$env:RUNNER_TEMP\spirv-headers"
+          git clone --depth 1 --branch vulkan-sdk-1.4.313.0 https://github.com/KhronosGroup/SPIRV-Headers.git $src
+          cmake -S $src -B "$src\build" -DCMAKE_INSTALL_PREFIX="$prefix"
+          cmake --build "$src\build" --target install --config Release
+          "CMAKE_PREFIX_PATH=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install LLVM (Windows, bindgen)
+        if: runner.os == 'Windows'
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: '17'
+
+      # Build llama.cpp's Vulkan backend with Ninja, not the Visual Studio
+      # generator: vulkan-shaders-gen is a nested ExternalProject whose install
+      # step breaks on the multi-config VS generator. Ninja needs the MSVC env.
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Ninja (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ninja -y
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-vulkan
+          cache-targets: ${{ runner.os != 'Windows' }}
+
+      - name: Check vulkan feature set (Linux)
+        if: runner.os == 'Linux'
+        run: cargo check --features cli,http,vulkan,vision
+
+      - name: Check vulkan feature set (Windows)
+        if: runner.os == 'Windows'
+        env:
+          LIBCLANG_PATH: ${{ env.LLVM_PATH }}/bin
+          CMAKE_GENERATOR: Ninja
+          # Force MSVC for the C/C++ build so the nested vulkan-shaders-gen
+          # ExternalProject doesn't auto-pick the bindgen Clang (too old for the
+          # VS18 STL). libclang is still used by bindgen via LIBCLANG_PATH.
+          CC: cl
+          CXX: cl
+        run: cargo check --features cli,http,vulkan,vision

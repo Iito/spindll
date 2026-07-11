@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Iito <https://github.com/Iito> and sarmientoF <https://github.com/sarmientoF>
+
 //! Native benchmark client: measures mlx-engine HTTP, spindll HTTP, and spindll gRPC
 //! without Python client overhead.
 //!

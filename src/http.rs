@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Iito <https://github.com/Iito> and sarmientoF <https://github.com/sarmientoF>
+
 //! HTTP/SSE API for direct access from web frontends and CLI tools.
 //!
 //! Provides the same capabilities as the gRPC server in a browser-friendly

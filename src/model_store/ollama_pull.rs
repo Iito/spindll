@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Iito <https://github.com/Iito> and sarmientoF <https://github.com/sarmientoF>
+
 use crate::model_store::import::{OllamaManifest, OllamaLayer};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::Write;

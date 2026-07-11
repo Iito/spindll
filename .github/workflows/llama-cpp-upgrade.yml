@@ -68,7 +68,7 @@ jobs:
             LATEST="$FORCE_VERSION"
           else
             LATEST=$(curl -fsSL \
-              -H "User-Agent: spindll-ci (mansa.camara.jp@gmail.com)" \
+              -H "User-Agent: spindll-ci (8190587+Iito@users.noreply.github.com)" \
               https://crates.io/api/v1/crates/llama-cpp-2 \
               | jq -r '.crate.max_stable_version')
           fi
