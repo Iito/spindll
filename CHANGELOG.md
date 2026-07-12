@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2026-07-12
+
+### Added
+
+- **Faithful Jinja chat templating (GGUF)** — the llama.cpp backend renders the model's embedded `tokenizer.chat_template` with minijinja (Python-compatible string methods via pycompat; Hugging Face `trim_blocks`/`lstrip_blocks` whitespace) instead of llama.cpp's legacy substring formatter, which only recognized a fixed set of formats and errored on anything else. Falls back to the legacy formatter when a model ships no embedded template or the template can't be rendered. Brings GGUF to parity with the MLX backend, which already rendered real Jinja via swift-transformers.
+- **Native tool templating** — `tools` / `tool_choice` now flow through the model's own chat template, so tool specs are rendered in the format each model was trained on rather than a generic injected preamble (kept only as a fallback for templates that don't declare `tools`). Works on both backends — the MLX Swift bridge passes tools to swift-transformers' `applyChatTemplate(messages:tools:)`. Extraction (`parse_tool_calls`) is unchanged.
+- **Grammar-constrained tool decoding** — new opt-in `grammar` Cargo feature (enables `llama-cpp-2/common`). When `tool_choice` is `required` or names a function, a lazy GBNF grammar derived from the tool schemas (`json_schema_to_grammar`) forces the model to emit a syntactically valid tool call, triggered only after a tool-call opener (`<tool_call>` / `[TOOL_CALLS]` / `<|python_tag|>`) so plain text stays unconstrained. Off by default (no build cost).
+
+### Changed
+
+- **`BackendModel` trait (breaking)** — `apply_chat_template` and `generate_chat` now take `tools: &[ToolSpec]` and `tool_choice: &ToolChoice`; external implementers and callers of the trait must update.
+- **Dependency** — `llama-cpp-2` `0.1.150` → `0.1.151`.
+
 ## [0.7.0] - 2026-06-14
 
 ### Added
