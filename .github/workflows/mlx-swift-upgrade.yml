@@ -10,11 +10,11 @@
 #      the mlx-swift tag in Package.resolved against upstream via `git ls-remote`.
 #   2. resolve (macOS, only if something moved): regenerate Package.resolved with
 #      `swift package update`, stage a spindll patch bump, and open a DRAFT PR
-#      against `next` labelled `mlx-validate-required`.
+#      against `main` labelled `mlx-validate-required`.
 #
 # MLX is Apple-only and, per the repo convention, is NOT built in CI — the bridge
 # is validated by hand on a mac (`scripts/mlx-validate.sh`). So this workflow only
-# refreshes the lockfile; it never builds MLX, never pushes to `next`, never tags.
+# refreshes the lockfile; it never builds MLX, never pushes to `main`, never tags.
 # A human runs the mac validation, then merges + pushes the `vX.Y.Z` tag. The
 # spindll patch bump is staged in the PR so that release version is ready on merge.
 #
@@ -44,7 +44,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  BASE_BRANCH: next
+  BASE_BRANCH: main
   LM_REPO: https://github.com/ml-explore/mlx-swift-lm
   CORE_REPO: https://github.com/ml-explore/mlx-swift
 

@@ -4,13 +4,13 @@
 #   1. Compare the locked `llama-cpp-2` version against the latest stable on crates.io.
 #   2. If newer, bump it on a branch and run the same gate CI uses
 #      (`cargo test` + `cargo clippy -D warnings`), building llama.cpp from source.
-#   3. Open a PR against `next`:
+#   3. Open a PR against `main`:
 #        - in-range patch (same major.minor) + green  -> ready-for-review PR.
 #        - new minor/major, or any failure            -> DRAFT PR, labelled for a
 #          human decision (this is the "whether we bump minor depends" gate).
 #
 # It bumps spindll's own patch version to stage a release, but never pushes to
-# `next` and never tags. Releases stay tag-driven (see release.yml): a human
+# `main` and never tags. Releases stay tag-driven (see release.yml): a human
 # reviews/merges this PR, then pushes the matching `vX.Y.Z` tag (promote it to a
 # minor first if the upstream delta warrants — the PR body says so).
 #
@@ -42,7 +42,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  BASE_BRANCH: next
+  BASE_BRANCH: main
 
 jobs:
   upgrade:
