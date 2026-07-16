@@ -13,7 +13,21 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - **`BackendModel` trait (breaking)** — `apply_chat_template` and `generate_chat` now take `tools: &[ToolSpec]` and `tool_choice: &ToolChoice`; external implementers and callers of the trait must update.
-- **Dependency** — `llama-cpp-2` `0.1.150` → `0.1.151`.
+
+## [0.7.1] - 2026-07-12
+
+### Added
+
+- **Apache-2.0 licensing** — `LICENSE` file, SPDX headers on all source files, and a copyright notice in the README.
+
+### Changed
+
+- **llama-cpp-2 0.1.150 → 0.1.151** — binding-level upstream updates: MTP speculative-decoding support, a model-load progress callback on `LlamaModelParams`, an optional Intel MKL build feature, and a Vulkan build fix for `x86_64-pc-windows-gnu`. The bundled llama.cpp version is unchanged.
+
+### Infrastructure
+
+- **Automated release publishing** — `release.yml` opens the GitHub release (or RC pre-release) as soon as tests pass; each platform build uploads its artifact as it finishes. Release notes carry over from the newest RC of the same version, and superseded RC pre-releases are retired when the final tag lands.
+- **Dependency auto-update PRs target `main`** — the daily llama-cpp-2 / mlx-swift upstream checkers now branch off and PR against `main`, so staged patch bumps release directly from `main` instead of riding `next`.
 
 ## [0.7.0] - 2026-06-14
 
