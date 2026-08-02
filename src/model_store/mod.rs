@@ -901,6 +901,12 @@ fn link_or_copy_if_missing(
 }
 
 fn link_or_copy_path(src: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<()> {
+    // `models/<owner>` may not exist yet — symlink, hard_link and copy all fail
+    // with ENOENT when the parent is missing.
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(src, dest)?;
@@ -1017,6 +1023,24 @@ mod tests {
         link_or_copy_if_missing(&src, &dest).unwrap();
 
         assert_eq!(std::fs::read(dest).unwrap(), b"fake");
+    }
+
+    #[test]
+    fn link_or_copy_path_creates_missing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("snapshot");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("model.safetensors"), b"fake").unwrap();
+
+        // models/<owner>/<repo> — <owner> does not exist yet, as on a fresh store.
+        let dest = dir.path().join("models/mlx-community/some-model-4bit");
+
+        link_or_copy_path(&src, &dest).unwrap();
+
+        assert_eq!(
+            std::fs::read(dest.join("model.safetensors")).unwrap(),
+            b"fake"
+        );
     }
 
     #[cfg(windows)]
