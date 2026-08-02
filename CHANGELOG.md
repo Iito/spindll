@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.2] - 2026-08-02
+
+### Fixed
+
+- **MLX import into a fresh model store** — `import_from_hf` linked `models/<owner>/<repo>` without creating `models/<owner>` first, so importing an MLX model from the HuggingFace cache failed with ENOENT on a fresh store and aborted the whole import — including GGUF models staged earlier in the same run, since the registry is only written at the end. `link_or_copy_path` now creates the destination's parent directory, covering all call sites. (#72)
+
 ## [0.7.1] - 2026-07-12
 
 ### Added
