@@ -44,8 +44,9 @@ impl ModelStore {
     /// Create a store rooted at the given directory, or `~/.spindll` if `None`.
     pub fn new(base_dir: Option<PathBuf>) -> Self {
         let base_dir = base_dir.unwrap_or_else(|| {
-            let home = std::env::var("HOME").expect("HOME not set");
-            PathBuf::from(home).join(".spindll")
+            import::home_dir()
+                .expect("cannot determine home directory (HOME/USERPROFILE unset)")
+                .join(".spindll")
         });
         Self { base_dir }
     }
@@ -428,7 +429,9 @@ impl ModelStore {
     /// Import all models from Ollama's local storage.
     pub fn import_from_ollama(&self) -> anyhow::Result<u32> {
         self.ensure_dirs()?;
-        let ollama = import::ollama_dir();
+        let Some(ollama) = import::ollama_dir() else {
+            anyhow::bail!("cannot determine home directory (HOME/USERPROFILE unset)");
+        };
         let models = import::discover_models(&ollama)?;
 
         if models.is_empty() {
@@ -518,7 +521,9 @@ impl ModelStore {
     /// Import all models from HuggingFace's local cache.
     pub fn import_from_hf(&self) -> anyhow::Result<u32> {
         self.ensure_dirs()?;
-        let hf_cache = import::hf_cache_dir();
+        let Some(hf_cache) = import::hf_cache_dir() else {
+            anyhow::bail!("cannot determine home directory (HOME/USERPROFILE unset)");
+        };
         let models = import::discover_hf_models(&hf_cache)?;
 
         if models.is_empty() {

@@ -54,8 +54,10 @@ fn now_secs() -> u64 {
 impl KvCache {
     /// Create a cache under `~/.spindll/cache` with the given size limit.
     pub fn new(max_bytes: u64) -> Self {
-        let home = std::env::var("HOME").expect("HOME not set");
-        let cache_dir = PathBuf::from(home).join(".spindll").join("cache");
+        let cache_dir = crate::model_store::import::home_dir()
+            .expect("cannot determine home directory (HOME/USERPROFILE unset)")
+            .join(".spindll")
+            .join("cache");
         Self::with_dir(cache_dir, max_bytes)
     }
 

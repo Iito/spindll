@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.4] - 2026-08-09
+
+### Fixed
+
+- **No more `HOME not set` panics** — home-directory resolution now falls back to `USERPROFILE` when `HOME` is unset (the norm in Windows shells), instead of panicking. Covers `import::ollama_dir()`, `import::hf_cache_dir()`, `ModelStore::new(None)`, and `KvCache::new()`; the Ollama and HuggingFace importers return a clear error when no home directory can be determined at all.
+
+### Changed
+
+- **`import::ollama_dir()` / `import::hf_cache_dir()` (breaking)** — now return `Option<PathBuf>` (`None` when no home directory can be determined) instead of a `PathBuf` that could only be produced by panicking.
+
 ## [0.7.3] - 2026-08-05
 
 ### Changed
