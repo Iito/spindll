@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.7.3] - 2026-08-02
+## [0.7.4] - 2026-08-09
 
 ### Fixed
 
@@ -11,6 +11,12 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - **`import::ollama_dir()` / `import::hf_cache_dir()` (breaking)** — now return `Option<PathBuf>` (`None` when no home directory can be determined) instead of a `PathBuf` that could only be produced by panicking.
+
+## [0.7.3] - 2026-08-05
+
+### Changed
+
+- **llama-cpp-2 0.1.151 → 0.1.154** — binding-level upstream updates: bindings for the three missing KV-cache functions, sampler offloading to the backend, an accessor for tensor buffer-type overrides, `GGML_*` environment variables forwarded to the CMake build (e.g. `GGML_CPU_REPACK=OFF` for mmap-friendly weight layouts), Vulkan support for Android cross-builds, and an MSVC debug CRT link fix. The bundled llama.cpp advances from a June 7 to a July 30 upstream snapshot. (#74)
 
 ## [0.7.2] - 2026-08-02
 
