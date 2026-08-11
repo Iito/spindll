@@ -37,10 +37,10 @@ impl OllamaManifest {
     }
 }
 
-/// Return the path to Ollama's model directory.
-pub fn ollama_dir() -> PathBuf {
-    let home = std::env::var("HOME").expect("HOME not set");
-    PathBuf::from(home).join(OLLAMA_MODELS_DIR)
+/// Return the path to Ollama's model directory, or `None` when no home
+/// directory can be determined.
+pub fn ollama_dir() -> Option<PathBuf> {
+    Some(home_dir()?.join(OLLAMA_MODELS_DIR))
 }
 
 /// Parse an Ollama manifest file.
@@ -83,10 +83,25 @@ pub fn discover_models(ollama_dir: &Path) -> anyhow::Result<Vec<(String, String,
     Ok(models)
 }
 
-/// Return the path to HuggingFace's cache directory.
-pub fn hf_cache_dir() -> PathBuf {
-    let home = std::env::var("HOME").expect("HOME not set");
-    PathBuf::from(home).join(HF_CACHE_DIR)
+/// Return the path to HuggingFace's cache directory, or `None` when no home
+/// directory can be determined.
+pub fn hf_cache_dir() -> Option<PathBuf> {
+    Some(home_dir()?.join(HF_CACHE_DIR))
+}
+
+/// Resolve the user's home directory from `HOME`, falling back to
+/// `USERPROFILE` (Windows shells typically set only the latter).
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    home_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+}
+
+fn home_from(
+    home: Option<std::ffi::OsString>,
+    userprofile: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    home.filter(|v| !v.is_empty())
+        .or(userprofile.filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
 }
 
 /// Discover all GGUF and MLX models in the HuggingFace cache.
@@ -132,4 +147,40 @@ pub fn discover_hf_models(hf_cache_dir: &Path) -> anyhow::Result<Vec<(String, Pa
     }
 
     Ok(models)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn os(s: &str) -> Option<OsString> {
+        Some(OsString::from(s))
+    }
+
+    #[test]
+    fn home_prefers_home_over_userprofile() {
+        assert_eq!(
+            home_from(os("/home/a"), os("C:\\Users\\a")),
+            Some(PathBuf::from("/home/a"))
+        );
+    }
+
+    #[test]
+    fn home_falls_back_to_userprofile() {
+        assert_eq!(
+            home_from(None, os("C:\\Users\\a")),
+            Some(PathBuf::from("C:\\Users\\a"))
+        );
+    }
+
+    #[test]
+    fn home_ignores_empty_values() {
+        assert_eq!(
+            home_from(os(""), os("C:\\Users\\a")),
+            Some(PathBuf::from("C:\\Users\\a"))
+        );
+        assert_eq!(home_from(os(""), os("")), None);
+        assert_eq!(home_from(None, None), None);
+    }
 }

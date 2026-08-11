@@ -14,6 +14,28 @@ All notable changes to this project will be documented in this file.
 
 - **`BackendModel` trait (breaking)** — `apply_chat_template` and `generate_chat` now take `tools: &[ToolSpec]` and `tool_choice: &ToolChoice`; external implementers and callers of the trait must update.
 
+## [0.7.4] - 2026-08-09
+
+### Fixed
+
+- **No more `HOME not set` panics** — home-directory resolution now falls back to `USERPROFILE` when `HOME` is unset (the norm in Windows shells), instead of panicking. Covers `import::ollama_dir()`, `import::hf_cache_dir()`, `ModelStore::new(None)`, and `KvCache::new()`; the Ollama and HuggingFace importers return a clear error when no home directory can be determined at all.
+
+### Changed
+
+- **`import::ollama_dir()` / `import::hf_cache_dir()` (breaking)** — now return `Option<PathBuf>` (`None` when no home directory can be determined) instead of a `PathBuf` that could only be produced by panicking.
+
+## [0.7.3] - 2026-08-05
+
+### Changed
+
+- **llama-cpp-2 0.1.151 → 0.1.154** — binding-level upstream updates: bindings for the three missing KV-cache functions, sampler offloading to the backend, an accessor for tensor buffer-type overrides, `GGML_*` environment variables forwarded to the CMake build (e.g. `GGML_CPU_REPACK=OFF` for mmap-friendly weight layouts), Vulkan support for Android cross-builds, and an MSVC debug CRT link fix. The bundled llama.cpp advances from a June 7 to a July 30 upstream snapshot. (#74)
+
+## [0.7.2] - 2026-08-02
+
+### Fixed
+
+- **MLX import into a fresh model store** — `import_from_hf` linked `models/<owner>/<repo>` without creating `models/<owner>` first, so importing an MLX model from the HuggingFace cache failed with ENOENT on a fresh store and aborted the whole import — including GGUF models staged earlier in the same run, since the registry is only written at the end. `link_or_copy_path` now creates the destination's parent directory, covering all call sites. (#72)
+
 ## [0.7.1] - 2026-07-12
 
 ### Added
