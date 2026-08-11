@@ -4,6 +4,9 @@
 //! Inference engine — model loading, text generation, KV caching, and metrics.
 
 pub mod batch;
+pub(crate) mod chat_template;
+#[cfg(feature = "grammar")]
+pub(crate) mod grammar;
 pub mod kv_cache;
 pub mod kv_ram_cache;
 pub mod manager;
@@ -116,7 +119,7 @@ impl Engine {
         &self,
         messages: &[(String, String)],
     ) -> anyhow::Result<String> {
-        apply_chat_template_with_fallback(&self.model, messages, None)
+        apply_chat_template_with_fallback(&self.model, messages, &[], &ToolChoice::None, None)
     }
 
     /// Enable the disk-backed KV cache with the given maximum size in bytes.
@@ -165,20 +168,161 @@ impl Engine {
     }
 }
 
-/// Apply a model's chat template, falling back to ChatML if none is embedded.
+/// Apply a model's chat template to `messages`, producing a prompt.
 ///
-/// Some templates — notably Gemma's — reject a standalone `system` role and make
-/// llama.cpp's apply return an FFI error (`ffi error -1`). When that happens and
-/// a system message is present, retry with the system content folded into the
-/// first user turn (the shape those models expect) instead of failing the
-/// request.
+/// Prefers **faithful Jinja rendering** of the template baked into the GGUF
+/// (`tokenizer.chat_template`) via [`chat_template::render`] — this handles
+/// arbitrary/unknown templates, thinking tags, and native tool formatting that
+/// llama.cpp's legacy substring formatter cannot. Falls back to the legacy
+/// formatter (with a ChatML default) when the model ships no Jinja template or
+/// minijinja can't render it.
+///
+/// Some templates — notably Gemma's — reject a standalone `system` role. When
+/// that happens and a system message is present, we retry with the system
+/// content folded into the first user turn (the shape those models expect)
+/// before giving up.
+///
+/// When `tools` are active, they are rendered through the template's `tools`
+/// variable if the template supports it (the model's trained tool format);
+/// otherwise the tool preamble is injected into the messages. Exactly one of the
+/// two paths runs, so native and injected tool descriptions never both appear.
 ///
 /// `override_tmpl`, when set, takes precedence over the model's embedded
-/// template. It may be a raw Jinja template or a built-in template name (e.g.
-/// "gemma", "chatml") — `LlamaChatTemplate::new` accepts both. This lets a
-/// model that ships a broken or unusable chat template be corrected without
-/// re-quantizing it (see the sidecar `.jinja` convention in the llama.cpp backend).
+/// template. A raw Jinja override is rendered by minijinja; a built-in template
+/// *name* (e.g. "gemma", "chatml") is resolved by the legacy formatter. This
+/// lets a model that ships a broken template be corrected without re-quantizing
+/// it (see the sidecar `.jinja` convention in the llama.cpp backend).
 pub(crate) fn apply_chat_template_with_fallback(
+    model: &LlamaModel,
+    messages: &[(String, String)],
+    tools: &[ToolSpec],
+    tool_choice: &ToolChoice,
+    override_tmpl: Option<&str>,
+) -> anyhow::Result<String> {
+    // Tools are "active" only when present and not explicitly disabled.
+    let tools_active = !tools.is_empty() && !matches!(tool_choice, ToolChoice::None);
+
+    if let Some(source) = jinja_template_source(model, override_tmpl) {
+        // Render `tools` natively only when the template actually consumes them
+        // (references `tools`); otherwise fall back to injecting the preamble.
+        // Never both — a single tool-system avoids native/injected drift.
+        let native_tools = (tools_active && source.contains("tools"))
+            .then(|| tools_to_oai_value(tools))
+            .flatten();
+        let injected;
+        let msgs = if tools_active && native_tools.is_none() {
+            injected = inject_tool_preamble(messages, tools, tool_choice);
+            injected.as_slice()
+        } else {
+            messages
+        };
+
+        match try_render_jinja(model, &source, msgs, native_tools.as_ref()) {
+            Ok(rendered) => return Ok(rendered),
+            Err(e) => tracing::debug!(
+                "Jinja chat template render failed ({e}); falling back to legacy formatter"
+            ),
+        }
+    }
+
+    // The legacy substring formatter can't render tools natively — inject.
+    if tools_active {
+        let injected = inject_tool_preamble(messages, tools, tool_choice);
+        apply_legacy_chat_template(model, &injected, override_tmpl)
+    } else {
+        apply_legacy_chat_template(model, messages, override_tmpl)
+    }
+}
+
+/// The OpenAI `tools` array as a JSON value for the template's `tools` variable.
+fn tools_to_oai_value(tools: &[ToolSpec]) -> Option<serde_json::Value> {
+    let json = tools::tools_to_oai_json(tools)?;
+    serde_json::from_str(&json).ok()
+}
+
+/// Fold the tool-injection preamble into `messages` (merged into the first system
+/// turn, or prepended as one) — the fallback for templates/formatters that can't
+/// render `tools` natively. Keeps a single tool-system so native and injected
+/// tool descriptions never both appear.
+fn inject_tool_preamble(
+    messages: &[(String, String)],
+    tools: &[ToolSpec],
+    choice: &ToolChoice,
+) -> Vec<(String, String)> {
+    let Some(preamble) = tools::tools_to_prompt(tools, choice) else {
+        return messages.to_vec();
+    };
+    let mut out = messages.to_vec();
+    match out.iter_mut().find(|(role, _)| role == "system") {
+        Some((_, content)) => *content = format!("{content}\n\n{preamble}"),
+        None => out.insert(0, ("system".to_string(), preamble)),
+    }
+    out
+}
+
+/// The raw Jinja template to render, if one is available. A raw-Jinja override
+/// wins; otherwise the model's embedded `tokenizer.chat_template`. Returns
+/// `None` for a built-in-name override or a model with no embedded template —
+/// both of which the legacy formatter handles.
+fn jinja_template_source(model: &LlamaModel, override_tmpl: Option<&str>) -> Option<String> {
+    match override_tmpl {
+        Some(t) if looks_like_jinja(t) => Some(t.to_string()),
+        Some(_) => None, // built-in template name — resolved by the legacy path
+        None => model
+            .meta_val_str("tokenizer.chat_template")
+            .ok()
+            .filter(|t| looks_like_jinja(t)),
+    }
+}
+
+/// A template string is Jinja (rather than a built-in name like "chatml") if it
+/// contains Jinja delimiters.
+fn looks_like_jinja(t: &str) -> bool {
+    t.contains("{{") || t.contains("{%")
+}
+
+/// Render `source` with minijinja, retrying with the system role folded into the
+/// first user turn if the template rejects a standalone system message.
+fn try_render_jinja(
+    model: &LlamaModel,
+    source: &str,
+    messages: &[(String, String)],
+    tools: Option<&serde_json::Value>,
+) -> anyhow::Result<String> {
+    let bos = special_token_text(model, model.token_bos());
+    let eos = special_token_text(model, model.token_eos());
+
+    match chat_template::render(source, messages, tools, &bos, &eos, true) {
+        Ok(rendered) => Ok(rendered),
+        Err(first_err) if has_system_message(messages) => {
+            tracing::debug!(
+                "Jinja template rejected the system role; folding it into the first user turn"
+            );
+            chat_template::render(source, &fold_system_into_user(messages), tools, &bos, &eos, true)
+                .map_err(|retry_err| {
+                    anyhow::anyhow!(
+                        "{first_err} (also failed after folding the system role into the user turn: {retry_err})"
+                    )
+                })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The textual form of a special token (e.g. `<s>`, `<|begin_of_text|>`) for the
+/// Jinja context. `special = true` renders the token's special-token text rather
+/// than plaintext. Empty if the model can't render it.
+fn special_token_text(model: &LlamaModel, token: llama_cpp_2::token::LlamaToken) -> String {
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    model
+        .token_to_piece(token, &mut decoder, true, None)
+        .unwrap_or_default()
+}
+
+/// llama.cpp's built-in (non-Jinja) formatter: substring-detects the format or
+/// resolves an explicit built-in template name, with a ChatML default and the
+/// system-role fold recovery. The fallback when Jinja rendering isn't available.
+fn apply_legacy_chat_template(
     model: &LlamaModel,
     messages: &[(String, String)],
     override_tmpl: Option<&str>,

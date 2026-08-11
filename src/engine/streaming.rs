@@ -9,8 +9,10 @@ use llama_cpp_2::sampling::LlamaSampler;
 
 use super::kv_cache::{KvCache, load_state_from_disk, save_state_to_disk};
 use super::kv_ram_cache::KvRamCache;
+use super::tools::{ToolChoice, ToolSpec};
 
 /// Sampling and generation parameters for a single inference request.
+#[derive(Clone)]
 pub struct GenerateParams {
     /// Maximum number of tokens to generate.
     pub max_tokens: u32,
@@ -24,6 +26,10 @@ pub struct GenerateParams {
     pub seed: u32,
     /// If `true`, only encode the prompt into the KV cache without generating tokens.
     pub prefill_only: bool,
+    /// Optional GBNF grammar constraining generation (llama.cpp backend only).
+    /// Set by the tool path under the `grammar` feature to force valid tool-call
+    /// output; `None` leaves sampling unconstrained. Ignored without the feature.
+    pub grammar: Option<String>,
 }
 
 impl Default for GenerateParams {
@@ -35,6 +41,43 @@ impl Default for GenerateParams {
             top_k: 40,
             seed: 42,
             prefill_only: false,
+            grammar: None,
+        }
+    }
+}
+
+impl GenerateParams {
+    /// Attach a tool-call grammar (under the `grammar` feature) that forces a
+    /// syntactically valid tool call when `tool_choice` requires one. A no-op
+    /// otherwise, and entirely compiled out without the feature.
+    #[cfg_attr(not(feature = "grammar"), allow(unused_mut, unused_variables))]
+    pub fn with_tool_grammar(mut self, tools: &[ToolSpec], tool_choice: &ToolChoice) -> Self {
+        #[cfg(feature = "grammar")]
+        {
+            self.grammar = super::grammar::tool_call_grammar(tools, tool_choice);
+        }
+        self
+    }
+}
+
+/// Build the lazy grammar sampler for `params.grammar`, or `None` when there is
+/// no grammar (or it fails to compile — generation then falls back to
+/// unconstrained). The sampler triggers only after a tool-call opener so plain
+/// text is never constrained.
+#[cfg(feature = "grammar")]
+fn grammar_sampler(model: &LlamaModel, params: &GenerateParams) -> Option<LlamaSampler> {
+    let grammar = params.grammar.as_deref()?;
+    match LlamaSampler::grammar_lazy(
+        model,
+        grammar,
+        "root",
+        super::grammar::TOOL_CALL_TRIGGERS.iter().copied(),
+        &[],
+    ) {
+        Ok(sampler) => Some(sampler),
+        Err(e) => {
+            tracing::warn!("grammar sampler init failed ({e}); generating unconstrained");
+            None
         }
     }
 }
@@ -145,12 +188,19 @@ pub fn generate_streaming(
         });
     }
 
-    let mut sampler = LlamaSampler::chain_simple([
+    let base = [
         LlamaSampler::temp(params.temperature),
         LlamaSampler::top_k(params.top_k),
         LlamaSampler::top_p(params.top_p, 1),
         LlamaSampler::dist(params.seed),
-    ]);
+    ];
+    // A grammar sampler (when set) goes first so it constrains the token set
+    // before temperature/top-k/top-p narrow it.
+    #[cfg(feature = "grammar")]
+    let mut sampler =
+        LlamaSampler::chain_simple(grammar_sampler(model, params).into_iter().chain(base));
+    #[cfg(not(feature = "grammar"))]
+    let mut sampler = LlamaSampler::chain_simple(base);
 
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut n_cur = batch.n_tokens();
@@ -352,12 +402,19 @@ pub fn generate_streaming_cached(
     }
 
     // Sample tokens
-    let mut sampler = LlamaSampler::chain_simple([
+    let base = [
         LlamaSampler::temp(params.temperature),
         LlamaSampler::top_k(params.top_k),
         LlamaSampler::top_p(params.top_p, 1),
         LlamaSampler::dist(params.seed),
-    ]);
+    ];
+    // A grammar sampler (when set) goes first so it constrains the token set
+    // before temperature/top-k/top-p narrow it.
+    #[cfg(feature = "grammar")]
+    let mut sampler =
+        LlamaSampler::chain_simple(grammar_sampler(model, params).into_iter().chain(base));
+    #[cfg(not(feature = "grammar"))]
+    let mut sampler = LlamaSampler::chain_simple(base);
 
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut n_cur = tokens.len() as i32;

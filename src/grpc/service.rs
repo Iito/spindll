@@ -36,6 +36,7 @@ fn proto_params_to_engine(p: Option<crate::proto::GenerateParams>) -> GeneratePa
             top_k:       p.top_k      .unwrap_or(40),
             seed:        p.seed       .map(|v| v as u32).unwrap_or(42),
             prefill_only: false,
+            ..Default::default()
         },
         None => GenerateParams::default(),
     }
@@ -238,21 +239,13 @@ impl Spindll for SpindllService {
                 && !matches!(tool_choice, crate::engine::tools::ToolChoice::None);
             let mut output = String::new();
 
-            // Text messages (role, content); tool preamble merged into the system
-            // turn when active.
-            let mut messages: Vec<(String, String)> = req
+            // Text messages (role, content). Tools flow to `generate_chat` for
+            // native template rendering; the vision path below still injects.
+            let messages: Vec<(String, String)> = req
                 .messages
                 .iter()
                 .map(|m| (m.role.clone(), proto_message_text(m)))
                 .collect();
-            // Rendered once; reused for the text turn here and the vision path below.
-            let preamble = crate::engine::tools::tools_to_prompt(&tool_specs, &tool_choice);
-            if let Some(ref preamble) = preamble {
-                match messages.iter_mut().find(|(r, _)| r == "system") {
-                    Some(sys) => sys.1 = format!("{}\n\n{}", sys.1, preamble),
-                    None => messages.insert(0, ("system".to_string(), preamble.clone())),
-                }
-            }
             let enc_key: Option<[u8; 32]> = (req.encryption_key.len() == 32).then(|| {
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&req.encryption_key);
@@ -275,10 +268,13 @@ impl Spindll for SpindllService {
                         return;
                     }
                 };
-                // Inject the tool preamble so vision + tools works like the text path,
-                // and buffer output when tools are active so calls can be parsed.
-                if let Some(ref preamble) = preamble {
-                    crate::engine::multimodal::inject_system_text(&mut mm_messages, preamble);
+                // Vision keeps tool injection (no image template path yet): fold
+                // the preamble into a system turn, and buffer output when tools are
+                // active so calls can be parsed.
+                if let Some(preamble) =
+                    crate::engine::tools::tools_to_prompt(&tool_specs, &tool_choice)
+                {
+                    crate::engine::multimodal::inject_system_text(&mut mm_messages, &preamble);
                 }
                 mgr.generate_chat_multimodal(&req.model, &mm_messages, &params, |token| {
                     if has_tools {
@@ -288,7 +284,7 @@ impl Spindll for SpindllService {
                     tx.blocking_send(Ok(token_resp(token))).is_ok()
                 })
             } else {
-                mgr.generate_chat(&req.model, &messages, &params, enc_key.as_ref(), |token| {
+                mgr.generate_chat(&req.model, &messages, &tool_specs, &tool_choice, &params, enc_key.as_ref(), |token| {
                     if has_tools {
                         output.push_str(token);
                         return true;
@@ -299,7 +295,7 @@ impl Spindll for SpindllService {
 
             #[cfg(not(feature = "vision"))]
             let result =
-                mgr.generate_chat(&req.model, &messages, &params, enc_key.as_ref(), |token| {
+                mgr.generate_chat(&req.model, &messages, &tool_specs, &tool_choice, &params, enc_key.as_ref(), |token| {
                     if has_tools {
                         output.push_str(token);
                         return true;
@@ -547,7 +543,16 @@ impl Spindll for SpindllService {
                 ..GenerateParams::default()
             };
 
-            let stats = mgr.generate_chat(&req.model, &messages, &params, enc_key.as_ref(), |_| true)
+            let stats = mgr
+                .generate_chat(
+                    &req.model,
+                    &messages,
+                    &[],
+                    &crate::engine::tools::ToolChoice::None,
+                    &params,
+                    enc_key.as_ref(),
+                    |_| true,
+                )
                 .map_err(|e| Status::internal(e.to_string()))?;
 
             Ok::<_, Status>(PrefillResponse {
@@ -642,7 +647,7 @@ mod tests {
     struct FakeModel;
     impl BackendModel for FakeModel {
         fn generate(&self, _: &str, _: &EngineParams, _: &mut dyn FnMut(&str) -> bool) -> anyhow::Result<GenerateResult> { Ok(GenerateResult::default()) }
-        fn apply_chat_template(&self, _: &[(String, String)]) -> anyhow::Result<String> { Ok(String::new()) }
+        fn apply_chat_template(&self, _: &[(String, String)], _: &[crate::engine::tools::ToolSpec], _: &crate::engine::tools::ToolChoice) -> anyhow::Result<String> { Ok(String::new()) }
         fn n_ctx(&self) -> u32 { 2048 }
         fn size_bytes(&self) -> u64 { 100 }
         fn kv_bytes_per_token(&self) -> u64 { 1 }

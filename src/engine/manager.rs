@@ -23,6 +23,7 @@ use super::kv_ram_cache::KvRamCache;
 use super::metrics::Metrics;
 use super::ram_cache::RamCache;
 use super::streaming::{GenerateParams, GenerateResult, generate_streaming_cached};
+use super::tools::{ToolChoice, ToolSpec};
 
 /// Eviction tier. Low evicts first, LRU tiebreak within tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -680,6 +681,7 @@ impl ModelManager {
                 top_k: params.top_k,
                 seed: params.seed,
                 prefill_only: params.prefill_only,
+                ..Default::default()
             },
             response_tx: resp_tx,
         };
@@ -774,10 +776,13 @@ impl ModelManager {
         skip(self, messages, params, on_token, encryption_key),
         fields(model = model_name)
     )]
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_chat(
         &self,
         model_name: &str,
         messages: &[(String, String)],
+        tools: &[ToolSpec],
+        tool_choice: &ToolChoice,
         params: &GenerateParams,
         encryption_key: Option<&[u8; 32]>,
         mut on_token: impl FnMut(&str) -> bool,
@@ -792,13 +797,23 @@ impl ModelManager {
         };
         *self.last_activity.write().unwrap() = Instant::now();
 
+        // Under the `grammar` feature, attach a lazy GBNF grammar that forces a
+        // valid tool call when tool_choice requires one (no-op otherwise). Done
+        // here so every llama.cpp path (batch, KV cache, direct) inherits it.
+        #[cfg(feature = "grammar")]
+        let grammared = params.clone().with_tool_grammar(tools, tool_choice);
+        #[cfg(feature = "grammar")]
+        let params = &grammared;
+
         let start = Instant::now();
         let result = if let Some(tx) = batch_tx {
             // Batch scheduler path is llama.cpp-only and requires a prompt string.
-            let prompt = self.apply_chat_template(model_name, messages)?;
+            let prompt = self.apply_chat_template(model_name, messages, tools, tool_choice)?;
             Self::generate_via_batch(tx, &prompt, params, &mut on_token)
         } else {
-            self.generate_chat_direct(model_name, messages, params, encryption_key, &mut on_token)
+            self.generate_chat_direct(
+                model_name, messages, tools, tool_choice, params, encryption_key, &mut on_token,
+            )
         };
 
         let elapsed_us = start.elapsed().as_micros() as u64;
@@ -831,10 +846,13 @@ impl ModelManager {
     }
 
     /// Per-request context path for `generate_chat`.
+    #[allow(clippy::too_many_arguments)]
     fn generate_chat_direct(
         &self,
         model_name: &str,
         messages: &[(String, String)],
+        tools: &[ToolSpec],
+        tool_choice: &ToolChoice,
         params: &GenerateParams,
         encryption_key: Option<&[u8; 32]>,
         on_token: &mut dyn FnMut(&str) -> bool,
@@ -848,7 +866,7 @@ impl ModelManager {
         // KV cache path: GGUF models need the prompt as a string.
         if let Some(cache) = &self.kv_cache
             && let Some(llama) = loaded.model.as_any().downcast_ref::<LlamaCppModel>() {
-                let prompt = loaded.model.apply_chat_template(messages)?;
+                let prompt = loaded.model.apply_chat_template(messages, tools, tool_choice)?;
                 let ctx_params = LlamaContextParams::default()
                     .with_n_ctx(NonZeroU32::new(loaded.n_ctx))
                     .with_n_batch(loaded.n_ctx);
@@ -871,7 +889,7 @@ impl ModelManager {
             }
 
         // All other backends (MLX): fused template + generation.
-        loaded.model.generate_chat(messages, params, on_token)
+        loaded.model.generate_chat(messages, tools, tool_choice, params, on_token)
     }
 
     /// Run multimodal inference (text + images) on a loaded model.
@@ -941,13 +959,15 @@ impl ModelManager {
         &self,
         model_name: &str,
         messages: &[(String, String)],
+        tools: &[ToolSpec],
+        tool_choice: &ToolChoice,
     ) -> anyhow::Result<String> {
         let models = self.models.read().unwrap();
         let loaded = models
             .get(model_name)
             .ok_or_else(|| anyhow::anyhow!("model '{}' not loaded", model_name))?;
         *loaded.last_used.write().unwrap() = Instant::now();
-        loaded.model.apply_chat_template(messages)
+        loaded.model.apply_chat_template(messages, tools, tool_choice)
     }
 
     /// Compute an embedding vector for a text string.
@@ -1130,6 +1150,8 @@ mod tests {
         fn apply_chat_template(
             &self,
             _messages: &[(String, String)],
+            _tools: &[ToolSpec],
+            _tool_choice: &ToolChoice,
         ) -> anyhow::Result<String> {
             Ok(String::new())
         }
@@ -1449,6 +1471,7 @@ mod tests {
         let mut token_count = 0u32;
         let result = mgr.generate_chat("test-mlx",
             &[("user".into(), "Hello".into())],
+            &[], &crate::engine::tools::ToolChoice::None,
             &params, None, |_| { token_count += 1; true },
         ).unwrap();
         assert_eq!(result.completion_tokens, 0);
@@ -1469,6 +1492,7 @@ mod tests {
         let mut token_count = 0u32;
         let _ = mgr.generate_chat("test-mlx",
             &[("user".into(), "Count from 1 to 50".into())],
+            &[], &crate::engine::tools::ToolChoice::None,
             &params, None, |_| { token_count += 1; false },
         );
         assert!(token_count <= 1, "expected at most 1 token, got {token_count}");

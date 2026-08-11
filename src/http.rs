@@ -228,11 +228,12 @@ async fn chat(
                 top_k: p.top_k.unwrap_or(40),
                 seed: p.seed.unwrap_or(42),
                 prefill_only: false,
+                ..Default::default()
             },
             None => GenerateParams::default(),
         };
 
-        let result = mgr.generate_chat(&req.model, &messages, &params, None, |token| {
+        let result = mgr.generate_chat(&req.model, &messages, &[], &crate::engine::tools::ToolChoice::None, &params, None, |token| {
             let payload = serde_json::json!({"type": "token", "content": token});
             tx.blocking_send(Ok(sse_data(&payload))).is_ok()
         });
@@ -800,23 +801,28 @@ fn oai_has_images(messages: &[OaiMessage]) -> bool {
 /// the model sees the tools — without this the text path's preamble (carried in
 /// `text_messages`) would be dropped and tool calling would silently no-op.
 #[cfg(feature = "vision")]
+#[allow(clippy::too_many_arguments)]
 fn generate_maybe_multimodal(
     mgr: &ModelManager,
     model: &str,
     oai_messages: &[OaiMessage],
     text_messages: &[(String, String)],
-    tool_preamble: Option<&str>,
+    tools: &[crate::engine::tools::ToolSpec],
+    tool_choice: &crate::engine::tools::ToolChoice,
     params: &GenerateParams,
     on_token: &mut dyn FnMut(&str) -> bool,
 ) -> anyhow::Result<crate::engine::GenerateResult> {
     if oai_has_images(oai_messages) {
+        // Vision path keeps tool injection: the multimodal generate path doesn't
+        // render tools through a template yet, so fold the preamble into a system
+        // turn (a no-op when there are no tools).
         let mut mm = oai_to_multimodal(oai_messages)?;
-        if let Some(preamble) = tool_preamble {
-            crate::engine::multimodal::inject_system_text(&mut mm, preamble);
+        if let Some(preamble) = crate::engine::tools::tools_to_prompt(tools, tool_choice) {
+            crate::engine::multimodal::inject_system_text(&mut mm, &preamble);
         }
         mgr.generate_chat_multimodal(model, &mm, params, on_token)
     } else {
-        mgr.generate_chat(model, text_messages, params, None, on_token)
+        mgr.generate_chat(model, text_messages, tools, tool_choice, params, None, on_token)
     }
 }
 
@@ -833,18 +839,15 @@ async fn oai_chat_completions(
         && !matches!(tool_choice, crate::engine::tools::ToolChoice::None);
     let include_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
 
-    // Render the tool preamble once and share it: the text path injects it via
-    // `prepare_messages_with_tools`, and the vision path injects it into the
-    // multimodal messages so vision + tools doesn't silently drop the tools.
-    // Only built when tools are active (`None` otherwise → no injection).
-    let tool_preamble: Option<String> = has_tools
-        .then(|| {
-            crate::engine::tools::tools_to_prompt(
-                &oai_tools_to_specs(req.tools.as_deref().unwrap_or_default()),
-                &tool_choice,
-            )
-        })
-        .flatten();
+    // Tool specs (empty when tools are off) are passed to `generate_chat`, which
+    // renders them through the model's native tool template or, as a fallback,
+    // injects a preamble. The vision path still injects (see
+    // `generate_maybe_multimodal`).
+    let tool_specs: Vec<crate::engine::tools::ToolSpec> = if has_tools {
+        oai_tools_to_specs(req.tools.as_deref().unwrap_or_default())
+    } else {
+        Vec::new()
+    };
 
     #[cfg(not(feature = "vision"))]
     if oai_has_images(&req.messages) {
@@ -864,7 +867,7 @@ async fn oai_chat_completions(
                 return;
             }
 
-            let messages = prepare_messages_with_tools(&req.messages, tool_preamble.as_deref());
+            let messages = prepare_messages_with_tools(&req.messages, None);
             let params = GenerateParams {
                 max_tokens: req.max_tokens.unwrap_or(512),
                 temperature: req.temperature.unwrap_or(0.8),
@@ -872,6 +875,7 @@ async fn oai_chat_completions(
                 top_k: 40,
                 seed: req.seed.unwrap_or(42),
                 prefill_only: false,
+                ..Default::default()
             };
 
             let completion_id = format!("chatcmpl-{:016x}", std::time::SystemTime::now()
@@ -894,12 +898,12 @@ async fn oai_chat_completions(
                 // When tools are active, collect full output to parse tool calls.
                 let mut output = String::new();
                 #[cfg(feature = "vision")]
-                let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, tool_preamble.as_deref(), &params, &mut |token| {
+                let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &tool_specs, &tool_choice, &params, &mut |token| {
                     output.push_str(token);
                     true
                 });
                 #[cfg(not(feature = "vision"))]
-                let result = mgr.generate_chat(&req.model, &messages, &params, None, |token| {
+                let result = mgr.generate_chat(&req.model, &messages, &tool_specs, &tool_choice, &params, None, |token| {
                     output.push_str(token);
                     true
                 });
@@ -973,7 +977,7 @@ async fn oai_chat_completions(
             } else {
                 // No tools — stream tokens directly as before.
                 #[cfg(feature = "vision")]
-                let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, tool_preamble.as_deref(), &params, &mut |token| {
+                let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &tool_specs, &tool_choice, &params, &mut |token| {
                     let chunk = serde_json::json!({
                         "id": &completion_id,
                         "object": "chat.completion.chunk",
@@ -988,7 +992,7 @@ async fn oai_chat_completions(
                     tx.blocking_send(Ok(sse_data(&chunk))).is_ok()
                 });
                 #[cfg(not(feature = "vision"))]
-                let result = mgr.generate_chat(&req.model, &messages, &params, None, |token| {
+                let result = mgr.generate_chat(&req.model, &messages, &tool_specs, &tool_choice, &params, None, |token| {
                     let chunk = serde_json::json!({
                         "id": &completion_id,
                         "object": "chat.completion.chunk",
@@ -1048,7 +1052,7 @@ async fn oai_chat_completions(
         let result = tokio::task::spawn_blocking(move || {
             auto_load(&mgr, &store, &req.model)?;
 
-            let messages = prepare_messages_with_tools(&req.messages, tool_preamble.as_deref());
+            let messages = prepare_messages_with_tools(&req.messages, None);
 
             let params = GenerateParams {
                 max_tokens: req.max_tokens.unwrap_or(512),
@@ -1057,16 +1061,17 @@ async fn oai_chat_completions(
                 top_k: 40,
                 seed: req.seed.unwrap_or(42),
                 prefill_only: false,
+                ..Default::default()
             };
 
             let mut output = String::new();
             #[cfg(feature = "vision")]
-            let stats = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, tool_preamble.as_deref(), &params, &mut |token| {
+            let stats = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &tool_specs, &tool_choice, &params, &mut |token| {
                 output.push_str(token);
                 true
             })?;
             #[cfg(not(feature = "vision"))]
-            let stats = mgr.generate_chat(&req.model, &messages, &params, None, |token| {
+            let stats = mgr.generate_chat(&req.model, &messages, &tool_specs, &tool_choice, &params, None, |token| {
                 output.push_str(token);
                 true
             })?;
@@ -1173,6 +1178,7 @@ async fn oai_completions(
                 top_k: 40,
                 seed: req.seed.unwrap_or(42),
                 prefill_only: false,
+                ..Default::default()
             };
 
             let completion_id = format!("cmpl-{:016x}", std::time::SystemTime::now()
@@ -1230,6 +1236,7 @@ async fn oai_completions(
                 top_k: 40,
                 seed: req.seed.unwrap_or(42),
                 prefill_only: false,
+                ..Default::default()
             };
 
             let mut output = String::new();
@@ -1552,7 +1559,7 @@ mod tests {
             }
             Ok(GenerateResult { prompt_tokens: 5, completion_tokens: 2, cache_hit: false })
         }
-        fn apply_chat_template(&self, _: &[(String, String)]) -> anyhow::Result<String> { Ok("prompt".into()) }
+        fn apply_chat_template(&self, _: &[(String, String)], _: &[crate::engine::tools::ToolSpec], _: &crate::engine::tools::ToolChoice) -> anyhow::Result<String> { Ok("prompt".into()) }
         fn n_ctx(&self) -> u32 { 2048 }
         fn size_bytes(&self) -> u64 { 100 }
         fn kv_bytes_per_token(&self) -> u64 { 1 }

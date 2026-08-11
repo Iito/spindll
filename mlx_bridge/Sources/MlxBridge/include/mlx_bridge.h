@@ -35,12 +35,16 @@ int32_t mlx_generate(
 
 // Render a chat template using the model's tokenizer.
 // `messages_json` is a UTF-8 JSON array: [{"role":"user","content":"..."}, ...].
+// `tools_json` is a UTF-8 JSON array of OpenAI tool specs
+// ([{"type":"function","function":{...}}, ...]) bound to the template's `tools`
+// variable, or NULL for no tools.
 // On success, returns a newly allocated NUL-terminated UTF-8 string that the
 // caller MUST release with mlx_free_string. Returns NULL on failure (model
 // has no template, JSON malformed, or tokenizer error).
 const char* mlx_apply_chat_template(
     MlxModelHandle* handle,
-    const char*     messages_json
+    const char*     messages_json,
+    const char*     tools_json
 );
 
 // Chat generation with image input for VLM models.
