@@ -39,3 +39,7 @@ Append-only. One entry per `/implement` close. Format:
 - build.rs: auto-selects a Swift 6.3+ toolchain via TOOLCHAINS for the SwiftPM child (explicit env > default swift > swift.org toolchain probe, with install hints); adds the selected toolchain's swift lib dir to the LINK search path only (runtime stays on OS libs — its dylibs on the rpath abort dyld at load).
 - CI: ci-macos.yml macos-15 → macos-26, pins Xcode 26.6, guards the Metal Toolchain component. AGENTS.md + docs/mlx-bridge.md updated.
 - Local validation on Swift 6.3.3 (swift.org toolchain over Xcode 16.4): swift release build clean; cargo build cli,http,mlx,vision green; clippy clean. Lib tests under mlx: rpath fix applied after a dyld abort, re-run pending — primary build/validation moving to the M4 Pro (native Xcode 26.x).
+
+## 2026-08-21 09:10  claude  feat/bump-mlx-swift-lm  ratchet=green  review=pending
+- Validation of the Swift 6.3 bump landed green on both lanes: local mac (swift.org 6.3.3 toolchain over Xcode 16.4 — exercises build.rs auto-select + link-search path) and the M4 Pro (native Swift 6.3.3, macOS 27 — the CI-equivalent path). Both: cargo build cli,http,mlx,vision + clippy -D warnings + 199/199 lib tests.
+- M4 Pro run executed in herdr tab spindll-mlx-bump (pane w1:p5) on the mbp for attachable review.
