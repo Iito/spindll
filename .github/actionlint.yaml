@@ -1,0 +1,10 @@
+# Extra runner labels actionlint should accept.
+#
+# macos-26 is a GitHub-hosted image (Xcode 26.x line; see
+# actions/runner-images images/macos/macos-26-arm64-Readme.md), not a
+# self-hosted runner — but the vendored label list in actionlint v1.7.7
+# (pinned in workflow-lint.yml) predates it and only knows up to macos-15.
+# Drop this entry once the pinned actionlint knows the label natively.
+self-hosted-runner:
+  labels:
+    - macos-26
