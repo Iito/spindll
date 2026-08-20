@@ -326,7 +326,20 @@ impl ModelManager {
             .iter()
             .find(|b| b.name() == target)
             .map(|b| b.as_ref())
-            .ok_or_else(|| anyhow::anyhow!("no backend available for {target} format"))
+            .ok_or_else(|| {
+                let hint = match format {
+                    ModelFormat::Mlx if !cfg!(feature = "mlx") => {
+                        " (this build lacks the `mlx` feature — rebuild with \
+                         `--features mlx` on Apple Silicon macOS)"
+                    }
+                    ModelFormat::Mlx => {
+                        " (the `mlx` feature is enabled but the backend is only \
+                         available on Apple Silicon macOS)"
+                    }
+                    ModelFormat::Gguf => "",
+                };
+                anyhow::anyhow!("no backend available for {target} format{hint}")
+            })
     }
 
     fn infer_format(path: &Path) -> ModelFormat {
@@ -1286,6 +1299,18 @@ mod tests {
         fn size_bytes(&self) -> u64 { 100 }
         fn kv_bytes_per_token(&self) -> u64 { 1 }
         fn as_any(&self) -> &dyn std::any::Any { self }
+    }
+
+    #[test]
+    fn missing_mlx_backend_error_names_the_remedy() {
+        let mgr = ModelManager::with_backends(vec![], 4300);
+        let dir = tempfile::tempdir().unwrap(); // a directory infers MLX format
+        let err = mgr.load_model("m", dir.path(), None).unwrap_err().to_string();
+        assert!(err.contains("no backend available for mlx format"), "{err}");
+        #[cfg(not(feature = "mlx"))]
+        assert!(err.contains("--features mlx"), "{err}");
+        #[cfg(feature = "mlx")]
+        assert!(err.contains("Apple Silicon"), "{err}");
     }
 
     #[test]
