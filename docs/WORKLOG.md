@@ -31,3 +31,11 @@ Append-only. One entry per `/implement` close. Format:
 - No bridge source changes needed — FFI-relevant API surface unchanged.
 - Validated: Swift release build clean; cargo build --features cli,http,mlx,vision green (metallib compiled); clippy -D warnings clean; 193 lib tests pass.
 - Follow-up: installing Xcode 26.6 (Swift 6.3.3) locally + pinning an Xcode in ci-macos.yml unlocks latest upstream main — #465 guided-generation fix, #475 prompt-cache persistence, #521 thinking-budget enforcement, #442/#467/#468 Qwen3.5 decode perf (all relevant to issue #75).
+
+## 2026-08-20 22:45  claude  feat/bump-mlx-swift-lm  ratchet=green(build+clippy)  review=pending
+- mlx-validate-required
+- Lifted the Swift 6.3 ceiling: re-bumped mlx-swift-lm to latest main@7871b09 (2026-08-17); mlx-swift now 0.31.6. Unlocks #465 guided-generation fix, #475 prompt-cache persistence, #521 thinking-budget enforcement, #442/#467/#468 Qwen3.5 decode perf, #531 tool parser hardening — the upstream half of issue #75.
+- Bridge fixes for upstream #453 (quantization APIs now throw): demote() keeps entry width on failure; snapshotCache() throws, save site uses try? (failed snapshot loses the cache entry, never the generation); makePromptCache takes try.
+- build.rs: auto-selects a Swift 6.3+ toolchain via TOOLCHAINS for the SwiftPM child (explicit env > default swift > swift.org toolchain probe, with install hints); adds the selected toolchain's swift lib dir to the LINK search path only (runtime stays on OS libs — its dylibs on the rpath abort dyld at load).
+- CI: ci-macos.yml macos-15 → macos-26, pins Xcode 26.6, guards the Metal Toolchain component. AGENTS.md + docs/mlx-bridge.md updated.
+- Local validation on Swift 6.3.3 (swift.org toolchain over Xcode 16.4): swift release build clean; cargo build cli,http,mlx,vision green; clippy clean. Lib tests under mlx: rpath fix applied after a dyld abort, re-run pending — primary build/validation moving to the M4 Pro (native Xcode 26.x).
