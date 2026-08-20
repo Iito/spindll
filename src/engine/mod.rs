@@ -14,6 +14,7 @@ pub mod metrics;
 #[cfg(feature = "vision")]
 pub mod multimodal;
 pub mod ram_cache;
+pub mod reasoning;
 pub mod streaming;
 pub mod tools;
 
