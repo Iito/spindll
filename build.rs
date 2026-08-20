@@ -118,6 +118,10 @@ fn preflight_metal_toolchain() -> Result<(), Box<dyn std::error::Error>> {
              Then rebuild with: cargo build --features cli,mlx".into()
         );
     }
+    if !out.status.success() {
+        // Only visible with `cargo build -vv`; the real compile step reports.
+        println!("preflight: xcrun metal failed for a non-toolchain reason: {stderr}");
+    }
     Ok(())
 }
 

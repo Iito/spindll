@@ -961,10 +961,13 @@ async fn oai_chat_completions(
                             });
                             let _ = tx.blocking_send(Ok(sse_data(&chunk)));
                         };
-                        // Reasoning first (its own delta), then leftover prose
-                        // as a content delta; with no calls that prose is the
-                        // whole answer, and a blank one is dropped rather than
-                        // streamed as stray whitespace.
+                        // Reasoning first (one delta — the tools path buffers
+                        // the whole output anyway, and chunking a long think
+                        // block here would only fragment an already-buffered
+                        // string), then leftover prose as a content delta;
+                        // with no calls that prose is the whole answer, and a
+                        // blank one is dropped rather than streamed as stray
+                        // whitespace.
                         if let Some(r) = &split.reasoning {
                             emit(serde_json::json!({ "reasoning_content": r }));
                         }

@@ -790,15 +790,6 @@ impl ModelStore {
     }
 }
 
-/// Convert a registry key to a friendly display name.
-///
-/// - `ollama/nemotron-3-nano/4b.gguf` → `nemotron-3-nano:4b`
-/// - `TheBloke/Llama-3-8B-GGUF/model.gguf` → `TheBloke/Llama-3-8B-GGUF:model`
-///
-/// Derive a canonical base model name from GGUF metadata or the user-provided model string.
-///
-/// Prefers `general.name` from GGUF metadata (most reliable), falling back to
-/// cleaning up the repo/model string by stripping GGUF-specific suffixes and org prefixes.
 /// True when `dir` holds at least one `*.safetensors` file — single-file
 /// (`model.safetensors`) or sharded (`model-00001-of-00002.safetensors` plus
 /// an index json), both of which the MLX serve path already loads.
@@ -814,6 +805,15 @@ fn dir_has_safetensors(dir: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Convert a registry key to a friendly display name.
+///
+/// - `ollama/nemotron-3-nano/4b.gguf` → `nemotron-3-nano:4b`
+/// - `TheBloke/Llama-3-8B-GGUF/model.gguf` → `TheBloke/Llama-3-8B-GGUF:model`
+///
+/// Derive a canonical base model name from GGUF metadata or the user-provided model string.
+///
+/// Prefers `general.name` from GGUF metadata (most reliable), falling back to
+/// cleaning up the repo/model string by stripping GGUF-specific suffixes and org prefixes.
 fn derive_base_model(gguf_name: &str, model: &str) -> String {
     // Use GGUF general.name if available — normalize spaces to hyphens.
     if !gguf_name.is_empty() {
