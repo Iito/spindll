@@ -81,6 +81,11 @@ pub struct LoadedModel {
     pub digest: String,
     /// On-disk format of this model.
     pub format: ModelFormat,
+    /// True when the chat template's generation prompt ends inside an opened
+    /// `<think>` block (probed once at load): the model streams its reasoning
+    /// with no opening tag, and the OpenAI surface routes it into
+    /// `reasoning_content` from the first token.
+    pub reasoning_forced_open: bool,
     /// Channel to submit requests to this model's batch scheduler (if running).
     pub batch_tx: Option<std::sync::mpsc::Sender<BatchRequest>>,
     pub priority: EvictionPriority,
@@ -431,6 +436,20 @@ impl ModelManager {
         let n_ctx_train = model.n_ctx_train();
         let size_bytes = model.size_bytes();
 
+        // Probe the rendered generation prompt once: a template that forces a
+        // think block open (Qwen3-thinking's trailing `<think>`) streams its
+        // reasoning with no opening tag, and the OpenAI surface needs to know
+        // that up front to route it into `reasoning_content`. Probe failures
+        // (e.g. a VLM template that rejects plain-string content) degrade to
+        // explicit-tag detection, never to a load error.
+        let reasoning_forced_open = model
+            .apply_chat_template(&[("user".to_string(), "ping".to_string())], &[], &ToolChoice::None)
+            .map(|p| super::reasoning::prompt_opens_reasoning(&p))
+            .unwrap_or(false);
+        if reasoning_forced_open {
+            tracing::info!(name, "chat template force-opens a think block; reasoning splits into reasoning_content");
+        }
+
         // Scheduler needs its own GGUF model copy.
         let batch_tx = if self.batch_slots > 0 && model.supports_batching() {
             let (tx, rx) = std::sync::mpsc::channel::<BatchRequest>();
@@ -471,6 +490,7 @@ impl ModelManager {
             requested_gpu_layers: gpu_layers,
             digest,
             format,
+            reasoning_forced_open,
             batch_tx,
             priority,
             idle_reload,
@@ -970,6 +990,17 @@ impl ModelManager {
         loaded.model.apply_chat_template(messages, tools, tool_choice)
     }
 
+    /// True when `model_name`'s chat template force-opens a think block at the
+    /// end of the generation prompt (see [`LoadedModel::reasoning_forced_open`]).
+    /// `false` for unknown or unloaded models.
+    pub fn reasoning_forced_open(&self, model_name: &str) -> bool {
+        self.models
+            .read()
+            .unwrap()
+            .get(model_name)
+            .is_some_and(|m| m.reasoning_forced_open)
+    }
+
     /// Compute an embedding vector for a text string.
     #[tracing::instrument(skip(self, text), fields(model = model_name))]
     pub fn embed(
@@ -1216,6 +1247,70 @@ mod tests {
         let f = std::fs::File::create(&p).unwrap();
         f.set_len(size).unwrap();
         p
+    }
+
+    /// Backend whose model renders a fixed chat-template string, for probing.
+    struct TemplateBackend(&'static str);
+
+    impl InferenceBackend for TemplateBackend {
+        fn load_model(
+            &self,
+            _path: &Path,
+            _params: BackendLoadParams,
+        ) -> anyhow::Result<Box<dyn BackendModel>> {
+            Ok(Box::new(TemplateModel(self.0)))
+        }
+        fn name(&self) -> &str { "llamacpp" }
+    }
+
+    struct TemplateModel(&'static str);
+
+    impl BackendModel for TemplateModel {
+        fn generate(
+            &self,
+            _prompt: &str,
+            _params: &GenerateParams,
+            _on_token: &mut dyn FnMut(&str) -> bool,
+        ) -> anyhow::Result<GenerateResult> {
+            Ok(GenerateResult::default())
+        }
+        fn apply_chat_template(
+            &self,
+            _messages: &[(String, String)],
+            _tools: &[ToolSpec],
+            _tool_choice: &ToolChoice,
+        ) -> anyhow::Result<String> {
+            Ok(self.0.to_string())
+        }
+        fn n_ctx(&self) -> u32 { 2048 }
+        fn size_bytes(&self) -> u64 { 100 }
+        fn kv_bytes_per_token(&self) -> u64 { 1 }
+        fn as_any(&self) -> &dyn std::any::Any { self }
+    }
+
+    #[test]
+    fn load_probes_forced_open_reasoning_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = fake_model_file(dir.path(), "think.gguf", 100);
+        let mgr = ModelManager::with_backends(
+            vec![Box::new(TemplateBackend("<|im_start|>assistant\n<think>\n"))],
+            4300,
+        );
+        mgr.load_model("think", &p, None).unwrap();
+        assert!(mgr.reasoning_forced_open("think"));
+    }
+
+    #[test]
+    fn load_probes_plain_template_as_not_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = fake_model_file(dir.path(), "plain.gguf", 100);
+        let mgr = ModelManager::with_backends(
+            vec![Box::new(TemplateBackend("<|im_start|>assistant\n"))],
+            4300,
+        );
+        mgr.load_model("plain", &p, None).unwrap();
+        assert!(!mgr.reasoning_forced_open("plain"));
+        assert!(!mgr.reasoning_forced_open("never-loaded"));
     }
 
     #[cfg(feature = "vision")]
