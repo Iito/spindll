@@ -644,7 +644,8 @@ impl ModelStore {
     }
 
     /// Import a model from an arbitrary path: a `.gguf` file or an MLX
-    /// directory containing `config.json` + `model.safetensors`.
+    /// directory containing `config.json` plus one or more `*.safetensors`
+    /// files (single-file or sharded).
     pub fn import_from_path(&self, path_str: &str) -> anyhow::Result<()> {
         self.ensure_dirs()?;
         let path = std::fs::canonicalize(path_str)
@@ -657,7 +658,7 @@ impl ModelStore {
                 .unwrap_or(false);
         let is_mlx_dir = path.is_dir()
             && path.join("config.json").exists()
-            && path.join("model.safetensors").exists();
+            && dir_has_safetensors(&path);
 
         let format = if is_gguf {
             registry::read_gguf_metadata(&path); // validate it parses as GGUF
@@ -666,7 +667,7 @@ impl ModelStore {
             registry::ModelFormat::Mlx
         } else {
             anyhow::bail!(
-                "unsupported model at {}: expected a .gguf file or an MLX directory (config.json + model.safetensors)",
+                "unsupported model at {}: expected a .gguf file or an MLX directory (config.json + *.safetensors)",
                 path.display()
             );
         };
@@ -798,6 +799,21 @@ impl ModelStore {
 ///
 /// Prefers `general.name` from GGUF metadata (most reliable), falling back to
 /// cleaning up the repo/model string by stripping GGUF-specific suffixes and org prefixes.
+/// True when `dir` holds at least one `*.safetensors` file — single-file
+/// (`model.safetensors`) or sharded (`model-00001-of-00002.safetensors` plus
+/// an index json), both of which the MLX serve path already loads.
+fn dir_has_safetensors(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries.filter_map(|e| e.ok()).any(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"))
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn derive_base_model(gguf_name: &str, model: &str) -> String {
     // Use GGUF general.name if available — normalize spaces to hyphens.
     if !gguf_name.is_empty() {
@@ -1303,5 +1319,40 @@ mod tests {
         std::fs::write(&src, b"not a model").unwrap();
 
         assert!(store.import_from_path(src.to_str().unwrap()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_from_path_accepts_sharded_mlx_directory() {
+        // Issue #75 friction: sharded models serve fine, but import rejected
+        // them for lacking a single-file model.safetensors.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        let src = dir.path().join("sharded-mlx");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("config.json"), b"{}").unwrap();
+        std::fs::write(src.join("model-00001-of-00002.safetensors"), vec![0u8; 1024]).unwrap();
+        std::fs::write(src.join("model-00002-of-00002.safetensors"), vec![0u8; 1024]).unwrap();
+        std::fs::write(src.join("model.safetensors.index.json"), b"{}").unwrap();
+
+        store
+            .import_from_path(src.to_str().unwrap())
+            .expect("sharded mlx directory import should succeed");
+
+        let reg = Registry::load(&store.registry_path()).unwrap();
+        let entry = reg.models.get("manual/sharded-mlx").expect("sharded mlx entry registered");
+        assert_eq!(entry.format, ModelFormat::Mlx);
+    }
+
+    #[test]
+    fn import_from_path_rejects_dir_without_safetensors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        let src = dir.path().join("configs-only");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("config.json"), b"{}").unwrap();
+
+        let err = store.import_from_path(src.to_str().unwrap()).unwrap_err().to_string();
+        assert!(err.contains("*.safetensors"), "{err}");
     }
 }
