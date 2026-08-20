@@ -38,6 +38,11 @@ mlx    = []
 bench  = ["cli"]
 # Vision / multimodal support via llama.cpp's mtmd (multimodal) API.
 vision = ["llama-cpp-2/mtmd", "dep:base64"]
+# Cross-machine layer offload via llama.cpp's RPC backend. The C backend is
+# compiled in all builds (GGML_RPC=ON via .cargo/config.toml [env] forwarding);
+# this feature gates spindll's Rust surface for it. Requires the [patch.crates-io]
+# git pin — the crates.io tarball strips the ggml-rpc sources.
+rpc = []
 # Grammar-constrained decoding (GBNF via llama.cpp's json-schema-to-grammar and
 # lazy grammar sampler). Opt-in: pulls in llama-cpp-2's `common` library, which
 # compiles llama.cpp's common/ C++ sources (adds build time). Forces a valid
@@ -93,3 +98,12 @@ http-body-util = "0.1"
 
 [build-dependencies]
 tonic-build = "0.13"
+
+# Pin the llama-cpp crates to the upstream git repo at the exact 0.1.154 release
+# rev. Same code as crates.io, except the git tree carries llama.cpp as a full
+# submodule *including* ggml/src/ggml-rpc/, which the published tarball strips —
+# required for the `rpc` feature's GGML_RPC=ON build (see .cargo/config.toml).
+# Drop this patch if upstream ever ships an `rpc` build feature.
+[patch.crates-io]
+llama-cpp-2     = { git = "https://github.com/utilityai/llama-cpp-rs", rev = "bed81ad4ab1a6c904b11d425608e50f976d8ea62" }
+llama-cpp-sys-2 = { git = "https://github.com/utilityai/llama-cpp-rs", rev = "bed81ad4ab1a6c904b11d425608e50f976d8ea62" }

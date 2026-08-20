@@ -1,0 +1,8 @@
+# GGML_* env vars are forwarded by llama-cpp-sys-2's build script to llama.cpp's
+# CMake configure step; any option the build script doesn't define itself can be
+# set this way. GGML_RPC compiles llama.cpp's RPC backend (cross-machine layer
+# offload) into every build — it stays inert until endpoints are registered
+# through spindll's `rpc` feature surface. Requires the [patch.crates-io] git pin
+# in Cargo.toml: the crates.io tarball strips the ggml-rpc sources.
+[env]
+GGML_RPC = "ON"
