@@ -22,7 +22,11 @@ fi
 PROMPT="You are reviewing a Rust diff for spindll (LLM inference engine, GGUF + MLX). Output markdown with sections: Critical, High, Medium, Low, Nit. Each finding: one line location (file:line), one line problem, one line suggested fix. Be terse."
 
 run_lane() {
-  local label="$1" cmd="$2" out="$OUT/${label}-${SHA}.md"
+  # One `local` per line: macOS bash 3.2 expands ${label} in a combined
+  # declaration before the assignment lands (breaks under `set -u`).
+  local label="$1"
+  local cmd="$2"
+  local out="$OUT/${label}-${SHA}.md"
   echo "==> lane $label -> $out"
   if eval "$cmd" < "$DIFF_FILE" > "$out" 2>&1; then
     echo "    ok"
