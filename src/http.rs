@@ -52,6 +52,7 @@ pub fn router(manager: Arc<ModelManager>, store: Arc<ModelStore>) -> Router {
         .route("/v1/status", get(oai_status))
         // Anthropic Messages API + OpenAI Responses API (agent clients)
         .route("/v1/messages", post(crate::http_anthropic::anthropic_messages))
+        .route("/v1/responses", post(crate::http_responses::responses_create))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
