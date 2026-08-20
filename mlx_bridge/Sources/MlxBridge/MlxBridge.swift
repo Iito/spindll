@@ -93,12 +93,18 @@ private struct PromptCacheHit {
 /// footprint. Mamba/SSM layers (already independent deep copies) are left as-is.
 private func demote(_ entry: PromptCacheEntry) {
     guard entry.bits != lowBits else { return }
-    entry.kvCache = entry.kvCache.map { layer -> any KVCache in
-        guard let q = layer as? QuantizedKVCache, q.bits != lowBits else { return layer }
-        return q.toUnquantized().toQuantized(groupSize: kvGroupSize, bits: lowBits)
+    do {
+        // The map builds a full replacement array before assignment, so a
+        // throw leaves the entry untouched at its current width.
+        entry.kvCache = try entry.kvCache.map { layer -> any KVCache in
+            guard let q = layer as? QuantizedKVCache, q.bits != lowBits else { return layer }
+            return try q.toUnquantized().toQuantized(groupSize: kvGroupSize, bits: lowBits)
+        }
+        entry.bits = lowBits
+        entry.sizeBytes = sizeOf(entry.kvCache)
+    } catch {
+        fputs("[mlx-bridge] demote to \(lowBits)-bit failed, keeping \(entry.bits)-bit: \(error)\n", stderr)
     }
-    entry.bits = lowBits
-    entry.sizeBytes = sizeOf(entry.kvCache)
 }
 
 /// Total bytes occupied by the live state arrays of every layer in `kvCache`.
@@ -646,13 +652,13 @@ private func deepCopyCache(_ layer: any KVCache) -> any KVCache {
 /// miss) or already quantized at some other width (`QuantizedKVCache`, on a hit
 /// off a previous snapshot). The result is independent — safe to retain while
 /// generation keeps mutating the live cache.
-private func snapshotCache(_ cache: [any KVCache], bits: Int) -> [any KVCache] {
-    cache.map { layer in
+private func snapshotCache(_ cache: [any KVCache], bits: Int) throws -> [any KVCache] {
+    try cache.map { layer in
         if let simple = layer as? KVCacheSimple {
-            return simple.toQuantized(groupSize: kvGroupSize, bits: bits)
+            return try simple.toQuantized(groupSize: kvGroupSize, bits: bits)
         }
         if let q = layer as? QuantizedKVCache, q.bits != bits {
-            return q.toUnquantized().toQuantized(groupSize: kvGroupSize, bits: bits)
+            return try q.toUnquantized().toQuantized(groupSize: kvGroupSize, bits: bits)
         }
         return deepCopyCache(layer)
     }
@@ -767,7 +773,7 @@ public func mlxChatGenerate(
                         parameters: params
                     )
                 } else {
-                    liveCache = makePromptCache(model: context.model, parameters: params)
+                    liveCache = try makePromptCache(model: context.model, parameters: params)
                     // Miss: the live cache is f16 — snapshot it near-losslessly.
                     snapshotBits = highBits
                     wasMiss = true
@@ -829,12 +835,16 @@ public func mlxChatGenerate(
                 // hand them to `save` directly. This avoids the redundant
                 // post-generation deep copy that was happening on every hit.
                 if canTrimPromptCache(liveCache) {
-                    let toStore = wasMiss ? snapshotCache(liveCache, bits: snapshotBits)
+                    // A failed snapshot only loses the cache entry — the
+                    // generation already streamed, so never fail it here.
+                    let toStore = wasMiss ? (try? snapshotCache(liveCache, bits: snapshotBits))
                                           : liveCache
-                    state.promptCache.save(
-                        tokenIds: tokenIds + generatedTokenIds,
-                        kvCache: toStore,
-                        bits: snapshotBits)
+                    if let toStore {
+                        state.promptCache.save(
+                            tokenIds: tokenIds + generatedTokenIds,
+                            kvCache: toStore,
+                            bits: snapshotBits)
+                    }
                 }
 
                 Stream().synchronize()

@@ -11,22 +11,17 @@ let package = Package(
         .package(
             url: "https://github.com/ml-explore/mlx-swift-lm",
             // Pinned to a main revision (not a tag) for reproducible builds:
-            // upstream's tags lag main by weeks, and this is the newest
-            // revision our toolchain can build. Ceiling, in order:
-            //  - #369 (2026-07-15) onward calls mlx-swift 0.31.5+ APIs
-            //    (MLXArray.maskFill, DType.greatestFiniteMagnitudeArray);
-            //  - mlx-swift 0.31.5+ declares swift-tools 6.3, newer than any
-            //    installed toolchain (Xcode 16.4 = 6.1, Xcode 26.3 = 6.2.4),
-            //    so resolution keeps mlx-swift at 0.31.4;
-            //  - lm main @ 2026-08-11+ (#519) additionally declares 6.2.
-            // This revision (main @ 2026-07-15, parent of #369) picks up the
-            // tool round-trip ordering fix (#409), ChatSession cancellation
-            // fixes (#389/#413/#423), the safetensors-index fix (#408), and
-            // Qwen3.5 windowed prefill (#399). The guided-generation
-            // required-properties fix (#465) and prompt-cache persistence
-            // (#475) land after #369 — revisit once a Swift 6.3 toolchain is
-            // on this mac and the macos-15 CI runner.
-            revision: "d2424294a6c3bbd0de37a0761d80efc05e6813dd"
+            // upstream's tags lag main by weeks.
+            // This revision (main @ 2026-08-17) picks up the guided-generation
+            // required-properties fix (#465), the tool round-trip ordering fix
+            // (#409), prompt-cache persistence (#475), thinking-budget
+            // enforcement (#521), Qwen3.5 decode perf (#442/#467/#468), and
+            // tool call parser hardening (#531).
+            // Toolchain floor: Swift 6.3 (mlx-swift 0.31.5+ declares
+            // swift-tools 6.3). Locally that means a swift.org 6.3+ toolchain
+            // (build.rs auto-detects one under ~/Library/Developer/Toolchains)
+            // or Xcode 26.4+; CI uses Xcode 26.6 on the macos-26 runner.
+            revision: "7871b09b2eda7500bc2acad51125ebd772cbaffe"
         ),
         // Needed so `import Tokenizers` is in scope when `#huggingFaceTokenizerLoader()` expands.
         .package(
