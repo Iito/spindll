@@ -3,6 +3,8 @@
 
 mod traits;
 pub mod llamacpp;
+#[cfg(feature = "rpc")]
+pub mod rpc_ffi;
 pub use traits::{BackendLoadParams, BackendModel, EmbedResult, InferenceBackend};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
