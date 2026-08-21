@@ -192,6 +192,12 @@ fn compile_mlx_metallib(manifest_dir: &str) -> Result<(), Box<dyn std::error::Er
             .args([
                 "-sdk", "macosx", "metal",
                 "-O2",
+                // Pin the Metal deployment target to the mlx_bridge platform
+                // floor (Package.swift: .macOS(.v15)). Without it the compiler
+                // defaults to the SDK's own OS — a metallib built on the
+                // macos-26 runner targets Metal language 4.0, which macOS 15's
+                // loader rejects ("language version 4.0 is not supported").
+                "-mmacosx-version-min=15.0",
                 "-c", metal_file.to_str().unwrap(),
                 "-o", air_file.to_str().unwrap(),
                 "-I", metal_src.to_str().unwrap(),
