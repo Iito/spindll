@@ -38,10 +38,12 @@ Existing test modules: `src/scheduler/budget.rs`, `src/model_store/registry.rs`.
 
 ## Punchlist + worklog (the core control point)
 
-Two committed files drive `/implement`:
+Two **local, per-host** files drive `/implement` — untracked since 2026-08-21 (history keeps them up to `d0f6d7e`; `.git/info/exclude` hides them):
 
 - `docs/PUNCHLIST.md` — ordered checkbox list of shippable units. `/implement` consumes top-most `[ ]`.
 - `docs/WORKLOG.md` — append-only run log. One entry per `/implement` close: `## YYYY-MM-DD HH:MM  <agent>  <branch>  <ratchet?>  <review?>` + bullets.
+
+**Never `git add` or commit these files** — `git add` will refuse (excluded), and each host maintains its own copy. A fresh clone has neither: seed them from another host or from history (`git show d0f6d7e:docs/PUNCHLIST.md`), then add both paths to that clone's `.git/info/exclude`. Caution: checking out pre-removal commits silently overwrites the local copies (git treats ignored files as expendable) — back them up before history archaeology.
 
 Tag `mlx-validate-required` in a worklog entry whenever the change touches `mlx_bridge/`, `src/backend/mlx*.rs`, or any `feature = "mlx"`-gated path. These paths now also build in CI on every PR (`.github/workflows/ci-macos.yml`, `macos-26`); `scripts/mlx-validate.sh` remains the full release-level mac validator and picks these tags up.
 
