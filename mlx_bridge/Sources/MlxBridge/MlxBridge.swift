@@ -865,9 +865,18 @@ public func mlxChatGenerate(
 // Image resizing helper
 // ---------------------------------------------------------------------------
 
-/// Default maximum pixel count (~4M pixels ≈ 2048×2048).
-/// Produces ~5K–10K image tokens — a good balance of quality vs speed.
-private let kDefaultMaxPixels: Int = 4_194_304
+/// Maximum pixel count before an input image is pre-scaled. Default ~1M px
+/// (≈ 1024×1024): Qwen-VL vision prefill scales linearly with patch count
+/// while decode speed is unaffected, so pixels beyond this mostly buy prefill
+/// latency — models ship permissive caps (qwen3.5-9b: 16.8M px). Override
+/// with SPINDLL_VLM_MAX_PIXELS; 0 or negative disables the cap.
+private let kDefaultMaxPixels: Int = {
+    if let raw = ProcessInfo.processInfo.environment["SPINDLL_VLM_MAX_PIXELS"],
+       let v = Int(raw) {
+        return v <= 0 ? Int.max : v
+    }
+    return 1_048_576
+}()
 
 /// If the image at `url` exceeds `maxPixels` total pixels, write a
 /// proportionally down-scaled JPEG (preserving colour and aspect ratio)
