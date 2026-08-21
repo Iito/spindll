@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Anthropic Messages API** — `POST /v1/messages` implements the Anthropic dialect on the shared engine chat path: string/block content, `system`, tools via `input_schema` with `tool_use`/`tool_result` round-trip, `tool_choice` (`auto`/`any`/`tool`/`none`), `stop_sequences` (streamed output holds back partial matches so a stop string split across tokens never leaks), image blocks behind the `vision` feature, and the Messages SSE grammar (named events, no `[DONE]`). Point Claude Code at spindll with `ANTHROPIC_BASE_URL=http://localhost:8080`.
+- **OpenAI Responses API** — `POST /v1/responses` serves the stateless subset agent clients use with `store: false`: `input` as string or item array (`message`, `function_call`/`function_call_output`, `developer`→`system`), `instructions`, flat function tools, and the item-based SSE grammar with monotonic `sequence_number`s, terminating in `response.completed` / `response.incomplete` / `response.failed` per spec. Codex CLI works with its default `wire_api = "responses"`. `previous_response_id` is rejected with a clear 400; `input_image` parts are not mapped yet.
+
 ## [0.8.0] - 2026-08-11
 
 ### Added
