@@ -6,8 +6,9 @@
 //! `instructions`, flat function tools, `tool_choice`, `max_output_tokens`,
 //! and the item-based SSE grammar (`response.created` →
 //! `response.output_item.added` → `response.output_text.delta` /
-//! `response.function_call_arguments.*` → `response.completed`, every event
-//! carrying a monotonic `sequence_number`). Stateful features are out of
+//! `response.function_call_arguments.*` → a terminal `response.completed`,
+//! `response.incomplete` (token cap), or `response.failed` (error), every
+//! event carrying a monotonic `sequence_number`). Stateful features are out of
 //! scope: `previous_response_id` is rejected with a clear 400, `store` is
 //! accepted and ignored (nothing is persisted), reasoning items are dropped.
 //! `input_image` parts are not supported yet (400).
@@ -261,6 +262,30 @@ fn resp_tool_choice(value: Option<&Value>) -> ToolChoice {
 
 // -- Response helpers --------------------------------------------------------
 
+/// Terminal SSE event for a finished response: the API signals an
+/// `incomplete` status with its own `response.incomplete` event type, not a
+/// `response.completed` carrying the status (Codex parses the event name).
+fn terminal_event(status: &str) -> &'static str {
+    if status == "incomplete" { "response.incomplete" } else { "response.completed" }
+}
+
+/// Response object for a `response.failed` event. Codex surfaces
+/// `response.error.code` / `.message` from this shape; a bare `error` event
+/// would be silently ignored and reported as a closed stream instead.
+fn failed_response(id: &str, model: &str, msg: &str) -> Value {
+    json!({
+        "id": id,
+        "object": "response",
+        "created_at": unix_secs(),
+        "status": "failed",
+        "incomplete_details": null,
+        "error": { "code": "server_error", "message": msg },
+        "model": model,
+        "output": [],
+        "usage": null,
+    })
+}
+
 fn resp_error_body(kind: &str, msg: &str) -> Value {
     json!({ "error": { "type": kind, "message": msg } })
 }
@@ -423,12 +448,14 @@ pub(crate) async fn responses_create(
 
         tokio::task::spawn_blocking(move || {
             let mut em = Emitter { tx, seq: 0 };
+            let resp_id = new_id("resp");
             if let Err(e) = auto_load(&mgr, &store, &model) {
-                em.send("error", resp_error_body("api_error", &e.to_string()));
+                em.send("response.failed", json!({
+                    "response": failed_response(&resp_id, &model, &e.to_string())
+                }));
                 return;
             }
 
-            let resp_id = new_id("resp");
             let skeleton = build_response(&resp_id, &model, Vec::new(), "in_progress", 0, 0);
             em.send("response.created", json!({ "response": skeleton }));
             em.send("response.in_progress", json!({ "response": skeleton }));
@@ -454,10 +481,12 @@ pub(crate) async fn responses_create(
                         };
                         let full = build_response(&resp_id, &model, items, status,
                             stats.prompt_tokens, stats.completion_tokens);
-                        em.send("response.completed", json!({ "response": full }));
+                        em.send(terminal_event(status), json!({ "response": full }));
                     }
                     Err(e) => {
-                        em.send("error", resp_error_body("api_error", &e.to_string()));
+                        em.send("response.failed", json!({
+                            "response": failed_response(&resp_id, &model, &e.to_string())
+                        }));
                     }
                 }
             } else {
@@ -503,10 +532,12 @@ pub(crate) async fn responses_create(
                         let status = if stats.completion_tokens >= max_tokens { "incomplete" } else { "completed" };
                         let full = build_response(&resp_id, &model, vec![item], status,
                             stats.prompt_tokens, stats.completion_tokens);
-                        em.send("response.completed", json!({ "response": full }));
+                        em.send(terminal_event(status), json!({ "response": full }));
                     }
                     Err(e) => {
-                        em.send("error", resp_error_body("api_error", &e.to_string()));
+                        em.send("response.failed", json!({
+                            "response": failed_response(&resp_id, &model, &e.to_string())
+                        }));
                     }
                 }
             }
@@ -757,6 +788,34 @@ mod tests {
         }
         assert!(text.contains("\"sequence_number\":0"));
         assert!(!text.contains("[DONE]"), "Responses SSE has no [DONE] sentinel");
+    }
+
+    #[tokio::test]
+    async fn responses_streaming_cap_ends_with_incomplete_event() {
+        let (status, text) = post_json(json!({
+            "model": "test-org/test-model",
+            "input": "hi",
+            "stream": true,
+            "max_output_tokens": 2
+        })).await;
+        assert_eq!(status, 200);
+        assert!(text.contains("event: response.incomplete"), "terminal event must be response.incomplete\n{text}");
+        assert!(!text.contains("event: response.completed"), "must not also send response.completed\n{text}");
+        assert!(text.contains("\"reason\":\"max_output_tokens\""));
+    }
+
+    #[tokio::test]
+    async fn responses_streaming_error_emits_response_failed() {
+        let (status, text) = post_json(json!({
+            "model": "no-such/model",
+            "input": "hi",
+            "stream": true
+        })).await;
+        assert_eq!(status, 200);
+        assert!(text.contains("event: response.failed"), "load failure must emit response.failed\n{text}");
+        assert!(text.contains("\"status\":\"failed\""));
+        assert!(text.contains("\"code\":\"server_error\""));
+        assert!(!text.contains("event: response.completed"));
     }
 
     #[tokio::test]
