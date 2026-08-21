@@ -24,7 +24,7 @@ You are running the **`/implement`** loop on spindll. Source: `AGENTS.md` "spec-
    - tag: mlx-validate-required   # only if MLX_REQUIRED=1
    ```
 
-10. **Commit, do not push.** `git add` + `git commit`. Stop. The user pushes manually (memory rule + nightshift `auto_create_pr: false`).
+10. **Commit code only, do not push.** `git add` + `git commit` the code/test changes. `docs/PUNCHLIST.md` and `docs/WORKLOG.md` are local per-host files (untracked + excluded) — the flip and the worklog entry stay on disk, never in the commit. Stop. The user pushes manually (memory rule + nightshift `auto_create_pr: false`).
 
 ## Hard rules
 

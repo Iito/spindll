@@ -38,6 +38,20 @@ The headers in `include/mlx_bridge.h` define the exported surface. All entry poi
 
 The cache lives on the `ModelState` retained by `mlx_model_load` and is released by `mlx_model_free`.
 
+## VLM image budget
+
+Input images are pre-scaled before they reach the processor when they exceed
+**~1M pixels** (`kDefaultMaxPixels`, ≈1024×1024). Vision prefill cost scales
+linearly with patch count while decode speed is unaffected, and model
+preprocessor configs ship permissive budgets (`qwen3.5-9b-4bit` allows 16.8M px
+— about two minutes of prefill for a 12 MP photo); the cap turns that into ~5 s
+with no decode cost. The resize preserves aspect ratio, never upscales, and
+logs `[mlx-bridge] resized image from W×H to W'×H'` when it fires.
+
+`SPINDLL_VLM_MAX_PIXELS` overrides the budget per process; `0` (or negative)
+disables the cap entirely and defers to the model's own preprocessor config —
+use this when caption fidelity on fine detail matters more than TTFT.
+
 ## Token streaming
 
 Both generate paths use `NaiveStreamingDetokenizer` and:
@@ -61,6 +75,14 @@ The build steps are:
 
 1. `swift build --package-path mlx_bridge --configuration release --arch arm64`
    produces `mlx_bridge/.build/release/libMlxBridge.a`.
+   SwiftPM must be Swift 6.3+ (mlx-swift 0.31.5+ declares `swift-tools-version: 6.3`).
+   `build.rs` picks the toolchain in this order: an explicit `$TOOLCHAINS`; the
+   default `swift` when it is 6.3+; the newest swift.org toolchain found under
+   `~/Library/Developer/Toolchains` or `/Library/Developer/Toolchains`
+   (selected via `TOOLCHAINS` for the SwiftPM child process only). If none
+   qualifies it aborts with install hints. Xcode 26.4+ satisfies this natively;
+   Xcode ≤ 26.3 needs a [swift.org toolchain](https://www.swift.org/install/macos/)
+   alongside — the metallib step below stays on the `xcode-select`'d Xcode either way.
 2. `compile_mlx_metallib` walks `mlx_bridge/.build/checkouts/mlx-swift/Source/Cmlx/mlx-generated/metal/`, compiles every `.metal` file with `xcrun -sdk macosx metal`, and links the resulting `.air` files into `mlx.metallib` next to the spindll binary. MLX's `device.cpp` discovers the metallib via `load_colocated_library("mlx")`, so it must sit next to the binary.
 3. Cargo links the static archive plus `Foundation`, `Metal`, `Accelerate`, `MetalPerformanceShaders`, and adds rpaths for the Xcode Swift toolchain and `/usr/lib/swift` so `libswift_Concurrency.dylib` resolves at runtime.
 

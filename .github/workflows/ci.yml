@@ -3,15 +3,25 @@ name: CI
 on:
   pull_request:
     branches: [main, next]
+    # Only paths the build/test jobs actually consume. Note: for pull_request
+    # events GitHub matches these against the WHOLE PR diff (base...head), so a
+    # docs-only push to a PR that also contains code changes still re-runs CI —
+    # that recertifies the new head SHA and is intended.
     paths:
       - "src/**"
+      - "tests/**"
       - "proto/**"
-      - "bench/**"
       - "build.rs"
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".cargo/**"
       - ".github/workflows/ci.yml"
   workflow_dispatch:
+
+# A new push to the same PR supersedes any still-running CI for it.
+concurrency:
+  group: ci-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always

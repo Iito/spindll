@@ -2,12 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.9.0] - 2026-08-21
 
 ### Added
 
 - **Anthropic Messages API** — `POST /v1/messages` implements the Anthropic dialect on the shared engine chat path: string/block content, `system`, tools via `input_schema` with `tool_use`/`tool_result` round-trip, `tool_choice` (`auto`/`any`/`tool`/`none`), `stop_sequences` (streamed output holds back partial matches so a stop string split across tokens never leaks), image blocks behind the `vision` feature, and the Messages SSE grammar (named events, no `[DONE]`). Point Claude Code at spindll with `ANTHROPIC_BASE_URL=http://localhost:8080`.
 - **OpenAI Responses API** — `POST /v1/responses` serves the stateless subset agent clients use with `store: false`: `input` as string or item array (`message`, `function_call`/`function_call_output`, `developer`→`system`), `instructions`, flat function tools, and the item-based SSE grammar with monotonic `sequence_number`s, terminating in `response.completed` / `response.incomplete` / `response.failed` per spec. Codex CLI works with its default `wire_api = "responses"`. `previous_response_id` is rejected with a clear 400; `input_image` parts are not mapped yet.
+- **`reasoning_content` on `/v1/chat/completions`** (#75) — thinking models' `<think>`-delimited reasoning no longer floods `message.content`: it is split into `message.reasoning_content` (non-streaming) / `delta.reasoning_content` (streaming), the mlx-vlm / DeepSeek response shape. Handles both explicit tags and templates that force the think block open (probed once per model at load). Tool calls are parsed from the visible answer only. When a block was split, `usage.completion_tokens_details.reasoning_tokens` reports the reasoning share.
+
+### Fixed
+
+- **`finish_reason` reports `"length"`** on `/v1/chat/completions` when generation exhausted `max_tokens` — previously always `"stop"`, which hid truncation (e.g. a reasoning pass consuming the whole budget) from clients. (#75)
+- **`spindll import <dir>` accepts sharded MLX models** — `config.json` plus any `*.safetensors` (e.g. `model-00001-of-00002.safetensors` + index) now qualifies; previously only a single-file `model.safetensors` did, even though sharded models served fine. (#75)
+- **`no backend available for mlx format` names the remedy** — the error now says to rebuild with `--features mlx` (or that the platform is unsupported) instead of leaving the fix to be guessed. (#75)
+- **Missing Metal Toolchain fails the MLX build fast** — `build.rs` probes `xcrun metal` before the multi-minute Swift build when `mlx.metallib` needs compiling, so the `xcodebuild -downloadComponent MetalToolchain` hint is the first thing the build says, not the last. (#75)
+
+### Changed
+
+- **VLM input images are pre-scaled to ~1M pixels by default** — vision prefill scales linearly with patch count while decode speed is unaffected, and models ship permissive budgets (`qwen3.5-9b-4bit` allows 16.8M px — ≈2 minutes of prefill for an uncapped 12 MP photo, vs ~5 s capped). `SPINDLL_VLM_MAX_PIXELS` overrides the budget; `0` disables the cap. Same-box control vs mlx-vlm 0.6.14 on identical weights: decode parity, faster prefill at every image size. (#75, #79)
+- **mlx-swift-lm bumped to main@7871b09 (2026-08-17)** — picks up upstream's Qwen3.5 prefill rework, recovering VLM decode throughput (issue #75's repro: 8 → ~39 tok/s). The MLX bridge now requires a **Swift 6.3+ toolchain**: `build.rs` selects one automatically (honors `$TOOLCHAINS`, falls back to an installed swift.org toolchain) while metallib compilation stays on the xcode-select'd toolchain. (#76)
+
+### Infrastructure
+
+- **macOS CI runs on macos-26 / Xcode 26.6** — the MLX job moved runners to satisfy the Swift 6.3 floor; actionlint taught the new runner label. (#76)
 
 ## [0.8.0] - 2026-08-11
 

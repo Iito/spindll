@@ -38,12 +38,14 @@ Existing test modules: `src/scheduler/budget.rs`, `src/model_store/registry.rs`.
 
 ## Punchlist + worklog (the core control point)
 
-Two committed files drive `/implement`:
+Two **local, per-host** files drive `/implement` — untracked since 2026-08-21 (history keeps them up to `d0f6d7e`; `.git/info/exclude` hides them):
 
 - `docs/PUNCHLIST.md` — ordered checkbox list of shippable units. `/implement` consumes top-most `[ ]`.
 - `docs/WORKLOG.md` — append-only run log. One entry per `/implement` close: `## YYYY-MM-DD HH:MM  <agent>  <branch>  <ratchet?>  <review?>` + bullets.
 
-Tag `mlx-validate-required` in a worklog entry whenever the change touches `mlx_bridge/`, `src/backend/mlx*.rs`, or any `feature = "mlx"`-gated path. These paths now also build in CI on every PR (`.github/workflows/ci-macos.yml`, `macos-15`); `scripts/mlx-validate.sh` remains the full release-level mac validator and picks these tags up.
+**Never `git add` or commit these files** — `git add` will refuse (excluded), and each host maintains its own copy. A fresh clone has neither: seed them from another host or from history (`git show d0f6d7e:docs/PUNCHLIST.md`), then add both paths to that clone's `.git/info/exclude`. Caution: checking out pre-removal commits silently overwrites the local copies (git treats ignored files as expendable) — back them up before history archaeology.
+
+Tag `mlx-validate-required` in a worklog entry whenever the change touches `mlx_bridge/`, `src/backend/mlx*.rs`, or any `feature = "mlx"`-gated path. These paths now also build in CI on every PR (`.github/workflows/ci-macos.yml`, `macos-26`); `scripts/mlx-validate.sh` remains the full release-level mac validator and picks these tags up.
 
 ## The spec-driven loop (`/implement`)
 
@@ -80,7 +82,7 @@ Driver: `scripts/autoloop.sh <metric> <param-grid.json>`. Logs to `.refs/autoloo
 - `cargo clippy --features cli,http -- -D warnings`
 - `cargo test --features cli,http --lib budget registry` (the two existing test modules — fast)
 
-Target ≤ 60 s on M-series mac, ≤ 90 s on the ubuntu box. If it grows, trim the test filter, do not raise the cap. Full `cargo test --release --features cli,http,mlx` runs only at the mac MLX validator step (`scripts/mlx-validate.sh`); CI exercises the MLX path at debug level on a `macos-15` runner (`.github/workflows/ci-macos.yml`).
+Target ≤ 60 s on M-series mac, ≤ 90 s on the ubuntu box. If it grows, trim the test filter, do not raise the cap. Full `cargo test --release --features cli,http,mlx` runs only at the mac MLX validator step (`scripts/mlx-validate.sh`); CI exercises the MLX path at debug level on a `macos-26` runner (`.github/workflows/ci-macos.yml`).
 
 ## Reviewer fanout policy
 
@@ -98,7 +100,7 @@ Target ≤ 60 s on M-series mac, ≤ 90 s on the ubuntu box. If it grows, trim t
 | **Mac (Apple Silicon)** | Local MLX validator + light interactive work. Runs `scripts/mlx-validate.sh` (release-level build) on branches tagged `mlx-validate-required`. Never run a nightshift schedule concurrently with the ubuntu one on the same branch. |
 | **Windows** | CI matrix only (`.github/workflows/ci.yml`). No local daemon. |
 
-**CI workflows.** `ci.yml` runs the Linux + Windows matrix (build/test, clippy, vision check), path-scoped to `src/**`, `proto/**`, `Cargo.*`, `build.rs` — it does **not** list `mlx_bridge/**`. `ci-macos.yml` runs a `macos-15` (Apple-Silicon) `--features cli,http,mlx,vision` debug build + lib tests, scoped to the MLX-relevant paths *including* `mlx_bridge/**`. Net: a Swift-bridge-only change runs **only** the macOS job; shared-code changes run all three platforms. `scripts/mlx-validate.sh` stays the heavier release-level (release build) mac validator.
+**CI workflows.** `ci.yml` runs the Linux + Windows matrix (build/test, clippy, vision check), path-scoped to `src/**`, `proto/**`, `Cargo.*`, `build.rs` — it does **not** list `mlx_bridge/**`. `ci-macos.yml` runs a `macos-26` (Apple-Silicon, Xcode 26.6) `--features cli,http,mlx,vision` debug build + lib tests, scoped to the MLX-relevant paths *including* `mlx_bridge/**`. Net: a Swift-bridge-only change runs **only** the macOS job; shared-code changes run all three platforms. `scripts/mlx-validate.sh` stays the heavier release-level (release build) mac validator.
 
 Sync between hosts: `git origin` only. No rsync, no live coupling.
 

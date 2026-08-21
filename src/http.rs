@@ -21,6 +21,7 @@ use tower_http::cors::CorsLayer;
 use crate::engine::{GenerateParams, ModelManager};
 #[cfg(feature = "vision")]
 use crate::engine::multimodal::{check_image_len, ContentPart, MAX_IMAGE_BYTES, MultimodalMessage};
+use crate::engine::reasoning::{ReasoningCollector, ReasoningSplitter};
 use crate::model_store::registry::Registry;
 use crate::model_store::ModelStore;
 
@@ -737,6 +738,35 @@ fn parse_tool_calls(output: &str) -> (Vec<OaiToolCallMessage>, String) {
     (calls, remaining)
 }
 
+/// OpenAI `finish_reason` for a completed generation: `"length"` when the
+/// token budget was exhausted, `"stop"` otherwise. Both backends stop *at* the
+/// cap and report one decoded piece per token, so `>=` is the budget-hit
+/// signal. (The MLX bridge skips empty pieces and can slightly under-count —
+/// a budget hit may then still read as `"stop"`, never the reverse.)
+fn oai_finish_reason(completion_tokens: u32, max_tokens: u32) -> &'static str {
+    if max_tokens > 0 && completion_tokens >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    }
+}
+
+/// OpenAI `usage` object. When a think block was split off, adds
+/// `completion_tokens_details.reasoning_tokens` (a stream-piece approximation
+/// of tokens) so clients can see how much of the budget the reasoning took.
+fn oai_usage(stats: &crate::engine::GenerateResult, reasoning_pieces: u32) -> serde_json::Value {
+    let mut usage = serde_json::json!({
+        "prompt_tokens": stats.prompt_tokens,
+        "completion_tokens": stats.completion_tokens,
+        "total_tokens": stats.prompt_tokens + stats.completion_tokens,
+    });
+    if reasoning_pieces > 0 {
+        usage["completion_tokens_details"] =
+            serde_json::json!({ "reasoning_tokens": reasoning_pieces });
+    }
+    usage
+}
+
 /// Prepare messages for template application, injecting the pre-rendered tool
 /// preamble (`engine::tools::tools_to_prompt`, built once by the caller and
 /// `None` when tools are inactive) into the system turn. Returns `(role,
@@ -870,6 +900,7 @@ async fn oai_chat_completions(
                 return;
             }
 
+            let forced_open = mgr.reasoning_forced_open(&req.model);
             let messages = prepare_messages_with_tools(&req.messages, None);
             let params = GenerateParams {
                 max_tokens: req.max_tokens.unwrap_or(512),
@@ -898,22 +929,26 @@ async fn oai_chat_completions(
             }))));
 
             if has_tools {
-                // When tools are active, collect full output to parse tool calls.
-                let mut output = String::new();
+                // When tools are active, collect full output to parse tool
+                // calls. The collector splits think-block reasoning off first,
+                // so a call the model merely *plans* inside `<think>` is not
+                // mistaken for one it made.
+                let mut collector = ReasoningCollector::new(forced_open);
                 #[cfg(feature = "vision")]
                 let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &tool_specs, &tool_choice, &params, &mut |token| {
-                    output.push_str(token);
+                    collector.push(token);
                     true
                 });
                 #[cfg(not(feature = "vision"))]
                 let result = mgr.generate_chat(&req.model, &messages, &tool_specs, &tool_choice, &params, None, |token| {
-                    output.push_str(token);
+                    collector.push(token);
                     true
                 });
 
                 match result {
                     Ok(ref stats) => {
-                        let (tool_calls, remaining) = parse_tool_calls(&output);
+                        let split = collector.finish();
+                        let (tool_calls, remaining) = parse_tool_calls(&split.content);
                         // One delta per chunk, keyed by `index`, matching OpenAI's
                         // streaming shape: id+name first, then arguments, so clients
                         // accumulate calls correctly. Arguments arrive in a single
@@ -929,9 +964,16 @@ async fn oai_chat_completions(
                             });
                             let _ = tx.blocking_send(Ok(sse_data(&chunk)));
                         };
-                        // Leftover prose (trimmed) goes first as a content delta;
-                        // with no calls this is the whole answer, and a blank one
-                        // is dropped rather than streamed as stray whitespace.
+                        // Reasoning first (one delta — the tools path buffers
+                        // the whole output anyway, and chunking a long think
+                        // block here would only fragment an already-buffered
+                        // string), then leftover prose as a content delta;
+                        // with no calls that prose is the whole answer, and a
+                        // blank one is dropped rather than streamed as stray
+                        // whitespace.
+                        if let Some(r) = &split.reasoning {
+                            emit(serde_json::json!({ "reasoning_content": r }));
+                        }
                         if !remaining.is_empty() {
                             emit(serde_json::json!({ "content": remaining }));
                         }
@@ -947,7 +989,11 @@ async fn oai_chat_completions(
                                 "function": { "arguments": call.function.arguments }
                             }]}));
                         }
-                        let finish = if !tool_calls.is_empty() { "tool_calls" } else { "stop" };
+                        let finish = if !tool_calls.is_empty() {
+                            "tool_calls"
+                        } else {
+                            oai_finish_reason(stats.completion_tokens, params.max_tokens)
+                        };
                         let done_chunk = serde_json::json!({
                             "id": &completion_id,
                             "object": "chat.completion.chunk",
@@ -963,11 +1009,7 @@ async fn oai_chat_completions(
                                 "created": created,
                                 "model": &req.model,
                                 "choices": [],
-                                "usage": {
-                                    "prompt_tokens": stats.prompt_tokens,
-                                    "completion_tokens": stats.completion_tokens,
-                                    "total_tokens": stats.prompt_tokens + stats.completion_tokens,
-                                }
+                                "usage": oai_usage(stats, split.reasoning_pieces),
                             });
                             let _ = tx.blocking_send(Ok(sse_data(&usage_chunk)));
                         }
@@ -978,40 +1020,53 @@ async fn oai_chat_completions(
                     }
                 }
             } else {
-                // No tools — stream tokens directly as before.
+                // No tools — stream tokens directly, splitting think-block
+                // reasoning into `delta.reasoning_content` as it arrives.
+                let mut splitter = ReasoningSplitter::new(forced_open);
+                let mut reasoning_pieces = 0u32;
+                let send_delta = |delta: serde_json::Value| -> bool {
+                    let chunk = serde_json::json!({
+                        "id": &completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": &req.model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": delta,
+                            "finish_reason": null,
+                        }]
+                    });
+                    tx.blocking_send(Ok(sse_data(&chunk))).is_ok()
+                };
+                let mut on_tok = |token: &str| -> bool {
+                    let (r, c) = splitter.push(token);
+                    let mut alive = true;
+                    if !r.is_empty() {
+                        reasoning_pieces += 1;
+                        alive &= send_delta(serde_json::json!({ "reasoning_content": r }));
+                    }
+                    if !c.is_empty() {
+                        alive &= send_delta(serde_json::json!({ "content": c }));
+                    }
+                    alive
+                };
                 #[cfg(feature = "vision")]
-                let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &tool_specs, &tool_choice, &params, &mut |token| {
-                    let chunk = serde_json::json!({
-                        "id": &completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": &req.model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": token},
-                            "finish_reason": null,
-                        }]
-                    });
-                    tx.blocking_send(Ok(sse_data(&chunk))).is_ok()
-                });
+                let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &tool_specs, &tool_choice, &params, &mut on_tok);
                 #[cfg(not(feature = "vision"))]
-                let result = mgr.generate_chat(&req.model, &messages, &tool_specs, &tool_choice, &params, None, |token| {
-                    let chunk = serde_json::json!({
-                        "id": &completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": &req.model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": token},
-                            "finish_reason": null,
-                        }]
-                    });
-                    tx.blocking_send(Ok(sse_data(&chunk))).is_ok()
-                });
+                let result = mgr.generate_chat(&req.model, &messages, &tool_specs, &tool_choice, &params, None, &mut on_tok);
 
                 match result {
                     Ok(ref stats) => {
+                        // Flush whatever the splitter still holds — a pending
+                        // partial tag, or a think block max_tokens cut short.
+                        let (r, c) = splitter.finish();
+                        if !r.is_empty() {
+                            reasoning_pieces += 1;
+                            let _ = send_delta(serde_json::json!({ "reasoning_content": r }));
+                        }
+                        if !c.is_empty() {
+                            let _ = send_delta(serde_json::json!({ "content": c }));
+                        }
                         let done_chunk = serde_json::json!({
                             "id": &completion_id,
                             "object": "chat.completion.chunk",
@@ -1020,7 +1075,7 @@ async fn oai_chat_completions(
                             "choices": [{
                                 "index": 0,
                                 "delta": {},
-                                "finish_reason": "stop",
+                                "finish_reason": oai_finish_reason(stats.completion_tokens, params.max_tokens),
                             }]
                         });
                         let _ = tx.blocking_send(Ok(sse_data(&done_chunk)));
@@ -1031,11 +1086,7 @@ async fn oai_chat_completions(
                                 "created": created,
                                 "model": &req.model,
                                 "choices": [],
-                                "usage": {
-                                    "prompt_tokens": stats.prompt_tokens,
-                                    "completion_tokens": stats.completion_tokens,
-                                    "total_tokens": stats.prompt_tokens + stats.completion_tokens,
-                                }
+                                "usage": oai_usage(stats, reasoning_pieces),
                             });
                             let _ = tx.blocking_send(Ok(sse_data(&usage_chunk)));
                         }
@@ -1055,6 +1106,7 @@ async fn oai_chat_completions(
         let result = tokio::task::spawn_blocking(move || {
             auto_load(&mgr, &store, &req.model)?;
 
+            let forced_open = mgr.reasoning_forced_open(&req.model);
             let messages = prepare_messages_with_tools(&req.messages, None);
 
             let params = GenerateParams {
@@ -1067,31 +1119,31 @@ async fn oai_chat_completions(
                 ..Default::default()
             };
 
-            let mut output = String::new();
+            let mut collector = ReasoningCollector::new(forced_open);
             #[cfg(feature = "vision")]
             let stats = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &tool_specs, &tool_choice, &params, &mut |token| {
-                output.push_str(token);
+                collector.push(token);
                 true
             })?;
             #[cfg(not(feature = "vision"))]
             let stats = mgr.generate_chat(&req.model, &messages, &tool_specs, &tool_choice, &params, None, |token| {
-                output.push_str(token);
+                collector.push(token);
                 true
             })?;
 
-            Ok::<_, anyhow::Error>((output, stats))
+            Ok::<_, anyhow::Error>((collector.finish(), stats, params.max_tokens))
         })
         .await;
 
         match result {
-            Ok(Ok((content, stats))) => {
+            Ok(Ok((split, stats, max_tokens))) => {
                 let completion_id = format!("chatcmpl-{:016x}", std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
                 let created = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
 
-                let (message, finish_reason) = if has_tools {
-                    let (tool_calls, remaining) = parse_tool_calls(&content);
+                let (mut message, finish_reason) = if has_tools {
+                    let (tool_calls, remaining) = parse_tool_calls(&split.content);
                     if !tool_calls.is_empty() {
                         let msg = if remaining.is_empty() {
                             serde_json::json!({"role": "assistant", "content": null, "tool_calls": tool_calls})
@@ -1101,11 +1153,16 @@ async fn oai_chat_completions(
                         (msg, "tool_calls")
                     } else {
                         // No call detected — return the parsed (call-free) content.
-                        (serde_json::json!({"role": "assistant", "content": remaining}), "stop")
+                        (serde_json::json!({"role": "assistant", "content": remaining}),
+                         oai_finish_reason(stats.completion_tokens, max_tokens))
                     }
                 } else {
-                    (serde_json::json!({"role": "assistant", "content": content}), "stop")
+                    (serde_json::json!({"role": "assistant", "content": split.content}),
+                     oai_finish_reason(stats.completion_tokens, max_tokens))
                 };
+                if let Some(r) = &split.reasoning {
+                    message["reasoning_content"] = serde_json::json!(r);
+                }
 
                 Json(serde_json::json!({
                     "id": completion_id,
@@ -1117,11 +1174,7 @@ async fn oai_chat_completions(
                         "message": message,
                         "finish_reason": finish_reason,
                     }],
-                    "usage": {
-                        "prompt_tokens": stats.prompt_tokens,
-                        "completion_tokens": stats.completion_tokens,
-                        "total_tokens": stats.prompt_tokens + stats.completion_tokens,
-                    }
+                    "usage": oai_usage(&stats, split.reasoning_pieces),
                 }))
                 .into_response()
             }
@@ -1575,7 +1628,50 @@ pub(crate) mod tests {
         }
     }
 
+    /// Backend whose model streams a fixed piece sequence and renders a fixed
+    /// chat-template string — drives the reasoning-split scenarios.
+    struct ScriptedBackend {
+        template: &'static str,
+        pieces: &'static [&'static str],
+    }
+    impl InferenceBackend for ScriptedBackend {
+        fn load_model(&self, _: &std::path::Path, _: BackendLoadParams) -> anyhow::Result<Box<dyn BackendModel>> {
+            Ok(Box::new(ScriptedModel { template: self.template, pieces: self.pieces }))
+        }
+        fn name(&self) -> &str { "llamacpp" }
+    }
+    struct ScriptedModel {
+        template: &'static str,
+        pieces: &'static [&'static str],
+    }
+    impl BackendModel for ScriptedModel {
+        fn generate(&self, _: &str, _params: &EngineParams, on_token: &mut dyn FnMut(&str) -> bool) -> anyhow::Result<GenerateResult> {
+            for tok in self.pieces {
+                if !on_token(tok) { break; }
+            }
+            Ok(GenerateResult {
+                prompt_tokens: 5,
+                completion_tokens: self.pieces.len() as u32,
+                cache_hit: false,
+            })
+        }
+        fn apply_chat_template(&self, _: &[(String, String)], _: &[crate::engine::tools::ToolSpec], _: &crate::engine::tools::ToolChoice) -> anyhow::Result<String> {
+            Ok(self.template.to_string())
+        }
+        fn n_ctx(&self) -> u32 { 2048 }
+        fn size_bytes(&self) -> u64 { 100 }
+        fn kv_bytes_per_token(&self) -> u64 { 1 }
+        fn as_any(&self) -> &dyn std::any::Any { self }
+    }
+
     pub(crate) fn setup_store_and_manager(dir: &std::path::Path) -> (Arc<ModelStore>, Arc<ModelManager>) {
+        setup_with_backend(dir, Box::new(FakeBackend))
+    }
+
+    fn setup_with_backend(
+        dir: &std::path::Path,
+        backend: Box<dyn InferenceBackend>,
+    ) -> (Arc<ModelStore>, Arc<ModelManager>) {
         let store = ModelStore::new(Some(dir.to_path_buf()));
         std::fs::create_dir_all(store.models_dir()).unwrap();
 
@@ -1604,7 +1700,7 @@ pub(crate) mod tests {
         });
         reg.save(&store.registry_path()).unwrap();
 
-        let mgr = ModelManager::with_backends(vec![Box::new(FakeBackend)], 0);
+        let mgr = ModelManager::with_backends(vec![backend], 0);
         (Arc::new(store), Arc::new(mgr))
     }
 
@@ -1664,6 +1760,128 @@ pub(crate) mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["object"], "chat.completion");
         assert!(json["choices"][0]["message"]["content"].as_str().unwrap().contains("Hello"));
+    }
+
+    async fn post_json(app: Router, uri: &str, body: serde_json::Value) -> (axum::http::StatusCode, String) {
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn oai_chat_splits_explicit_think_block_in_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_with_backend(dir.path(), Box::new(ScriptedBackend {
+            template: "prompt",
+            pieces: &["<think>", "why", "</think>", "\n\n", "hi"],
+        }));
+        let (status, text) = post_json(router(mgr, store), "/v1/chat/completions", serde_json::json!({
+            "model": "test-org/test-model",
+            "messages": [{"role": "user", "content": "q"}],
+            "stream": true,
+            "max_tokens": 10,
+            "stream_options": {"include_usage": true}
+        })).await;
+
+        assert_eq!(status, 200);
+        assert!(text.contains(r#""reasoning_content":"why""#), "{text}");
+        assert!(text.contains(r#""content":"hi""#), "{text}");
+        assert!(!text.contains("<think>"), "think tags must not leak: {text}");
+        assert!(text.contains(r#""finish_reason":"stop""#), "{text}");
+        assert!(text.contains(r#""reasoning_tokens":1"#), "{text}");
+    }
+
+    #[tokio::test]
+    async fn oai_chat_forced_open_template_splits_from_first_piece() {
+        // Qwen3-thinking style: the template leaves the block open, the stream
+        // carries only the closing tag. The load-time probe must catch it.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_with_backend(dir.path(), Box::new(ScriptedBackend {
+            template: "<|im_start|>assistant\n<think>\n",
+            pieces: &["I am reasoning.", "</think>", "\n42"],
+        }));
+        let (status, text) = post_json(router(mgr, store), "/v1/chat/completions", serde_json::json!({
+            "model": "test-org/test-model",
+            "messages": [{"role": "user", "content": "q"}],
+            "stream": true,
+            "max_tokens": 10
+        })).await;
+
+        assert_eq!(status, 200);
+        assert!(text.contains(r#""reasoning_content":"I am reasoning.""#), "{text}");
+        assert!(text.contains(r#""content":"42""#), "{text}");
+        assert!(!text.contains("</think>"), "close tag must not leak: {text}");
+    }
+
+    #[tokio::test]
+    async fn oai_chat_non_stream_returns_reasoning_content_and_usage_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_with_backend(dir.path(), Box::new(ScriptedBackend {
+            template: "prompt",
+            pieces: &["<think>", "why", "</think>", "\n\n", "hi"],
+        }));
+        let (status, text) = post_json(router(mgr, store), "/v1/chat/completions", serde_json::json!({
+            "model": "test-org/test-model",
+            "messages": [{"role": "user", "content": "q"}],
+            "stream": false,
+            "max_tokens": 10
+        })).await;
+
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let msg = &json["choices"][0]["message"];
+        assert_eq!(msg["reasoning_content"], "why");
+        assert_eq!(msg["content"], "hi");
+        assert_eq!(json["choices"][0]["finish_reason"], "stop");
+        assert_eq!(json["usage"]["completion_tokens_details"]["reasoning_tokens"], 1);
+    }
+
+    #[tokio::test]
+    async fn oai_chat_reports_length_when_budget_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_store_and_manager(dir.path());
+        // FakeModel reports completion_tokens = 2; cap the request at 2.
+        let (status, text) = post_json(router(mgr, store), "/v1/chat/completions", serde_json::json!({
+            "model": "test-org/test-model",
+            "messages": [{"role": "user", "content": "q"}],
+            "stream": false,
+            "max_tokens": 2
+        })).await;
+
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["choices"][0]["finish_reason"], "length");
+    }
+
+    #[tokio::test]
+    async fn oai_chat_exhausted_mid_think_is_reasoning_only_with_length() {
+        // Issue #75's failure mode: the whole budget went to the think block.
+        // The response must expose it as reasoning + "length", not as content.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mgr) = setup_with_backend(dir.path(), Box::new(ScriptedBackend {
+            template: "<|im_start|>assistant\n<think>\n",
+            pieces: &["thinking forever"],
+        }));
+        let (status, text) = post_json(router(mgr, store), "/v1/chat/completions", serde_json::json!({
+            "model": "test-org/test-model",
+            "messages": [{"role": "user", "content": "q"}],
+            "stream": false,
+            "max_tokens": 1
+        })).await;
+
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let msg = &json["choices"][0]["message"];
+        assert_eq!(msg["reasoning_content"], "thinking forever");
+        assert_eq!(msg["content"], "");
+        assert_eq!(json["choices"][0]["finish_reason"], "length");
     }
 
     #[cfg(not(feature = "vision"))]

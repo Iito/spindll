@@ -31,8 +31,6 @@ TS=$(date "+%Y-%m-%d %H:%M")
   echo "- mlx build + lib tests pass on $(uname -srm)"
   echo "- tag: mlx-validated"
 } >> docs/WORKLOG.md
+# WORKLOG.md is a local per-host file (untracked + excluded) — append only, never commit.
 
-git add docs/WORKLOG.md
-git commit -m "mlx-validate: $BRANCH green on Apple Silicon"
-
-echo "==> done. Push when ready (per AGENTS.md push policy)."
+echo "==> done. Worklog updated locally; nothing to push for the log itself."
