@@ -38,6 +38,20 @@ The headers in `include/mlx_bridge.h` define the exported surface. All entry poi
 
 The cache lives on the `ModelState` retained by `mlx_model_load` and is released by `mlx_model_free`.
 
+## VLM image budget
+
+Input images are pre-scaled before they reach the processor when they exceed
+**~1M pixels** (`kDefaultMaxPixels`, ≈1024×1024). Vision prefill cost scales
+linearly with patch count while decode speed is unaffected, and model
+preprocessor configs ship permissive budgets (`qwen3.5-9b-4bit` allows 16.8M px
+— about two minutes of prefill for a 12 MP photo); the cap turns that into ~5 s
+with no decode cost. The resize preserves aspect ratio, never upscales, and
+logs `[mlx-bridge] resized image from W×H to W'×H'` when it fires.
+
+`SPINDLL_VLM_MAX_PIXELS` overrides the budget per process; `0` (or negative)
+disables the cap entirely and defers to the model's own preprocessor config —
+use this when caption fidelity on fine detail matters more than TTFT.
+
 ## Token streaming
 
 Both generate paths use `NaiveStreamingDetokenizer` and:
