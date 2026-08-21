@@ -8,6 +8,14 @@ All notable changes to this project will be documented in this file.
 
 - **Anthropic Messages API** — `POST /v1/messages` implements the Anthropic dialect on the shared engine chat path: string/block content, `system`, tools via `input_schema` with `tool_use`/`tool_result` round-trip, `tool_choice` (`auto`/`any`/`tool`/`none`), `stop_sequences` (streamed output holds back partial matches so a stop string split across tokens never leaks), image blocks behind the `vision` feature, and the Messages SSE grammar (named events, no `[DONE]`). Point Claude Code at spindll with `ANTHROPIC_BASE_URL=http://localhost:8080`.
 - **OpenAI Responses API** — `POST /v1/responses` serves the stateless subset agent clients use with `store: false`: `input` as string or item array (`message`, `function_call`/`function_call_output`, `developer`→`system`), `instructions`, flat function tools, and the item-based SSE grammar with monotonic `sequence_number`s, terminating in `response.completed` / `response.incomplete` / `response.failed` per spec. Codex CLI works with its default `wire_api = "responses"`. `previous_response_id` is rejected with a clear 400; `input_image` parts are not mapped yet.
+- **`reasoning_content` on `/v1/chat/completions`** (#75) — thinking models' `<think>`-delimited reasoning no longer floods `message.content`: it is split into `message.reasoning_content` (non-streaming) / `delta.reasoning_content` (streaming), the mlx-vlm / DeepSeek response shape. Handles both explicit tags and templates that force the think block open (probed once per model at load). Tool calls are parsed from the visible answer only. When a block was split, `usage.completion_tokens_details.reasoning_tokens` reports the reasoning share.
+
+### Fixed
+
+- **`finish_reason` reports `"length"`** on `/v1/chat/completions` when generation exhausted `max_tokens` — previously always `"stop"`, which hid truncation (e.g. a reasoning pass consuming the whole budget) from clients. (#75)
+- **`spindll import <dir>` accepts sharded MLX models** — `config.json` plus any `*.safetensors` (e.g. `model-00001-of-00002.safetensors` + index) now qualifies; previously only a single-file `model.safetensors` did, even though sharded models served fine. (#75)
+- **`no backend available for mlx format` names the remedy** — the error now says to rebuild with `--features mlx` (or that the platform is unsupported) instead of leaving the fix to be guessed. (#75)
+- **Missing Metal Toolchain fails the MLX build fast** — `build.rs` probes `xcrun metal` before the multi-minute Swift build when `mlx.metallib` needs compiling, so the `xcodebuild -downloadComponent MetalToolchain` hint is the first thing the build says, not the last. (#75)
 
 ## [0.8.0] - 2026-08-11
 

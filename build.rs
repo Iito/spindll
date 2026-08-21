@@ -25,6 +25,10 @@ fn build_mlx_bridge() -> Result<(), Box<dyn std::error::Error>> {
 
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")?;
 
+    // Fail fast on a missing Metal Toolchain BEFORE the multi-minute Swift
+    // build, so the actionable hint is the first thing the build says.
+    preflight_metal_toolchain()?;
+
     // Build the Swift package as a release static library.
     let status = Command::new("swift")
         .args([
@@ -75,6 +79,52 @@ fn build_mlx_bridge() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Destination of the compiled Metal library, next to the Rust binary.
+/// OUT_DIR = target/{profile}/build/spindll-{hash}/out  →  ../../.. = target/{profile}/
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn metallib_dest_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let out_dir = std::env::var("OUT_DIR")?;
+    let bin_dir = std::path::Path::new(&out_dir)
+        .ancestors()
+        .nth(3)
+        .ok_or("cannot derive bin dir from OUT_DIR")?
+        .to_path_buf();
+    Ok(bin_dir.join("mlx.metallib"))
+}
+
+/// Issue #75 friction: when `mlx.metallib` will need compiling this build,
+/// verify the Metal Toolchain exists up front instead of surfacing the error
+/// after the long Swift build. A cached metallib skips the check entirely
+/// (matching `compile_mlx_metallib`'s skip); any other `xcrun` hiccup is left
+/// for the real compile step to report with full context.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn preflight_metal_toolchain() -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
+
+    if metallib_dest_path()?.exists() {
+        return Ok(());
+    }
+    let Ok(out) = Command::new("xcrun")
+        .args(["-sdk", "macosx", "metal", "--version"])
+        .output()
+    else {
+        return Ok(());
+    };
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() && stderr.contains("Metal Toolchain") {
+        return Err(
+            "Metal Toolchain not installed — the MLX build needs it to compile mlx.metallib.\n\
+             Run: xcodebuild -downloadComponent MetalToolchain\n\
+             Then rebuild with: cargo build --features cli,mlx".into()
+        );
+    }
+    if !out.status.success() {
+        // Only visible with `cargo build -vv`; the real compile step reports.
+        println!("preflight: xcrun metal failed for a non-toolchain reason: {stderr}");
+    }
+    Ok(())
+}
+
 /// Compile MLX's pre-generated Metal shaders into `mlx.metallib` and copy it
 /// next to the Rust binary so `load_colocated_library("mlx")` in device.cpp finds it.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -85,16 +135,8 @@ fn compile_mlx_metallib(manifest_dir: &str) -> Result<(), Box<dyn std::error::Er
     let metal_src = PathBuf::from(manifest_dir)
         .join("mlx_bridge/.build/checkouts/mlx-swift/Source/Cmlx/mlx-generated/metal");
 
-    // Derive the binary output directory from OUT_DIR:
-    // OUT_DIR = target/{profile}/build/spindll-{hash}/out  →  ../../.. = target/{profile}/
     let out_dir = std::env::var("OUT_DIR")?;
-    let bin_dir = Path::new(&out_dir)
-        .ancestors()
-        .nth(3)
-        .ok_or("cannot derive bin dir from OUT_DIR")?
-        .to_path_buf();
-
-    let metallib_dest = bin_dir.join("mlx.metallib");
+    let metallib_dest = metallib_dest_path()?;
     let metallib_out = Path::new(&out_dir).join("mlx.metallib");
 
     // Skip recompilation if the metallib is already in the binary dir.
