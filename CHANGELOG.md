@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.2] - 2026-08-21
+
+### Fixed
+
+- **`spindll rm` accepts the names `spindll list` prints** — multi-variant GGUF repos list as `<repo> (<quant>)` (e.g. `cjpais/llava-1.6-mistral-7b-gguf (q8_0)`), but deletion looked the raw string up as a registry key and failed with "not found". Name resolution now understands the display form, disambiguating variants by quant tag; the same resolution applies to `DELETE /models/{id}` over HTTP.
+- **`spindll rm` fully removes downloaded artifacts** — deletion previously left the store-materialized `mmproj` projector behind (vision models like LLaVA ship one), let emptied repo/org directories accumulate, and leaked dangling symlinks. All three are cleaned up; directory pruning stops at the first level still holding another variant. Externally-imported models keep their confirmation prompt and never lose source files.
+
 ## [0.9.1] - 2026-08-21
 
 ### Fixed
