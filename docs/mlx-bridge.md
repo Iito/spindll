@@ -61,6 +61,14 @@ The build steps are:
 
 1. `swift build --package-path mlx_bridge --configuration release --arch arm64`
    produces `mlx_bridge/.build/release/libMlxBridge.a`.
+   SwiftPM must be Swift 6.3+ (mlx-swift 0.31.5+ declares `swift-tools-version: 6.3`).
+   `build.rs` picks the toolchain in this order: an explicit `$TOOLCHAINS`; the
+   default `swift` when it is 6.3+; the newest swift.org toolchain found under
+   `~/Library/Developer/Toolchains` or `/Library/Developer/Toolchains`
+   (selected via `TOOLCHAINS` for the SwiftPM child process only). If none
+   qualifies it aborts with install hints. Xcode 26.4+ satisfies this natively;
+   Xcode ≤ 26.3 needs a [swift.org toolchain](https://www.swift.org/install/macos/)
+   alongside — the metallib step below stays on the `xcode-select`'d Xcode either way.
 2. `compile_mlx_metallib` walks `mlx_bridge/.build/checkouts/mlx-swift/Source/Cmlx/mlx-generated/metal/`, compiles every `.metal` file with `xcrun -sdk macosx metal`, and links the resulting `.air` files into `mlx.metallib` next to the spindll binary. MLX's `device.cpp` discovers the metallib via `load_colocated_library("mlx")`, so it must sit next to the binary.
 3. Cargo links the static archive plus `Foundation`, `Metal`, `Accelerate`, `MetalPerformanceShaders`, and adds rpaths for the Xcode Swift toolchain and `/usr/lib/swift` so `libswift_Concurrency.dylib` resolves at runtime.
 
