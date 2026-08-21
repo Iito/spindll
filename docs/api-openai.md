@@ -262,6 +262,83 @@ curl -X POST http://localhost:8080/v1/completions \
 | `top_p` | float | no | 0.95 |
 | `seed` | integer | no | 42 |
 
+## POST /v1/responses
+
+The [OpenAI Responses API](https://platform.openai.com/docs/api-reference/responses) — the stateless subset agent clients use with `store: false`. Codex CLI works with its default `wire_api = "responses"`; no provider override needed:
+
+```toml
+# ~/.codex/config.toml
+model = "llama3.1:8b"                 # a spindll model id (see /v1/models)
+model_provider = "spindll"
+
+[model_providers.spindll]
+name = "spindll"
+base_url = "http://localhost:8080/v1"
+```
+
+### Non-streaming
+
+```bash
+curl -X POST http://localhost:8080/v1/responses   -H "Content-Type: application/json"   -d '{
+    "model": "llama3.1:8b",
+    "instructions": "Be brief.",
+    "input": "hello",
+    "max_output_tokens": 256
+  }'
+```
+
+```json
+{
+  "id": "resp_0123456789abcdef",
+  "object": "response",
+  "status": "completed",
+  "model": "llama3.1:8b",
+  "output": [
+    {
+      "type": "message",
+      "id": "msg_...",
+      "status": "completed",
+      "role": "assistant",
+      "content": [{"type": "output_text", "text": "Hi! How can I help?", "annotations": []}]
+    }
+  ],
+  "usage": {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20}
+}
+```
+
+### Streaming
+
+Set `"stream": true`. Item-based events, each carrying a monotonic `sequence_number`, no `[DONE]` sentinel:
+
+```
+event: response.created
+event: response.in_progress
+event: response.output_item.added
+event: response.content_part.added
+event: response.output_text.delta        (one per token)
+event: response.output_text.done
+event: response.content_part.done
+event: response.output_item.done
+event: response.completed
+```
+
+The terminal event is `response.completed`, or `response.incomplete` when `max_output_tokens` was hit, or `response.failed` (with `response.error.code` / `message`) on error.
+
+### Scope
+
+| Accepted | Notes |
+|----------|-------|
+| `input` | String, or item array: `message` (typed or bare `{role, content}`), `function_call`, `function_call_output`; `developer` role maps to `system` |
+| `instructions` | Prepended as the system turn |
+| `tools` | Flat `{"type": "function", "name", ...}` definitions; hosted tool types (`web_search`, `local_shell`, …) are skipped |
+| `tool_choice` | `auto` / `none` / `required` / `{"type": "function", "name"}` |
+| `max_output_tokens`, `temperature`, `top_p`, `stream` | Passed through |
+| `store`, `reasoning`, `include`, `prompt_cache_key`, `text`, and other stateful/hosted fields | Accepted and ignored (nothing is persisted); replayed `reasoning` items are dropped |
+
+Function calls come back as `function_call` output items (arguments as one fragment via `response.function_call_arguments.delta`); send results back as `function_call_output` items keyed by `call_id`.
+
+**Rejected with a 400:** `previous_response_id` (spindll is stateless — Codex's `store: false` path never sends it) and `input_image` parts (not mapped yet).
+
 **Error format:**
 
 ```json

@@ -57,6 +57,8 @@ pub mod grpc;
 pub mod backend;
 #[cfg(feature = "http")]
 pub mod http;
+mod http_anthropic;
+mod http_responses;
 
 /// Auto-generated protobuf types for the spindll gRPC protocol.
 pub mod proto {

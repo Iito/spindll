@@ -26,9 +26,9 @@ use crate::model_store::registry::Registry;
 use crate::model_store::ModelStore;
 
 #[derive(Clone)]
-struct AppState {
-    manager: Arc<ModelManager>,
-    store: Arc<ModelStore>,
+pub(crate) struct AppState {
+    pub(crate) manager: Arc<ModelManager>,
+    pub(crate) store: Arc<ModelStore>,
 }
 
 /// Build the HTTP API router without binding to a port.
@@ -51,6 +51,9 @@ pub fn router(manager: Arc<ModelManager>, store: Arc<ModelStore>) -> Router {
         .route("/v1/completions", post(oai_completions))
         .route("/v1/embeddings", post(oai_embeddings))
         .route("/v1/status", get(oai_status))
+        // Anthropic Messages API + OpenAI Responses API (agent clients)
+        .route("/v1/messages", post(crate::http_anthropic::anthropic_messages))
+        .route("/v1/responses", post(crate::http_responses::responses_create))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -593,13 +596,13 @@ struct OaiImageUrl {
 
 /// MIME allow-list. Rejected before `MtmdBitmap::from_buffer` / MLX ImageIO.
 #[cfg(feature = "vision")]
-const ALLOWED_IMAGE_MEDIA: &[&str] = &[
+pub(crate) const ALLOWED_IMAGE_MEDIA: &[&str] = &[
     "image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp",
 ];
 
 /// Decode `data:...;base64,...` URI. Rejects > MAX_IMAGE_BYTES.
 #[cfg(feature = "vision")]
-fn decode_data_uri(uri: &str) -> anyhow::Result<(Vec<u8>, Option<String>)> {
+pub(crate) fn decode_data_uri(uri: &str) -> anyhow::Result<(Vec<u8>, Option<String>)> {
     use base64::Engine as _;
 
     let rest = uri.strip_prefix("data:")
@@ -1568,7 +1571,7 @@ fn oai_error(msg: &str) -> serde_json::Value {
 }
 
 /// Auto-load a model if not already in memory.
-fn auto_load(
+pub(crate) fn auto_load(
     mgr: &ModelManager,
     store: &ModelStore,
     model: &str,
@@ -1588,7 +1591,7 @@ fn auto_load(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::backend::{BackendLoadParams, BackendModel, EmbedResult, InferenceBackend};
     use crate::engine::streaming::{GenerateParams as EngineParams, GenerateResult};
@@ -1661,7 +1664,7 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any { self }
     }
 
-    fn setup_store_and_manager(dir: &std::path::Path) -> (Arc<ModelStore>, Arc<ModelManager>) {
+    pub(crate) fn setup_store_and_manager(dir: &std::path::Path) -> (Arc<ModelStore>, Arc<ModelManager>) {
         setup_with_backend(dir, Box::new(FakeBackend))
     }
 

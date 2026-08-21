@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Anthropic Messages API** — `POST /v1/messages` implements the Anthropic dialect on the shared engine chat path: string/block content, `system`, tools via `input_schema` with `tool_use`/`tool_result` round-trip, `tool_choice` (`auto`/`any`/`tool`/`none`), `stop_sequences` (streamed output holds back partial matches so a stop string split across tokens never leaks), image blocks behind the `vision` feature, and the Messages SSE grammar (named events, no `[DONE]`). Point Claude Code at spindll with `ANTHROPIC_BASE_URL=http://localhost:8080`.
+- **OpenAI Responses API** — `POST /v1/responses` serves the stateless subset agent clients use with `store: false`: `input` as string or item array (`message`, `function_call`/`function_call_output`, `developer`→`system`), `instructions`, flat function tools, and the item-based SSE grammar with monotonic `sequence_number`s, terminating in `response.completed` / `response.incomplete` / `response.failed` per spec. Codex CLI works with its default `wire_api = "responses"`. `previous_response_id` is rejected with a clear 400; `input_image` parts are not mapped yet.
 - **`reasoning_content` on `/v1/chat/completions`** (#75) — thinking models' `<think>`-delimited reasoning no longer floods `message.content`: it is split into `message.reasoning_content` (non-streaming) / `delta.reasoning_content` (streaming), the mlx-vlm / DeepSeek response shape. Handles both explicit tags and templates that force the think block open (probed once per model at load). Tool calls are parsed from the visible answer only. When a block was split, `usage.completion_tokens_details.reasoning_tokens` reports the reasoning share.
 
 ### Fixed

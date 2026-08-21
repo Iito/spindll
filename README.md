@@ -29,6 +29,7 @@ Models are loaded automatically on first request, or explicitly via the `Load` R
 - **Smart quant default** -- `pull` without `--quant` picks q4_k_m by priority list (q4_k_m > q5_k_m > q4_0 > … > fp16) instead of grabbing the first GGUF in the repo
 - **Streaming inference** -- token-by-token output over gRPC, HTTP/SSE, or OpenAI-compatible API
 - **OpenAI-compatible API** -- `/v1/chat/completions`, `/v1/completions`, and tool/function calling for AnythingLLM, Open WebUI, and any OpenAI client
+- **Agent-client APIs** -- Anthropic Messages (`/v1/messages`) and OpenAI Responses (`/v1/responses`), so Claude Code and Codex CLI run against spindll as a local backend
 - **Multi-model** -- multiple models loaded concurrently, LRU eviction when budget exceeded
 - **Continuous batching** -- concurrent requests to the same model share a single context via sequence IDs
 - **KV cache** -- disk-backed prefix caching with optional ChaCha20-Poly1305 encryption at rest
@@ -117,6 +118,7 @@ Quick summary of available interfaces:
 | gRPC | 50051 | none (always on) | Programmatic access, mesh integrations |
 | HTTP/SSE | 8080 | `http` | Web frontends, custom integrations |
 | OpenAI `/v1` | 8080 | `http` | AnythingLLM, Open WebUI, any OpenAI client (chat, completions, tool calling) |
+| Agent APIs | 8080 | `http` | Claude Code (`/v1/messages`), Codex CLI (`/v1/responses`) |
 
 ## Using as a Rust library
 
