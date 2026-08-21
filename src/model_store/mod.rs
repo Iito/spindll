@@ -336,6 +336,21 @@ impl ModelStore {
             return Ok(model.to_string());
         }
 
+        // 1b. Display-name form: `<repo> (<quant>)` as printed by `spindll list`
+        //     for repos holding multiple GGUF variants — match on repo prefix,
+        //     disambiguated by each entry's quant tag.
+        if let Some((base, rest)) = model.rsplit_once(" (")
+            && let Some(quant) = rest.strip_suffix(')') {
+                let prefix = format!("{base}/");
+                if let Some(key) = reg.models.iter().find_map(|(k, e)| {
+                    (k.starts_with(&prefix)
+                        && download::extract_quant(&e.filename) == Some(quant))
+                        .then(|| k.clone())
+                }) {
+                    return Ok(key);
+                }
+            }
+
         // 2. Ollama name:tag  →  ollama/name/tag.gguf
         if let Some((name, tag)) = model.split_once(':') {
             let key = format!("ollama/{name}/{tag}.gguf");
@@ -738,9 +753,13 @@ impl ModelStore {
     /// - OllamaImported / HfImported / ManuallyImported: prompt for confirmation (external ownership)
     /// - With purge=true: skip prompts, delete symlinks only for external sources
     pub fn remove(&self, model: &str, purge: bool) -> anyhow::Result<()> {
+        // Accept every name form `resolve_key` understands — including the
+        // `<repo> (<quant>)` display form `spindll list` prints, which users
+        // paste straight back into `spindll rm`.
+        let key = self.resolve_key(model)?;
         let mut reg = registry::Registry::load(&self.registry_path())?;
-        let entry = reg.models.remove(model)
-            .ok_or_else(|| anyhow::anyhow!("model '{}' not found", model))?;
+        let entry = reg.models.remove(&key)
+            .ok_or_else(|| anyhow::anyhow!("model '{}' not found", key))?;
 
         let should_delete = match &entry.source {
             registry::ModelSource::OllamaSourceDownloaded
@@ -753,7 +772,7 @@ impl ModelStore {
                 } else {
                     eprintln!(
                         "warning: '{}' is managed externally ({:?})",
-                        model, entry.source
+                        key, entry.source
                     );
                     eprint!("delete symlink? (y/N) ");
                     use std::io::Write;
@@ -768,23 +787,46 @@ impl ModelStore {
         };
 
         if should_delete {
-            if entry.path.exists() {
+            // symlink_metadata: a dangling symlink reports !exists() but still
+            // occupies the path — remove it rather than leak it.
+            if entry.path.symlink_metadata().is_ok() {
                 // MLX = dir, GGUF = file.
                 match entry.format {
                     registry::ModelFormat::Mlx => std::fs::remove_dir_all(&entry.path)?,
                     registry::ModelFormat::Gguf => std::fs::remove_file(&entry.path)?,
                 }
             }
+            // A projector materialized into the store belongs to this model;
+            // one living outside (imported in place) is not ours to delete.
+            if let Some(mmproj) = &entry.mmproj_path
+                && mmproj.starts_with(self.models_dir())
+                && mmproj.symlink_metadata().is_ok()
+            {
+                std::fs::remove_file(mmproj)?;
+            }
+            // Prune directories the deletion emptied (repo dir, then org dir).
+            // remove_dir refuses non-empty dirs, so this stops at the first
+            // level still holding other variants or an unrelated model.
+            let mut dir = entry.path.parent();
+            while let Some(d) = dir {
+                if d == self.models_dir() || !d.starts_with(self.models_dir()) {
+                    break;
+                }
+                if std::fs::remove_dir(d).is_err() {
+                    break;
+                }
+                dir = d.parent();
+            }
         } else {
             // User said no, put the entry back in the registry
-            reg.models.insert(model.to_string(), entry);
+            reg.models.insert(key.clone(), entry);
         }
 
         reg.save(&self.registry_path())?;
         if should_delete {
-            println!("deleted {}", model);
+            println!("deleted {}", key);
         } else {
-            println!("kept {}", model);
+            println!("kept {}", key);
         }
         Ok(())
     }
@@ -1140,6 +1182,93 @@ mod tests {
         assert!(!model_dir.exists(), "MLX dir should be deleted");
         let reg = Registry::load(&store.registry_path()).unwrap();
         assert!(!reg.models.contains_key("mlx-community/test-4bit"));
+    }
+
+    #[test]
+    fn resolve_key_accepts_list_display_name_with_quant() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(store.models_dir()).unwrap();
+        write_entry(
+            &store.registry_path(),
+            "cjpais/llava-1.6-mistral-7b-gguf/llava-q8_0.gguf",
+            gguf_entry("cjpais/llava-1.6-mistral-7b-gguf", "llava-q8_0.gguf"),
+        );
+        write_entry(
+            &store.registry_path(),
+            "cjpais/llava-1.6-mistral-7b-gguf/llava-q4_k_m.gguf",
+            gguf_entry("cjpais/llava-1.6-mistral-7b-gguf", "llava-q4_k_m.gguf"),
+        );
+
+        let q8 = store.resolve_key("cjpais/llava-1.6-mistral-7b-gguf (q8_0)").unwrap();
+        assert_eq!(q8, "cjpais/llava-1.6-mistral-7b-gguf/llava-q8_0.gguf");
+        let q4 = store.resolve_key("cjpais/llava-1.6-mistral-7b-gguf (q4_k_m)").unwrap();
+        assert_eq!(q4, "cjpais/llava-1.6-mistral-7b-gguf/llava-q4_k_m.gguf");
+    }
+
+    /// Regression: `spindll rm` on the name `spindll list` prints (quant
+    /// suffix included) must resolve, delete the artifact AND its
+    /// store-materialized mmproj, and prune the emptied repo/org dirs.
+    #[test]
+    fn remove_display_name_deletes_artifact_mmproj_and_empty_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(store.models_dir()).unwrap();
+
+        let repo_dir = store.models_dir().join("cjpais/llava-1.6-mistral-7b-gguf");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let model_file = repo_dir.join("llava-q8_0.gguf");
+        let mmproj_file = repo_dir.join("mmproj-model-f16.gguf");
+        std::fs::write(&model_file, b"fake-gguf").unwrap();
+        std::fs::write(&mmproj_file, b"fake-mmproj").unwrap();
+
+        let mut entry = gguf_entry("cjpais/llava-1.6-mistral-7b-gguf", "llava-q8_0.gguf");
+        entry.path = model_file.clone();
+        entry.mmproj_path = Some(mmproj_file.clone());
+        write_entry(
+            &store.registry_path(),
+            "cjpais/llava-1.6-mistral-7b-gguf/llava-q8_0.gguf",
+            entry,
+        );
+
+        store.remove("cjpais/llava-1.6-mistral-7b-gguf (q8_0)", false)
+            .expect("display-name remove should succeed");
+
+        assert!(!model_file.exists(), "artifact should be deleted");
+        assert!(!mmproj_file.exists(), "store-materialized mmproj should be deleted");
+        assert!(!repo_dir.exists(), "emptied repo dir should be pruned");
+        assert!(!store.models_dir().join("cjpais").exists(), "emptied org dir should be pruned");
+        assert!(store.models_dir().exists(), "models root must survive");
+        let reg = Registry::load(&store.registry_path()).unwrap();
+        assert!(reg.models.is_empty());
+    }
+
+    /// A second variant in the same repo keeps the shared dirs alive.
+    #[test]
+    fn remove_keeps_repo_dir_holding_other_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(store.models_dir()).unwrap();
+
+        let repo_dir = store.models_dir().join("TheBloke/Llama-GGUF");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let q8 = repo_dir.join("llama-q8_0.gguf");
+        let q4 = repo_dir.join("llama-q4_k_m.gguf");
+        std::fs::write(&q8, b"a").unwrap();
+        std::fs::write(&q4, b"b").unwrap();
+
+        let mut e8 = gguf_entry("TheBloke/Llama-GGUF", "llama-q8_0.gguf");
+        e8.path = q8.clone();
+        let mut e4 = gguf_entry("TheBloke/Llama-GGUF", "llama-q4_k_m.gguf");
+        e4.path = q4.clone();
+        write_entry(&store.registry_path(), "TheBloke/Llama-GGUF/llama-q8_0.gguf", e8);
+        write_entry(&store.registry_path(), "TheBloke/Llama-GGUF/llama-q4_k_m.gguf", e4);
+
+        store.remove("TheBloke/Llama-GGUF (q8_0)", false).unwrap();
+
+        assert!(!q8.exists());
+        assert!(q4.exists(), "sibling variant must survive");
+        assert!(repo_dir.exists(), "repo dir still holding a variant must survive");
     }
 
     #[test]
