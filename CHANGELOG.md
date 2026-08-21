@@ -17,6 +17,15 @@ All notable changes to this project will be documented in this file.
 - **`no backend available for mlx format` names the remedy** — the error now says to rebuild with `--features mlx` (or that the platform is unsupported) instead of leaving the fix to be guessed. (#75)
 - **Missing Metal Toolchain fails the MLX build fast** — `build.rs` probes `xcrun metal` before the multi-minute Swift build when `mlx.metallib` needs compiling, so the `xcodebuild -downloadComponent MetalToolchain` hint is the first thing the build says, not the last. (#75)
 
+### Changed
+
+- **VLM input images are pre-scaled to ~1M pixels by default** — vision prefill scales linearly with patch count while decode speed is unaffected, and models ship permissive budgets (`qwen3.5-9b-4bit` allows 16.8M px — ≈2 minutes of prefill for an uncapped 12 MP photo, vs ~5 s capped). `SPINDLL_VLM_MAX_PIXELS` overrides the budget; `0` disables the cap. Same-box control vs mlx-vlm 0.6.14 on identical weights: decode parity, faster prefill at every image size. (#75, #79)
+- **mlx-swift-lm bumped to main@7871b09 (2026-08-17)** — picks up upstream's Qwen3.5 prefill rework, recovering VLM decode throughput (issue #75's repro: 8 → ~39 tok/s). The MLX bridge now requires a **Swift 6.3+ toolchain**: `build.rs` selects one automatically (honors `$TOOLCHAINS`, falls back to an installed swift.org toolchain) while metallib compilation stays on the xcode-select'd toolchain. (#76)
+
+### Infrastructure
+
+- **macOS CI runs on macos-26 / Xcode 26.6** — the MLX job moved runners to satisfy the Swift 6.3 floor; actionlint taught the new runner label. (#76)
+
 ## [0.8.0] - 2026-08-11
 
 ### Added
