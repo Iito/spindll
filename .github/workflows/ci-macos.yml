@@ -24,6 +24,7 @@ on:
       - "src/**"
       - "proto/**"
       - "build.rs"
+      - ".cargo/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "mlx_bridge/**"
