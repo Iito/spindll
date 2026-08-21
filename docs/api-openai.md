@@ -163,6 +163,38 @@ Send tool results back as a `tool` role message:
 - Emission is **prompt-injection only** — llama.cpp's OpenAI-compatible chat-template + GBNF-grammar helper was removed in llama-cpp-2 0.1.150, so there is no model-native grammar constraint today.
 - Streaming with tools: output is buffered to parse the calls, then emitted as OpenAI-style **incremental** `tool_calls` deltas (per-call `index`, then `id`/`name`, then `arguments`).
 
+### Reasoning models (`reasoning_content`)
+
+Thinking models (Qwen3 / Qwen3.5, DeepSeek-R1, …) emit a reasoning pass delimited by `<think>` / `</think>` before the visible answer. spindll splits it out automatically — no request option needed — following the response shape mlx-vlm and the DeepSeek API use:
+
+- **Non-streaming:** the reasoning arrives in `message.reasoning_content`; `message.content` holds only the answer.
+- **Streaming:** reasoning arrives as `delta.reasoning_content` chunks, the answer as `delta.content` chunks.
+- **Tools:** tool calls are parsed from the answer only, so a call the model merely *plans* inside its think block is not mistaken for one it made.
+
+```json
+{
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "reasoning_content": "The user wants a title. The sign reads…",
+      "content": "{\"title\": \"Winter Evening Sake Shop\"}"
+    },
+    "finish_reason": "stop"
+  }],
+  "usage": {
+    "prompt_tokens": 137,
+    "completion_tokens": 214,
+    "total_tokens": 351,
+    "completion_tokens_details": {"reasoning_tokens": 96}
+  }
+}
+```
+
+Both delimiter conventions are handled: models that emit `<think>` themselves, and chat templates that force the block open (the generation prompt ends with `<think>`, so the stream starts mid-reasoning — detected once per model at load). A single leading think block is recognized; delimiters appearing after visible content stream through as ordinary text.
+
+**Truncation is detectable.** `finish_reason` is `"length"` when generation exhausted `max_tokens` (previously always `"stop"`). If the reasoning consumed the whole budget, `content` is empty (or absent from deltas), the partial reasoning is still returned in `reasoning_content`, and `usage.completion_tokens_details.reasoning_tokens` shows where the budget went. `reasoning_tokens` is a stream-piece approximation of the token count.
+
 ## POST /v1/completions
 
 Raw text completion (no chat template applied). Use this for code completion, text continuation, and other non-chat tasks.
