@@ -46,8 +46,31 @@ enum Commands {
         purge: bool,
     },
 
+    /// Load a model into memory on the running server
+    Load {
+        /// Model name (any form `spindll list` prints)
+        model: String,
+
+        /// HTTP port of the running server (default: from the server lockfile, else 8080)
+        #[arg(long)]
+        http_port: Option<u16>,
+    },
+
+    /// Unload a model from memory on the running server (keeps it on disk)
+    Unload {
+        /// Model name (any form `spindll list` prints)
+        model: String,
+
+        /// HTTP port of the running server (default: from the server lockfile, else 8080)
+        #[arg(long)]
+        http_port: Option<u16>,
+    },
+
     /// Start the gRPC server (models loaded dynamically via Load RPC)
     Serve {
+        /// Model to load immediately after the server starts (optional)
+        model: Option<String>,
+
         /// Port to listen on
         #[arg(long, default_value = "50051")]
         port: u16,
@@ -203,6 +226,46 @@ enum Commands {
 }
 
 /// Parse a human-readable size like "2G", "512M" into bytes. Defaults to 2GB.
+/// HTTP port for client commands: explicit flag > running server's lockfile
+/// (0 there means the server runs without HTTP) > default 8080.
+fn server_http_port(flag: Option<u16>) -> anyhow::Result<u16> {
+    if let Some(p) = flag {
+        return Ok(p);
+    }
+    match spindll::lockfile::Lockfile::read() {
+        Some(lock) if lock.http_port == 0 => anyhow::bail!(
+            "the running spindll server (pid {}) has no HTTP port — restart it without --http-port 0",
+            lock.pid
+        ),
+        Some(lock) => Ok(lock.http_port),
+        None => Ok(8080),
+    }
+}
+
+fn server_unreachable(port: u16, e: reqwest::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "no spindll server reachable on 127.0.0.1:{port} — start one with `spindll serve` ({e})"
+    )
+}
+
+/// Load a model into the given manager the same way the HTTP /load path does
+/// (digest + auto-discovered mmproj, manager defaults for everything else).
+fn preload_model(
+    mgr: &spindll::engine::ModelManager,
+    store: &spindll::model_store::ModelStore,
+    model: &str,
+) -> anyhow::Result<()> {
+    let path = store.resolve_model_path(model)?;
+    let digest = store.resolve_model_digest(model).unwrap_or_default();
+    mgr.load_model_with_options(model, &path, spindll::engine::LoadOptions {
+        digest,
+        #[cfg(feature = "vision")]
+        mmproj_path: store.resolve_mmproj_path(model).unwrap_or(None),
+        ..Default::default()
+    })?;
+    Ok(())
+}
+
 fn parse_size_bytes(s: Option<&str>) -> u64 {
     const DEFAULT: u64 = 2 * 1_073_741_824; // 2 GB
     let s = match s {
@@ -446,7 +509,46 @@ async fn main() -> anyhow::Result<()> {
             let store = spindll::model_store::ModelStore::new(None);
             store.remove(&model, purge)?;
         }
+        Commands::Load { model, http_port } => {
+            let port = server_http_port(http_port)?;
+            let client = reqwest::Client::new();
+            let resp = client
+                .post(format!("http://127.0.0.1:{port}/load"))
+                .json(&serde_json::json!({ "model": model }))
+                .send()
+                .await
+                .map_err(|e| server_unreachable(port, e))?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            if !status.is_success() {
+                anyhow::bail!("load failed: {}", body["error"].as_str().unwrap_or("unknown error"));
+            }
+            if body["already_loaded"].as_bool() == Some(true) {
+                println!("{model} already loaded");
+            } else {
+                println!("loaded {model}");
+            }
+        }
+        Commands::Unload { model, http_port } => {
+            let port = server_http_port(http_port)?;
+            let client = reqwest::Client::new();
+            let resp = client
+                .post(format!(
+                    "http://127.0.0.1:{port}/models/{}/unload",
+                    urlencoding::encode(&model)
+                ))
+                .send()
+                .await
+                .map_err(|e| server_unreachable(port, e))?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            if !status.is_success() {
+                anyhow::bail!("unload failed: {}", body["error"].as_str().unwrap_or("unknown error"));
+            }
+            println!("unloaded {model}");
+        }
         Commands::Serve {
+            model,
             port,
             ctx_size,
             gpu_layers,
@@ -535,6 +637,20 @@ async fn main() -> anyhow::Result<()> {
             }
             #[cfg(not(feature = "http"))]
             let _ = http_port;
+
+            // Preload the requested model in the background so the ports come
+            // up immediately; requests for it queue behind the same load lock.
+            if let Some(name) = model {
+                let mgr = manager.clone();
+                let st = store.clone();
+                tokio::task::spawn_blocking(move || {
+                    println!("preloading {name} \u{2026}");
+                    match preload_model(&mgr, &st, &name) {
+                        Ok(()) => println!("model ready: {name}"),
+                        Err(e) => eprintln!("preload of {name} failed: {e}"),
+                    }
+                });
+            }
 
             let effective_http_port = if cfg!(feature = "http") { http_port } else { 0 };
             spindll::lockfile::Lockfile::write(port, effective_http_port)?;
