@@ -4,7 +4,7 @@ Single source of truth for both **Claude Code** and **Codex CLI** running agains
 
 ## What this project is
 
-Spindll = Rust-native LLM inference engine. GGUF (via llama.cpp) + MLX (via Swift FFI on Apple Silicon). Single binary that pulls models from Ollama / HuggingFace and serves streaming inference over gRPC + HTTP/SSE + OpenAI-compatible `/v1`.
+Spindll = Rust-native LLM inference engine. GGUF (via llama.cpp) + MLX (via Swift FFI on Apple Silicon). Single binary that pulls models from Ollama / HuggingFace and serves streaming inference over gRPC + HTTP/SSE + OpenAI-compatible `/v1`, plus agent-client dialects: Anthropic Messages (`/v1/messages`) and OpenAI Responses (`/v1/responses`, stateless subset).
 
 Edition 2024. Active branch: usually `next` for in-flight work, `main` is stable. PRs land via review.
 
