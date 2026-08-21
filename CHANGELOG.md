@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.1] - 2026-08-21
+
+### Fixed
+
+- **macOS release artifact: the MLX Metal library loads on macOS 15 again** — `build.rs` now pins `-mmacosx-version-min=15.0` (the `mlx_bridge` platform floor) when compiling `mlx.metallib`. Built on the macos-26 runner it previously defaulted to Metal language 4.0, which macOS 15's loader rejects, so every MLX operation failed with "This library is using language version 4.0 which is not supported on this OS". GGUF was unaffected. v0.9.0's macOS artifact carries the defect; local builds on macOS 15 never did.
+
 ## [0.9.0] - 2026-08-21
 
 ### Added
