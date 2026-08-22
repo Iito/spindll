@@ -29,6 +29,19 @@ const FULL_PRECISION: &[&str] = &["fp16", "bf16", "f32"];
 ///   "qwen2.5-3b-instruct-q4_k_m.gguf" -> Some("q4_k_m")
 ///   "qwen2.5-3b-instruct-fp16-00001-of-00002.gguf" -> Some("fp16")
 ///   "model.gguf" -> None
+/// Repo files worth mirroring for an MLX model: weights, configs/tokenizers,
+/// and the standalone `chat_template.jinja` newer repos ship — the template
+/// used to live inside tokenizer_config.json, and without the file the MLX
+/// bridge falls back to generic ChatML, which breaks VLM image-token
+/// insertion (#82).
+fn is_mlx_repo_file(name: &str) -> bool {
+    name.ends_with(".safetensors")
+        || name.ends_with(".json")
+        || name.ends_with(".txt")
+        || name.ends_with(".model")
+        || name.ends_with(".jinja")
+}
+
 pub(crate) fn extract_quant(filename: &str) -> Option<&'static str> {
     let lower = filename.to_lowercase();
     QUANT_PRIORITY.iter().chain(FULL_PRECISION.iter()).find(|&q| lower.contains(q)).map(|v| v as _)
@@ -212,13 +225,7 @@ pub fn download_hf_auto(
     let mlx_files: Vec<_> = info
         .siblings
         .iter()
-        .filter(|s| {
-            let f = &s.rfilename;
-            f.ends_with(".safetensors")
-                || f.ends_with(".json")
-                || f.ends_with(".txt")
-                || f.ends_with(".model")
-        })
+        .filter(|s| is_mlx_repo_file(&s.rfilename))
         .collect();
 
     let has_safetensors = mlx_files.iter().any(|s| s.rfilename.ends_with(".safetensors"));
@@ -397,6 +404,16 @@ mod tests {
         let files = ["model-fp16-2.gguf", "model-fp16-1.gguf"];
         let picked = files.iter().min_by_key(|f| rank_quant(f)).unwrap();
         assert_eq!(*picked, "model-fp16-2.gguf");
+    }
+
+    #[test]
+    fn mlx_repo_file_filter_includes_chat_template_jinja() {
+        assert!(is_mlx_repo_file("chat_template.jinja"));
+        assert!(is_mlx_repo_file("model-00001-of-00002.safetensors"));
+        assert!(is_mlx_repo_file("tokenizer_config.json"));
+        assert!(is_mlx_repo_file("merges.txt"));
+        assert!(!is_mlx_repo_file("README.md"));
+        assert!(!is_mlx_repo_file("model.gguf"));
     }
 
     #[test]
