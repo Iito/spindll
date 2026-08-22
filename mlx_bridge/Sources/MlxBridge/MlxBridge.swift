@@ -377,11 +377,39 @@ private final class ModelState: @unchecked Sendable {
     let promptCache: PromptCache
     /// True when the model was loaded via VLMModelFactory (supports images).
     let isVLM: Bool
-    init(_ container: ModelContainer, modelDigest: String, isVLM: Bool = false) {
+    /// False when the tokenizer cannot render its own chat template — text
+    /// requests then fall back to ChatML and vision requests are rejected.
+    let hasChatTemplate: Bool
+    init(_ container: ModelContainer, modelDigest: String, isVLM: Bool = false,
+         hasChatTemplate: Bool = true) {
         self.container = container
         self.promptCache = PromptCache(modelDigest: modelDigest)
         self.isVLM = isVLM
+        self.hasChatTemplate = hasChatTemplate
     }
+}
+
+/// True when the tokenizer renders its own chat template. Any render failure
+/// counts as "no template" — generation would take the ChatML fallback either
+/// way.
+private func probeChatTemplate(_ container: ModelContainer) async -> Bool {
+    (try? await container.perform(nonSendable: ()) { context, _ in
+        _ = try context.tokenizer.applyChatTemplate(
+            messages: [["role": "user", "content": "probe"]], tools: nil)
+    }) != nil
+}
+
+/// One loud, load-time warning when a model ships no usable chat template —
+/// per #82 the silent per-request fallback hid image-blind VLM generations.
+private func warnMissingChatTemplate(modelPath: String, isVLM: Bool) {
+    fputs("[mlx-bridge] WARNING: no chat template in \(modelPath)\n", stderr)
+    if isVLM {
+        fputs("[mlx-bridge]   This model is multimodal: image requests will be REJECTED, because\n", stderr)
+        fputs("[mlx-bridge]   the template is what inserts the image tokens vision needs.\n", stderr)
+    }
+    fputs("[mlx-bridge]   Text requests fall back to generic ChatML (wrong special tokens for\n", stderr)
+    fputs("[mlx-bridge]   most models). Newer HF repos ship the template as chat_template.jinja —\n", stderr)
+    fputs("[mlx-bridge]   re-pull the model to fetch it.\n", stderr)
 }
 
 // ---------------------------------------------------------------------------
@@ -419,7 +447,10 @@ public func mlxModelLoad(_ path: UnsafePointer<CChar>?) -> UnsafeMutableRawPoint
                 from: url,
                 using: #huggingFaceTokenizerLoader()
             )
-            box.value = ModelState(container, modelDigest: modelDigest, isVLM: true)
+            let hasTemplate = await probeChatTemplate(container)
+            if !hasTemplate { warnMissingChatTemplate(modelPath: modelPath, isVLM: true) }
+            box.value = ModelState(container, modelDigest: modelDigest, isVLM: true,
+                                   hasChatTemplate: hasTemplate)
         } catch {
             // Fall back to LLM for text-only architectures.
             do {
@@ -427,7 +458,10 @@ public func mlxModelLoad(_ path: UnsafePointer<CChar>?) -> UnsafeMutableRawPoint
                     from: url,
                     using: #huggingFaceTokenizerLoader()
                 )
-                box.value = ModelState(container, modelDigest: modelDigest, isVLM: false)
+                let hasTemplate = await probeChatTemplate(container)
+                if !hasTemplate { warnMissingChatTemplate(modelPath: modelPath, isVLM: false) }
+                box.value = ModelState(container, modelDigest: modelDigest, isVLM: false,
+                                       hasChatTemplate: hasTemplate)
             } catch {
                 // box.value stays nil; Rust side receives NULL
             }
@@ -608,7 +642,8 @@ private func applyChatTemplateWithFallback(
     do {
         return try tokenizer.applyChatTemplate(messages: messages, tools: tools)
     } catch is MLXLMCommon.TokenizerError {
-        fputs("[mlx-bridge] model has no chat template, using ChatML fallback\n", stderr)
+        fputs("[mlx-bridge] model has no chat template, using ChatML fallback " +
+              "(re-pull to fetch chat_template.jinja if the repo ships one)\n", stderr)
         var chatML = ""
         for msg in messages {
             if let role = msg["role"], let content = msg["content"] {
@@ -956,6 +991,14 @@ public func mlxChatGenerateVision(
 ) -> Int32 {
     guard let handle, let messagesJson else { return -1 }
     let state = Unmanaged<ModelState>.fromOpaque(handle).takeUnretainedValue()
+    // Without the model's real template the image tokens vision conditioning
+    // needs are never inserted — a ChatML-formatted request would generate
+    // image-blind. Fail fast instead (#82).
+    guard state.hasChatTemplate else {
+        fputs("[mlx-bridge] vision request rejected: model has no chat template " +
+              "(re-pull to fetch chat_template.jinja)\n", stderr)
+        return -1
+    }
     let json = String(cString: messagesJson)
 
     guard
