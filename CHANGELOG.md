@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.3] - 2026-08-22
+
+### Fixed
+
+- **`spindll pull` mirrors `chat_template.jinja`** — newer HuggingFace repos ship the chat template as a standalone Jinja file instead of a `tokenizer_config.json` field; the MLX download filter skipped it, so affected models silently lost their template. Models pulled before this fix need a re-pull to pick the file up.
+- **Missing chat templates are loud, and vision fails fast** — the MLX bridge now probes the tokenizer's template once at load. A template-less model prints a prominent warning with the re-pull remedy; text requests keep the generic ChatML fallback (now with a hint); image requests are rejected with a clear error instead of silently generating image-blind — the template is what inserts the image tokens vision conditioning needs.
+
 ## [0.9.2] - 2026-08-21
 
 ### Fixed
