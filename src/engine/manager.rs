@@ -559,6 +559,21 @@ impl ModelManager {
         Ok(())
     }
 
+    /// Unload a model given both its canonical registry key and the name the
+    /// caller typed.
+    ///
+    /// Explicit loads register under the canonical key, but a model auto-loaded
+    /// by an inference request is keyed on whatever name that request used —
+    /// so unloading has to try both before reporting "not loaded". The
+    /// canonical key wins when both are resident; the error reported is always
+    /// the canonical one, since that is the name the user is told about.
+    pub fn unload_model_or_alias(&self, key: &str, alias: &str) -> anyhow::Result<()> {
+        match self.unload_model(key) {
+            Err(e) if key != alias => self.unload_model(alias).map_err(|_| e),
+            other => other,
+        }
+    }
+
     /// Returns `true` if a model with the given name is currently loaded.
     pub fn is_loaded(&self, name: &str) -> bool {
         self.models.read().unwrap().contains_key(name)
@@ -1489,6 +1504,40 @@ mod tests {
         assert!(models.contains_key("norm"));
         assert!(models.contains_key("high"));
         assert!(models.contains_key("new"));
+    }
+
+    #[test]
+    fn unload_or_alias_finds_the_canonical_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(0);
+        let p = fake_model_file(dir.path(), "m.gguf", 100);
+        mgr.load_model_with_options("org/Model-4bit", &p, LoadOptions::default()).unwrap();
+
+        mgr.unload_model_or_alias("org/Model-4bit", "model:4b").unwrap();
+        assert!(!mgr.is_loaded("org/Model-4bit"));
+    }
+
+    /// A model auto-loaded by an inference request is keyed on the name that
+    /// request used, so unload must fall back to it.
+    #[test]
+    fn unload_or_alias_falls_back_to_the_typed_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(0);
+        let p = fake_model_file(dir.path(), "m.gguf", 100);
+        mgr.load_model_with_options("model:4b", &p, LoadOptions::default()).unwrap();
+
+        mgr.unload_model_or_alias("org/Model-4bit", "model:4b").unwrap();
+        assert!(!mgr.is_loaded("model:4b"));
+    }
+
+    #[test]
+    fn unload_or_alias_reports_the_canonical_name_when_neither_is_loaded() {
+        let mgr = test_manager(0);
+        let err = mgr
+            .unload_model_or_alias("org/Model-4bit", "model:4b")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("org/Model-4bit"), "got: {err}");
     }
 
     fn real_gguf_path() -> Option<PathBuf> {
