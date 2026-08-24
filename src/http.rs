@@ -168,11 +168,28 @@ async fn model_unload(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match state.manager.unload_model(&id) {
-        Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
-        Err(e) => (
+    // Models are resident under their canonical key, so an alias has to be
+    // resolved the same way `/load` resolves it. A name the registry doesn't
+    // know still gets tried verbatim, so a model loaded from outside the
+    // registry stays unloadable.
+    let key = state.store.resolve_key(&id).unwrap_or_else(|_| id.clone());
+    let manager = state.manager.clone();
+
+    // unload re-warms the RAM cache, which reads the whole model file on the
+    // way out — never on an async worker.
+    let result =
+        tokio::task::spawn_blocking(move || manager.unload_model_or_alias(&key, &id)).await;
+
+    match result {
+        Ok(Ok(())) => Json(serde_json::json!({"status": "ok"})).into_response(),
+        Ok(Err(e)) => (
             axum::http::StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("unload task failed: {e}")})),
         )
             .into_response(),
     }
@@ -217,10 +234,13 @@ async fn chat(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
 
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = auto_load(&mgr, &store, &req.model) {
-            let _ = tx.blocking_send(Ok(sse_data(&serde_json::json!({"type": "error", "error": e.to_string()}))));
-            return;
-        }
+        let key = match auto_load(&mgr, &store, &req.model) {
+            Ok(k) => k,
+            Err(e) => {
+                let _ = tx.blocking_send(Ok(sse_data(&serde_json::json!({"type": "error", "error": e.to_string()}))));
+                return;
+            }
+        };
 
         let messages: Vec<_> = req.messages.iter().map(|m| (m.role.clone(), m.content.clone())).collect();
 
@@ -237,7 +257,7 @@ async fn chat(
             None => GenerateParams::default(),
         };
 
-        let result = mgr.generate_chat(&req.model, &messages, &[], &crate::engine::tools::ToolChoice::None, &params, None, |token| {
+        let result = mgr.generate_chat(&key, &messages, &[], &crate::engine::tools::ToolChoice::None, &params, None, |token| {
             let payload = serde_json::json!({"type": "token", "content": token});
             tx.blocking_send(Ok(sse_data(&payload))).is_ok()
         });
@@ -277,12 +297,8 @@ async fn load(
     State(state): State<AppState>,
     Json(req): Json<LoadRequest>,
 ) -> impl IntoResponse {
-    if state.manager.is_loaded(&req.model) {
-        return Json(LoadResponse { already_loaded: true }).into_response();
-    }
-
-    let path = match state.store.resolve_model_path(&req.model) {
-        Ok(p) => p,
+    let resolved = match state.store.resolve(&req.model) {
+        Ok(r) => r,
         Err(e) => {
             return (
                 axum::http::StatusCode::NOT_FOUND,
@@ -291,20 +307,39 @@ async fn load(
                 .into_response();
         }
     };
-    let digest = state.store.resolve_model_digest(&req.model).unwrap_or_default();
-    let gpu_layers = req.gpu_layers.and_then(|l| if l < 0 { None } else { Some(l as u32) });
 
-    match state.manager.load_model_with_options(&req.model, &path, crate::engine::manager::LoadOptions {
+    // Check residency under the canonical key, not the alias the caller typed.
+    if state.manager.is_loaded(&resolved.key) {
+        return Json(LoadResponse { already_loaded: true }).into_response();
+    }
+
+    let gpu_layers = req.gpu_layers.and_then(|l| if l < 0 { None } else { Some(l as u32) });
+    let manager = state.manager.clone();
+    let opts = crate::engine::manager::LoadOptions {
         gpu_layers,
-        digest,
+        digest: resolved.digest,
         #[cfg(feature = "vision")]
-        mmproj_path: state.store.resolve_mmproj_path(&req.model).unwrap_or(None),
+        mmproj_path: resolved.mmproj_path,
         ..Default::default()
-    }) {
-        Ok(()) => Json(LoadResponse { already_loaded: false }).into_response(),
-        Err(e) => (
+    };
+
+    // Loading is minutes of blocking mmap + GPU upload; keep it off the async
+    // worker so in-flight streams on this thread don't stall.
+    let result = tokio::task::spawn_blocking(move || {
+        manager.load_model_with_options(&resolved.key, &resolved.path, opts)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => Json(LoadResponse { already_loaded: false }).into_response(),
+        Ok(Err(e)) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("load task failed: {e}")})),
         )
             .into_response(),
     }
@@ -895,12 +930,15 @@ async fn oai_chat_completions(
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
 
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = auto_load(&mgr, &store, &req.model) {
-                let _ = tx.blocking_send(Ok(sse_data(&oai_error(&e.to_string()))));
-                return;
-            }
+            let key = match auto_load(&mgr, &store, &req.model) {
+                Ok(k) => k,
+                Err(e) => {
+                    let _ = tx.blocking_send(Ok(sse_data(&oai_error(&e.to_string()))));
+                    return;
+                }
+            };
 
-            let forced_open = mgr.reasoning_forced_open(&req.model);
+            let forced_open = mgr.reasoning_forced_open(&key);
             let messages = prepare_messages_with_tools(&req.messages, None);
             let params = GenerateParams {
                 max_tokens: req.max_tokens.unwrap_or(512),
@@ -940,7 +978,7 @@ async fn oai_chat_completions(
                     true
                 });
                 #[cfg(not(feature = "vision"))]
-                let result = mgr.generate_chat(&req.model, &messages, &tool_specs, &tool_choice, &params, None, |token| {
+                let result = mgr.generate_chat(&key, &messages, &tool_specs, &tool_choice, &params, None, |token| {
                     collector.push(token);
                     true
                 });
@@ -1053,7 +1091,7 @@ async fn oai_chat_completions(
                 #[cfg(feature = "vision")]
                 let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &tool_specs, &tool_choice, &params, &mut on_tok);
                 #[cfg(not(feature = "vision"))]
-                let result = mgr.generate_chat(&req.model, &messages, &tool_specs, &tool_choice, &params, None, &mut on_tok);
+                let result = mgr.generate_chat(&key, &messages, &tool_specs, &tool_choice, &params, None, &mut on_tok);
 
                 match result {
                     Ok(ref stats) => {
@@ -1104,9 +1142,9 @@ async fn oai_chat_completions(
     } else {
         // Non-streaming: collect all tokens then return a single JSON response.
         let result = tokio::task::spawn_blocking(move || {
-            auto_load(&mgr, &store, &req.model)?;
+            let key = auto_load(&mgr, &store, &req.model)?;
 
-            let forced_open = mgr.reasoning_forced_open(&req.model);
+            let forced_open = mgr.reasoning_forced_open(&key);
             let messages = prepare_messages_with_tools(&req.messages, None);
 
             let params = GenerateParams {
@@ -1126,7 +1164,7 @@ async fn oai_chat_completions(
                 true
             })?;
             #[cfg(not(feature = "vision"))]
-            let stats = mgr.generate_chat(&req.model, &messages, &tool_specs, &tool_choice, &params, None, |token| {
+            let stats = mgr.generate_chat(&key, &messages, &tool_specs, &tool_choice, &params, None, |token| {
                 collector.push(token);
                 true
             })?;
@@ -1222,10 +1260,13 @@ async fn oai_completions(
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
 
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = auto_load(&mgr, &store, &req.model) {
-                let _ = tx.blocking_send(Ok(sse_data(&oai_error(&e.to_string()))));
-                return;
-            }
+            let key = match auto_load(&mgr, &store, &req.model) {
+                Ok(k) => k,
+                Err(e) => {
+                    let _ = tx.blocking_send(Ok(sse_data(&oai_error(&e.to_string()))));
+                    return;
+                }
+            };
 
             let params = GenerateParams {
                 max_tokens: req.max_tokens.unwrap_or(512),
@@ -1242,7 +1283,7 @@ async fn oai_completions(
             let created = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
 
-            let result = mgr.generate(&req.model, &req.prompt, &params, None, |token| {
+            let result = mgr.generate(&key, &req.prompt, &params, None, |token| {
                 let chunk = serde_json::json!({
                     "id": &completion_id,
                     "object": "text_completion",
@@ -1283,7 +1324,7 @@ async fn oai_completions(
         Sse::new(ReceiverStream::new(rx)).into_response()
     } else {
         let result = tokio::task::spawn_blocking(move || {
-            auto_load(&mgr, &store, &req.model)?;
+            let key = auto_load(&mgr, &store, &req.model)?;
 
             let params = GenerateParams {
                 max_tokens: req.max_tokens.unwrap_or(512),
@@ -1296,7 +1337,7 @@ async fn oai_completions(
             };
 
             let mut output = String::new();
-            let stats = mgr.generate(&req.model, &req.prompt, &params, None, |token| {
+            let stats = mgr.generate(&key, &req.prompt, &params, None, |token| {
                 output.push_str(token);
                 true
             })?;
@@ -1502,13 +1543,13 @@ async fn oai_embeddings(
     let store = state.store.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        auto_load(&mgr, &store, &req.model)?;
+        let key = auto_load(&mgr, &store, &req.model)?;
 
         let mut data = Vec::with_capacity(texts.len());
         let mut total_tokens = 0u32;
 
         for (i, text) in texts.iter().enumerate() {
-            let r = mgr.embed(&req.model, text)?;
+            let r = mgr.embed(&key, text)?;
             total_tokens += r.prompt_tokens;
             let embedding_val = if want_base64 {
                 serde_json::Value::String(encode_embedding_base64(&r.embedding))
@@ -1571,23 +1612,32 @@ fn oai_error(msg: &str) -> serde_json::Value {
 }
 
 /// Auto-load a model if not already in memory.
+/// Ensure `model` is resident, and return the canonical key it is resident
+/// under.
+///
+/// Callers must address the manager with the returned key, not the name the
+/// request carried: loading `llama3.1:8b` under the alias while `/load` and
+/// `/v1/models` use the canonical key puts the same weights in memory twice,
+/// each counted separately against the eviction budget.
 pub(crate) fn auto_load(
     mgr: &ModelManager,
     store: &ModelStore,
     model: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     if mgr.is_loaded(model) {
-        return Ok(());
+        return Ok(model.to_string());
     }
-    let path = store.resolve_model_path(model)?;
-    let digest = store.resolve_model_digest(model).unwrap_or_default();
-    mgr.load_model_with_options(model, &path, crate::engine::manager::LoadOptions {
-        digest,
+    let resolved = store.resolve(model)?;
+    if mgr.is_loaded(&resolved.key) {
+        return Ok(resolved.key);
+    }
+    mgr.load_model_with_options(&resolved.key, &resolved.path, crate::engine::manager::LoadOptions {
+        digest: resolved.digest,
         #[cfg(feature = "vision")]
-        mmproj_path: store.resolve_mmproj_path(model).unwrap_or(None),
+        mmproj_path: resolved.mmproj_path,
         ..Default::default()
     })?;
-    Ok(())
+    Ok(resolved.key)
 }
 
 #[cfg(test)]

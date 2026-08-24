@@ -440,20 +440,19 @@ impl Spindll for SpindllService {
         let req = request.into_inner();
         tracing::Span::current().record("model", req.model.as_str());
 
-        if self.manager.is_loaded(&req.model) {
+        let resolved = self.model_store
+            .resolve(&req.model)
+            .map_err(|e| Status::not_found(e.to_string()))?;
+
+        // Residency is keyed on the canonical name — checking the alias here
+        // would miss a resident model and load the same weights a second time.
+        if self.manager.is_loaded(&resolved.key) {
             return Ok(Response::new(LoadResponse {
                 success: true,
-                message: format!("{} already loaded", req.model),
+                message: format!("{} already loaded", resolved.key),
                 already_loaded: true,
             }));
         }
-
-        let model_path = self.model_store
-            .resolve_model_path(&req.model)
-            .map_err(|e| Status::not_found(e.to_string()))?;
-        let digest = self.model_store
-            .resolve_model_digest(&req.model)
-            .unwrap_or_default();
 
         let gpu_layers = if req.gpu_layers < 0 { None } else { Some(req.gpu_layers as u32) };
 
@@ -468,24 +467,28 @@ impl Spindll for SpindllService {
             Some(std::time::Duration::from_secs(req.idle_reload_secs as u64))
         };
 
-        self.manager
-            .load_model_with_options(
-                &req.model,
-                &model_path,
-                LoadOptions {
-                    gpu_layers,
-                    digest,
-                    priority,
-                    idle_reload,
-                    #[cfg(feature = "vision")]
-                    mmproj_path: self.model_store.resolve_mmproj_path(&req.model).unwrap_or(None),
-                },
-            )
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let manager = self.manager.clone();
+        let key = resolved.key.clone();
+        let opts = LoadOptions {
+            gpu_layers,
+            digest: resolved.digest,
+            priority,
+            idle_reload,
+            #[cfg(feature = "vision")]
+            mmproj_path: resolved.mmproj_path,
+        };
+
+        // Minutes of blocking mmap + GPU upload; keep it off the async worker.
+        tokio::task::spawn_blocking(move || {
+            manager.load_model_with_options(&key, &resolved.path, opts)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("load task failed: {e}")))?
+        .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(LoadResponse {
             success: true,
-            message: format!("loaded {}", req.model),
+            message: format!("loaded {}", resolved.key),
             already_loaded: false,
         }))
     }
@@ -497,8 +500,18 @@ impl Spindll for SpindllService {
     ) -> Result<Response<UnloadResponse>, Status> {
         let req = request.into_inner();
         tracing::Span::current().record("model", req.model.as_str());
-        self.manager
-            .unload_model(&req.model)
+
+        // Resolve the alias the same way `load` does; a name the registry
+        // doesn't know is still tried verbatim so a model loaded from outside
+        // the registry stays unloadable.
+        let alias = req.model;
+        let key = self.model_store.resolve_key(&alias).unwrap_or_else(|_| alias.clone());
+        let manager = self.manager.clone();
+
+        // unload re-warms the RAM cache, reading the whole model file.
+        tokio::task::spawn_blocking(move || manager.unload_model_or_alias(&key, &alias))
+            .await
+            .map_err(|e| Status::internal(format!("unload task failed: {e}")))?
             .map_err(|e| Status::not_found(e.to_string()))?;
 
         Ok(Response::new(UnloadResponse { success: true }))
