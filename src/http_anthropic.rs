@@ -523,10 +523,13 @@ pub(crate) async fn anthropic_messages(
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
 
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = auto_load(&mgr, &store, &req.model) {
-                let _ = tx.blocking_send(Ok(sse_named("error", &anth_error_body("api_error", &e.to_string()))));
-                return;
-            }
+            let key = match auto_load(&mgr, &store, &req.model) {
+                Ok(k) => k,
+                Err(e) => {
+                    let _ = tx.blocking_send(Ok(sse_named("error", &anth_error_body("api_error", &e.to_string()))));
+                    return;
+                }
+            };
 
             let msg_id = new_message_id();
             let _ = tx.blocking_send(Ok(sse_named("message_start", &json!({
@@ -547,7 +550,7 @@ pub(crate) async fn anthropic_messages(
             // streams through the stop scanner token by token.
             if has_tools {
                 let mut output = String::new();
-                let result = generate(&mgr, &req, &tool_specs, &tool_choice, &params, &mut |t| {
+                let result = generate(&mgr, &key, &req, &tool_specs, &tool_choice, &params, &mut |t| {
                     output.push_str(t);
                     true
                 });
@@ -575,7 +578,7 @@ pub(crate) async fn anthropic_messages(
 
                 let mut scanner = StopScanner::new(&req.stop_sequences);
                 let mut stop_hit: Option<String> = None;
-                let result = generate(&mgr, &req, &tool_specs, &tool_choice, &params, &mut |token| {
+                let result = generate(&mgr, &key, &req, &tool_specs, &tool_choice, &params, &mut |token| {
                     if stop_hit.is_some() {
                         return false;
                     }
@@ -642,9 +645,9 @@ pub(crate) async fn anthropic_messages(
         let model_id = req.model.clone();
         let stop_sequences = req.stop_sequences.clone();
         let result = tokio::task::spawn_blocking(move || {
-            auto_load(&mgr, &store, &req.model)?;
+            let key = auto_load(&mgr, &store, &req.model)?;
             let mut output = String::new();
-            let stats = generate(&mgr, &req, &tool_specs, &tool_choice, &params, &mut |t| {
+            let stats = generate(&mgr, &key, &req, &tool_specs, &tool_choice, &params, &mut |t| {
                 output.push_str(t);
                 true
             })?;
@@ -681,8 +684,11 @@ pub(crate) async fn anthropic_messages(
 
 /// Run generation on the vision path when image blocks are present, else the
 /// text chat path — mirrors the chat-completions handler's split.
+/// `key` is the canonical registry key the model is resident under — not
+/// `req.model`, which may be an alias.
 fn generate(
     mgr: &crate::engine::manager::ModelManager,
+    key: &str,
     req: &AnthMessagesRequest,
     tool_specs: &[ToolSpec],
     tool_choice: &ToolChoice,
@@ -695,10 +701,10 @@ fn generate(
         if let Some(preamble) = crate::engine::tools::tools_to_prompt(tool_specs, tool_choice) {
             crate::engine::multimodal::inject_system_text(&mut mm, &preamble);
         }
-        return mgr.generate_chat_multimodal(&req.model, &mm, params, on_token);
+        return mgr.generate_chat_multimodal(key, &mm, params, on_token);
     }
     let pairs = anth_to_pairs(req.system.as_ref(), &req.messages);
-    mgr.generate_chat(&req.model, &pairs, tool_specs, tool_choice, params, None, on_token)
+    mgr.generate_chat(key, &pairs, tool_specs, tool_choice, params, None, on_token)
 }
 
 /// Emit one finished content block through the streaming grammar. Text blocks

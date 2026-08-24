@@ -449,12 +449,15 @@ pub(crate) async fn responses_create(
         tokio::task::spawn_blocking(move || {
             let mut em = Emitter { tx, seq: 0 };
             let resp_id = new_id("resp");
-            if let Err(e) = auto_load(&mgr, &store, &model) {
-                em.send("response.failed", json!({
-                    "response": failed_response(&resp_id, &model, &e.to_string())
-                }));
-                return;
-            }
+            let key = match auto_load(&mgr, &store, &model) {
+                Ok(k) => k,
+                Err(e) => {
+                    em.send("response.failed", json!({
+                        "response": failed_response(&resp_id, &model, &e.to_string())
+                    }));
+                    return;
+                }
+            };
 
             let skeleton = build_response(&resp_id, &model, Vec::new(), "in_progress", 0, 0);
             em.send("response.created", json!({ "response": skeleton }));
@@ -464,7 +467,7 @@ pub(crate) async fn responses_create(
                 // Buffer the full output so calls can be parsed, then replay
                 // it through the item grammar.
                 let mut output = String::new();
-                let result = mgr.generate_chat(&model, &pairs, &tool_specs, &tool_choice, &params, None, |t| {
+                let result = mgr.generate_chat(&key, &pairs, &tool_specs, &tool_choice, &params, None, |t| {
                     output.push_str(t);
                     true
                 });
@@ -505,7 +508,7 @@ pub(crate) async fn responses_create(
                 }));
 
                 let mut text = String::new();
-                let result = mgr.generate_chat(&model, &pairs, &tool_specs, &tool_choice, &params, None, |token| {
+                let result = mgr.generate_chat(&key, &pairs, &tool_specs, &tool_choice, &params, None, |token| {
                     text.push_str(token);
                     em.send("response.output_text.delta", json!({
                         "item_id": &item_id, "output_index": 0, "content_index": 0,
@@ -546,9 +549,9 @@ pub(crate) async fn responses_create(
         Sse::new(ReceiverStream::new(rx)).into_response()
     } else {
         let result = tokio::task::spawn_blocking(move || {
-            auto_load(&mgr, &store, &model)?;
+            let key = auto_load(&mgr, &store, &model)?;
             let mut output = String::new();
-            let stats = mgr.generate_chat(&model, &pairs, &tool_specs, &tool_choice, &params, None, |t| {
+            let stats = mgr.generate_chat(&key, &pairs, &tool_specs, &tool_choice, &params, None, |t| {
                 output.push_str(t);
                 true
             })?;
