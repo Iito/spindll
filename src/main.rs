@@ -51,9 +51,9 @@ enum Commands {
         /// Model name (any form `spindll list` prints)
         model: String,
 
-        /// HTTP port of the running server (default: from the server lockfile, else 8080)
+        /// gRPC port of the running server (default: from the server lockfile)
         #[arg(long)]
-        http_port: Option<u16>,
+        port: Option<u16>,
     },
 
     /// Unload a model from memory on the running server (keeps it on disk)
@@ -61,9 +61,9 @@ enum Commands {
         /// Model name (any form `spindll list` prints)
         model: String,
 
-        /// HTTP port of the running server (default: from the server lockfile, else 8080)
+        /// gRPC port of the running server (default: from the server lockfile)
         #[arg(long)]
-        http_port: Option<u16>,
+        port: Option<u16>,
     },
 
     /// Start the gRPC server (models loaded dynamically via Load RPC)
@@ -107,8 +107,12 @@ enum Commands {
         #[arg(long, default_value = "0")]
         batch_slots: usize,
 
-        /// RAM cache for recently-evicted models (e.g. "8G", default 4G when enabled)
-        #[arg(long)]
+        /// RAM cache for recently-evicted models (e.g. --ram-cache=8G, default 4G when enabled)
+        ///
+        /// `require_equals` keeps the optional value from swallowing the
+        /// positional model name: without it `serve --ram-cache mymodel`
+        /// parses the model as the cache size and preloads nothing.
+        #[arg(long, require_equals = true)]
         ram_cache: Option<Option<String>>,
 
         /// HTTP/SSE server port (requires --features http, 0 = disabled)
@@ -225,67 +229,41 @@ enum Commands {
     },
 }
 
-/// HTTP port for client commands: explicit flag > running server's lockfile
-/// (0 there means the server runs without HTTP) > default 8080.
-fn server_http_port(flag: Option<u16>) -> anyhow::Result<u16> {
-    resolve_http_port(flag, spindll::lockfile::Lockfile::read())
-}
-
-/// Pure half of [`server_http_port`], split out so the precedence rules are
-/// testable without depending on a real lockfile.
-fn resolve_http_port(
-    flag: Option<u16>,
-    lock: Option<spindll::lockfile::Lockfile>,
-) -> anyhow::Result<u16> {
+/// gRPC port for the client subcommands: explicit flag, else the running
+/// server's lockfile.
+///
+/// The lockfile is read only when no flag was given — reading it unlinks a
+/// stale entry as a side effect, which a command told exactly where to connect
+/// has no business triggering. There is deliberately no default port: guessing
+/// one sends a mutating request at whatever else happens to be listening.
+fn server_grpc_port(flag: Option<u16>) -> anyhow::Result<u16> {
     if let Some(p) = flag {
         return Ok(p);
     }
-    match lock {
-        Some(lock) if lock.http_port == 0 => anyhow::bail!(
-            "the running spindll server (pid {}) has no HTTP port — it was started with \
-             --http-port 0, or built without the `http` feature",
-            lock.pid
-        ),
-        Some(lock) => Ok(lock.http_port),
-        None => Ok(8080),
+    match spindll::lockfile::Lockfile::read() {
+        Some(lock) => Ok(lock.grpc_port),
+        None => anyhow::bail!("no running server found (no lockfile); specify --port"),
     }
 }
 
-/// HTTP client for the client-side subcommands. The connect timeout stops
-/// `spindll load` hanging indefinitely on a wedged listener; the request itself
-/// stays unbounded because loading a large model legitimately takes minutes.
-fn server_client() -> anyhow::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(Into::into)
-}
-
-fn server_unreachable(port: u16, e: reqwest::Error) -> anyhow::Error {
-    anyhow::anyhow!(
-        "no spindll server reachable on 127.0.0.1:{port} — start one with `spindll serve` ({e})"
-    )
-}
-
-/// Resolve a model to the same path + options the HTTP `/load` path builds
-/// (digest + auto-discovered mmproj, manager defaults for everything else).
+/// Connect to a running server's gRPC endpoint.
 ///
-/// Split from the load itself so `serve <model>` can reject an unknown name
-/// synchronously, before anything moves onto a background task. Mirrors
-/// `http::auto_load`, which is unreachable here because `serve` also builds
-/// without the `http` feature — keep the two in step.
-fn preload_options(
-    store: &spindll::model_store::ModelStore,
-    model: &str,
-) -> anyhow::Result<(std::path::PathBuf, spindll::engine::LoadOptions)> {
-    let path = store.resolve_model_path(model)?;
-    let digest = store.resolve_model_digest(model).unwrap_or_default();
-    Ok((path, spindll::engine::LoadOptions {
-        digest,
-        #[cfg(feature = "vision")]
-        mmproj_path: store.resolve_mmproj_path(model).unwrap_or(None),
-        ..Default::default()
-    }))
+/// gRPC rather than HTTP because the service is compiled into every build,
+/// while `http` is optional: `spindll load` has to work on a `--features cli`
+/// binary and on a server started with `--http-port 0`. It also gets a typed
+/// response, so a stranger answering on the port fails the handshake instead of
+/// being mistaken for success.
+async fn connect_server(
+    port: u16,
+) -> anyhow::Result<spindll::proto::spindll_client::SpindllClient<tonic::transport::Channel>> {
+    spindll::proto::spindll_client::SpindllClient::connect(format!("http://127.0.0.1:{port}"))
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot reach a spindll server on 127.0.0.1:{port} — \
+                 start one with `spindll serve` ({e})"
+            )
+        })
 }
 
 /// Parse a human-readable size like "2G", "512M" into bytes. Defaults to 2GB.
@@ -532,42 +510,29 @@ async fn main() -> anyhow::Result<()> {
             let store = spindll::model_store::ModelStore::new(None);
             store.remove(&model, purge)?;
         }
-        Commands::Load { model, http_port } => {
-            let port = server_http_port(http_port)?;
-            let client = server_client()?;
-            let resp = client
-                .post(format!("http://127.0.0.1:{port}/load"))
-                .json(&serde_json::json!({ "model": model }))
-                .send()
+        Commands::Load { model, port } => {
+            let port = server_grpc_port(port)?;
+            let resp = connect_server(port)
+                .await?
+                .load(spindll::proto::LoadRequest {
+                    model: model.clone(),
+                    gpu_layers: -1, // -1 = let the server decide
+                    ..Default::default()
+                })
                 .await
-                .map_err(|e| server_unreachable(port, e))?;
-            let status = resp.status();
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            if !status.is_success() {
-                anyhow::bail!("load failed: {}", body["error"].as_str().unwrap_or("unknown error"));
-            }
-            if body["already_loaded"].as_bool() == Some(true) {
-                println!("{model} already loaded");
-            } else {
-                println!("loaded {model}");
-            }
+                .map_err(|e| anyhow::anyhow!("load failed: {}", e.message()))?
+                .into_inner();
+            // The server reports the canonical name it loaded under, which is
+            // the name to use for unload and in API requests.
+            println!("{}", resp.message);
         }
-        Commands::Unload { model, http_port } => {
-            let port = server_http_port(http_port)?;
-            let client = server_client()?;
-            let resp = client
-                .post(format!(
-                    "http://127.0.0.1:{port}/models/{}/unload",
-                    urlencoding::encode(&model)
-                ))
-                .send()
+        Commands::Unload { model, port } => {
+            let port = server_grpc_port(port)?;
+            connect_server(port)
+                .await?
+                .unload(spindll::proto::UnloadRequest { model: model.clone() })
                 .await
-                .map_err(|e| server_unreachable(port, e))?;
-            let status = resp.status();
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            if !status.is_success() {
-                anyhow::bail!("unload failed: {}", body["error"].as_str().unwrap_or("unknown error"));
-            }
+                .map_err(|e| anyhow::anyhow!("unload failed: {}", e.message()))?;
             println!("unloaded {model}");
         }
         Commands::Serve {
@@ -646,13 +611,34 @@ async fn main() -> anyhow::Result<()> {
             let manager = manager.into_arc();
             let store = std::sync::Arc::new(spindll::model_store::ModelStore::new(None));
 
-            // Resolve the preload target before anything binds, so an unknown
-            // model name fails the command outright instead of briefly opening
-            // the ports and then exiting.
-            let preload = match &model {
-                Some(name) => Some((name.clone(), preload_options(&store, name)?)),
-                None => None,
-            };
+            // Preload before anything binds. Loading after the ports are open
+            // races inbound requests: `auto_load` sees the model as absent
+            // until the very end of the load and starts a second copy of the
+            // same weights, doubling peak memory against a one-model budget.
+            // Serving only once the model is ready also means a failure is
+            // fatal and visible, instead of a warm-looking server with nothing
+            // in it.
+            if let Some(name) = &model {
+                let resolved = store.resolve(name)?;
+                println!("preloading {} ...", resolved.key);
+                let mgr = manager.clone();
+                let key = resolved.key.clone();
+                tokio::task::spawn_blocking(move || {
+                    mgr.load_model_with_options(
+                        &key,
+                        &resolved.path,
+                        spindll::engine::LoadOptions {
+                            digest: resolved.digest,
+                            #[cfg(feature = "vision")]
+                            mmproj_path: resolved.mmproj_path,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("preload task failed: {e}"))??;
+                println!("{} ready", resolved.key);
+            }
 
             #[cfg(feature = "http")]
             if http_port > 0 {
@@ -668,21 +654,6 @@ async fn main() -> anyhow::Result<()> {
             }
             #[cfg(not(feature = "http"))]
             let _ = http_port;
-
-            // Load it in the background so the ports stay available while a
-            // large model is still coming up. Logged through tracing so these
-            // lines cannot interleave mid-line with the subscriber's own
-            // stderr writes.
-            if let Some((name, (path, opts))) = preload {
-                let mgr = manager.clone();
-                tokio::task::spawn_blocking(move || {
-                    tracing::info!(model = %name, "preloading");
-                    match mgr.load_model_with_options(&name, &path, opts) {
-                        Ok(()) => tracing::info!(model = %name, "model ready"),
-                        Err(e) => tracing::error!(model = %name, error = %e, "preload failed"),
-                    }
-                });
-            }
 
             let effective_http_port = if cfg!(feature = "http") { http_port } else { 0 };
             spindll::lockfile::Lockfile::write(port, effective_http_port)?;
@@ -1045,22 +1016,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Status { port } => {
-            let port = match port {
-                Some(p) => p,
-                None => match spindll::lockfile::Lockfile::read() {
-                    Some(lf) => lf.grpc_port,
-                    None => {
-                        anyhow::bail!("no running server found (no lockfile); specify --port")
-                    }
-                },
-            };
-            let addr = format!("http://localhost:{port}");
-            let mut client =
-                spindll::proto::spindll_client::SpindllClient::connect(addr)
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("cannot connect to server on port {port}: {e}")
-                    })?;
+            let port = server_grpc_port(port)?;
+            let mut client = connect_server(port).await?;
 
             let resp = client
                 .status(spindll::proto::StatusRequest {})
@@ -1130,36 +1087,38 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    fn lock(pid: u32, http_port: u16) -> spindll::lockfile::Lockfile {
-        spindll::lockfile::Lockfile { pid, grpc_port: 50051, http_port }
+    #[test]
+    fn grpc_port_flag_wins_without_touching_the_lockfile() {
+        // Reading the lockfile unlinks stale entries, so a command told which
+        // port to use must not consult it at all.
+        assert_eq!(server_grpc_port(Some(9999)).unwrap(), 9999);
     }
 
+    /// `serve --ram-cache <model>` must not bind the model name to the flag.
     #[test]
-    fn http_port_flag_wins_over_lockfile() {
-        assert_eq!(resolve_http_port(Some(9999), Some(lock(1, 8080))).unwrap(), 9999);
-    }
+    fn ram_cache_does_not_swallow_the_positional_model() {
+        use clap::Parser;
 
-    #[test]
-    fn http_port_falls_back_to_lockfile() {
-        assert_eq!(resolve_http_port(None, Some(lock(1, 18080))).unwrap(), 18080);
-    }
+        // Bare flag + positional: the cache takes its default, the model binds
+        // to the positional. Without require_equals the name became the size.
+        let cli = Cli::try_parse_from(["spindll", "serve", "--ram-cache", "qwen3:8b"]).unwrap();
+        match cli.command {
+            Commands::Serve { model, ram_cache, .. } => {
+                assert_eq!(model.as_deref(), Some("qwen3:8b"));
+                assert_eq!(ram_cache, Some(None), "flag present, value defaulted");
+            }
+            _ => panic!("expected serve"),
+        }
 
-    #[test]
-    fn http_port_defaults_to_8080_without_a_lockfile() {
-        assert_eq!(resolve_http_port(None, None).unwrap(), 8080);
-    }
-
-    #[test]
-    fn http_port_zero_in_lockfile_is_an_error_naming_the_pid() {
-        let err = resolve_http_port(None, Some(lock(4242, 0))).unwrap_err().to_string();
-        assert!(err.contains("4242"), "error should name the server pid: {err}");
-        assert!(err.contains("no HTTP port"), "{err}");
-    }
-
-    #[test]
-    fn http_port_flag_wins_even_when_the_server_has_http_disabled() {
-        // An explicit --http-port must not be rejected by the lockfile's 0.
-        assert_eq!(resolve_http_port(Some(18080), Some(lock(1, 0))).unwrap(), 18080);
+        // Explicit size still reaches the flag.
+        let cli = Cli::try_parse_from(["spindll", "serve", "--ram-cache=8G", "qwen3:8b"]).unwrap();
+        match cli.command {
+            Commands::Serve { model, ram_cache, .. } => {
+                assert_eq!(model.as_deref(), Some("qwen3:8b"));
+                assert_eq!(ram_cache, Some(Some("8G".to_string())));
+            }
+            _ => panic!("expected serve"),
+        }
     }
 
     #[test]
