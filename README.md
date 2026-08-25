@@ -48,7 +48,9 @@ spindll list                          # show local models with metadata (alias: 
 spindll rm <model> [flags]            # delete a local model, alias: remove (prompts for external sources)
 spindll run <model> "prompt" [flags]   # one-shot inference (no server)
 spindll bench <model> [other]         # benchmark one or two models (debug builds only)
-spindll serve [options]               # start gRPC + HTTP server
+spindll serve [model] [options]       # start gRPC + HTTP server, optionally preloading a model
+spindll load <model> [--port N]       # load a model into a running server
+spindll unload <model> [--port N]     # drop a model from memory (stays on disk)
 spindll import [OPTIONS]              # import models (from Ollama, HuggingFace cache, or file path)
 spindll status                        # query a running server
 ```

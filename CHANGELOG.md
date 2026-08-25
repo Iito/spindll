@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **`spindll serve <model>`, `spindll load`, `spindll unload`** — `serve` takes an optional model and preloads it before the ports open, so the server only accepts traffic once the model is ready and a failed load exits non-zero instead of leaving a warm-looking server with nothing in it. `load` / `unload` drive a running server over gRPC (`--port`, else the server's lockfile), which works on `--features cli` builds and servers started with `--http-port 0`.
+
+### Fixed
+
+- **A model is resident under exactly one name** — loading `llama3.1:8b` and requesting `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit` (the id `/v1/models` advertises) put the same weights in memory twice, each counted separately against the eviction budget. Every load path now resolves to the canonical registry key, and `unload` accepts either form.
+- **`/load` and `/unload` no longer block an async worker** — both ran their synchronous work inline, stalling in-flight SSE streams on that thread; unload additionally re-reads the whole model to warm the RAM cache.
+- **The server shuts down on SIGINT/SIGTERM** — nothing handled either signal, so the lockfile survived every ordinary Ctrl-C and the next client command read a dead server's ports out of it. The lockfile is now also only removed by the process that wrote it, so a second `serve` that fails to bind can't erase a healthy server's record.
+- **`spindll serve --ram-cache <model>` no longer swallows the model name** — the optional flag value consumed the positional argument, silently falling back to the default cache size and preloading nothing.
+- **`cargo build --features cli` compiles again** — the Anthropic and Responses dialect modules were not gated behind the `http` feature they depend on.
+
 ## [0.9.3] - 2026-08-22
 
 ### Fixed
