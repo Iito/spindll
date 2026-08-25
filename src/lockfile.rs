@@ -38,8 +38,19 @@ impl Lockfile {
         }
     }
 
+    /// Remove the lockfile, but only when it is ours.
+    ///
+    /// A second `spindll serve` that fails to bind would otherwise erase the
+    /// record of the healthy server already holding the port, leaving
+    /// `spindll status` reporting no server while one is serving.
     pub fn remove() {
-        std::fs::remove_file(lockfile_path()).ok();
+        let ours = std::fs::read_to_string(lockfile_path())
+            .ok()
+            .and_then(|d| serde_json::from_str::<Lockfile>(&d).ok())
+            .is_some_and(|l| l.pid == std::process::id());
+        if ours {
+            std::fs::remove_file(lockfile_path()).ok();
+        }
     }
 }
 
