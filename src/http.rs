@@ -868,11 +868,14 @@ fn oai_has_images(messages: &[OaiMessage]) -> bool {
 /// active). On the vision path it is injected into the multimodal messages so
 /// the model sees the tools — without this the text path's preamble (carried in
 /// `text_messages`) would be dropped and tool calling would silently no-op.
+///
+/// `key` must be the canonical registry key from [`auto_load`], not the name the
+/// caller typed — the manager keys its slots by the former.
 #[cfg(feature = "vision")]
 #[allow(clippy::too_many_arguments)]
 fn generate_maybe_multimodal(
     mgr: &ModelManager,
-    model: &str,
+    key: &str,
     oai_messages: &[OaiMessage],
     text_messages: &[(String, String)],
     tools: &[crate::engine::tools::ToolSpec],
@@ -888,9 +891,9 @@ fn generate_maybe_multimodal(
         if let Some(preamble) = crate::engine::tools::tools_to_prompt(tools, tool_choice) {
             crate::engine::multimodal::inject_system_text(&mut mm, &preamble);
         }
-        mgr.generate_chat_multimodal(model, &mm, params, on_token)
+        mgr.generate_chat_multimodal(key, &mm, params, on_token)
     } else {
-        mgr.generate_chat(model, text_messages, tools, tool_choice, params, None, on_token)
+        mgr.generate_chat(key, text_messages, tools, tool_choice, params, None, on_token)
     }
 }
 
@@ -973,7 +976,7 @@ async fn oai_chat_completions(
                 // mistaken for one it made.
                 let mut collector = ReasoningCollector::new(forced_open);
                 #[cfg(feature = "vision")]
-                let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &tool_specs, &tool_choice, &params, &mut |token| {
+                let result = generate_maybe_multimodal(&mgr, &key, &req.messages, &messages, &tool_specs, &tool_choice, &params, &mut |token| {
                     collector.push(token);
                     true
                 });
@@ -1089,7 +1092,7 @@ async fn oai_chat_completions(
                     alive
                 };
                 #[cfg(feature = "vision")]
-                let result = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &tool_specs, &tool_choice, &params, &mut on_tok);
+                let result = generate_maybe_multimodal(&mgr, &key, &req.messages, &messages, &tool_specs, &tool_choice, &params, &mut on_tok);
                 #[cfg(not(feature = "vision"))]
                 let result = mgr.generate_chat(&key, &messages, &tool_specs, &tool_choice, &params, None, &mut on_tok);
 
@@ -1159,7 +1162,7 @@ async fn oai_chat_completions(
 
             let mut collector = ReasoningCollector::new(forced_open);
             #[cfg(feature = "vision")]
-            let stats = generate_maybe_multimodal(&mgr, &req.model, &req.messages, &messages, &tool_specs, &tool_choice, &params, &mut |token| {
+            let stats = generate_maybe_multimodal(&mgr, &key, &req.messages, &messages, &tool_specs, &tool_choice, &params, &mut |token| {
                 collector.push(token);
                 true
             })?;
