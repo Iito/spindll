@@ -22,6 +22,7 @@ use crate::engine::{GenerateParams, ModelManager};
 #[cfg(feature = "vision")]
 use crate::engine::multimodal::{check_image_len, ContentPart, MAX_IMAGE_BYTES, MultimodalMessage};
 use crate::engine::reasoning::{ReasoningCollector, ReasoningSplitter};
+use crate::engine::residency::ensure_loaded;
 use crate::model_store::registry::Registry;
 use crate::model_store::ModelStore;
 
@@ -234,7 +235,7 @@ async fn chat(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
 
     tokio::task::spawn_blocking(move || {
-        let key = match auto_load(&mgr, &store, &req.model) {
+        let key = match ensure_loaded(&mgr, &store, &req.model) {
             Ok(k) => k,
             Err(e) => {
                 let _ = tx.blocking_send(Ok(sse_data(&serde_json::json!({"type": "error", "error": e.to_string()}))));
@@ -869,7 +870,7 @@ fn oai_has_images(messages: &[OaiMessage]) -> bool {
 /// the model sees the tools — without this the text path's preamble (carried in
 /// `text_messages`) would be dropped and tool calling would silently no-op.
 ///
-/// `key` must be the canonical registry key from [`auto_load`], not the name the
+/// `key` must be the canonical registry key from [`ensure_loaded`], not the name the
 /// caller typed — the manager keys its slots by the former.
 #[cfg(feature = "vision")]
 #[allow(clippy::too_many_arguments)]
@@ -933,7 +934,7 @@ async fn oai_chat_completions(
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
 
         tokio::task::spawn_blocking(move || {
-            let key = match auto_load(&mgr, &store, &req.model) {
+            let key = match ensure_loaded(&mgr, &store, &req.model) {
                 Ok(k) => k,
                 Err(e) => {
                     let _ = tx.blocking_send(Ok(sse_data(&oai_error(&e.to_string()))));
@@ -1145,7 +1146,7 @@ async fn oai_chat_completions(
     } else {
         // Non-streaming: collect all tokens then return a single JSON response.
         let result = tokio::task::spawn_blocking(move || {
-            let key = auto_load(&mgr, &store, &req.model)?;
+            let key = ensure_loaded(&mgr, &store, &req.model)?;
 
             let forced_open = mgr.reasoning_forced_open(&key);
             let messages = prepare_messages_with_tools(&req.messages, None);
@@ -1263,7 +1264,7 @@ async fn oai_completions(
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
 
         tokio::task::spawn_blocking(move || {
-            let key = match auto_load(&mgr, &store, &req.model) {
+            let key = match ensure_loaded(&mgr, &store, &req.model) {
                 Ok(k) => k,
                 Err(e) => {
                     let _ = tx.blocking_send(Ok(sse_data(&oai_error(&e.to_string()))));
@@ -1327,7 +1328,7 @@ async fn oai_completions(
         Sse::new(ReceiverStream::new(rx)).into_response()
     } else {
         let result = tokio::task::spawn_blocking(move || {
-            let key = auto_load(&mgr, &store, &req.model)?;
+            let key = ensure_loaded(&mgr, &store, &req.model)?;
 
             let params = GenerateParams {
                 max_tokens: req.max_tokens.unwrap_or(512),
@@ -1546,7 +1547,7 @@ async fn oai_embeddings(
     let store = state.store.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let key = auto_load(&mgr, &store, &req.model)?;
+        let key = ensure_loaded(&mgr, &store, &req.model)?;
 
         let mut data = Vec::with_capacity(texts.len());
         let mut total_tokens = 0u32;
@@ -1612,35 +1613,6 @@ fn oai_error(msg: &str) -> serde_json::Value {
             "type": "server_error",
         }
     })
-}
-
-/// Auto-load a model if not already in memory.
-/// Ensure `model` is resident, and return the canonical key it is resident
-/// under.
-///
-/// Callers must address the manager with the returned key, not the name the
-/// request carried: loading `llama3.1:8b` under the alias while `/load` and
-/// `/v1/models` use the canonical key puts the same weights in memory twice,
-/// each counted separately against the eviction budget.
-pub(crate) fn auto_load(
-    mgr: &ModelManager,
-    store: &ModelStore,
-    model: &str,
-) -> anyhow::Result<String> {
-    if mgr.is_loaded(model) {
-        return Ok(model.to_string());
-    }
-    let resolved = store.resolve(model)?;
-    if mgr.is_loaded(&resolved.key) {
-        return Ok(resolved.key);
-    }
-    mgr.load_model_with_options(&resolved.key, &resolved.path, crate::engine::manager::LoadOptions {
-        digest: resolved.digest,
-        #[cfg(feature = "vision")]
-        mmproj_path: resolved.mmproj_path,
-        ..Default::default()
-    })?;
-    Ok(resolved.key)
 }
 
 #[cfg(test)]

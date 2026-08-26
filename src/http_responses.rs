@@ -24,7 +24,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::engine::streaming::GenerateParams;
 use crate::engine::tools::{ToolChoice, ToolSpec};
-use crate::http::{AppState, auto_load};
+use crate::engine::residency::ensure_loaded;
+use crate::http::AppState;
 
 // -- Request types -----------------------------------------------------------
 
@@ -449,7 +450,7 @@ pub(crate) async fn responses_create(
         tokio::task::spawn_blocking(move || {
             let mut em = Emitter { tx, seq: 0 };
             let resp_id = new_id("resp");
-            let key = match auto_load(&mgr, &store, &model) {
+            let key = match ensure_loaded(&mgr, &store, &model) {
                 Ok(k) => k,
                 Err(e) => {
                     em.send("response.failed", json!({
@@ -549,7 +550,7 @@ pub(crate) async fn responses_create(
         Sse::new(ReceiverStream::new(rx)).into_response()
     } else {
         let result = tokio::task::spawn_blocking(move || {
-            let key = auto_load(&mgr, &store, &model)?;
+            let key = ensure_loaded(&mgr, &store, &model)?;
             let mut output = String::new();
             let stats = mgr.generate_chat(&key, &pairs, &tool_specs, &tool_choice, &params, None, |t| {
                 output.push_str(t);

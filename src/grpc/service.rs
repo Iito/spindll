@@ -141,13 +141,18 @@ impl Spindll for SpindllService {
         let req = request.into_inner();
         tracing::Span::current().record("model", req.model.as_str());
         let mgr = self.manager.clone();
+        let store = self.model_store.clone();
         let (tx, rx) = mpsc::channel(32);
 
         tokio::task::spawn_blocking(move || {
+            // Unlike `chat`, this RPC never auto-loads — but `Load` registers
+            // under the canonical key, so an alias still has to be mapped across
+            // or a just-loaded model reads as absent.
+            let key = crate::engine::resident_key(&mgr, &store, &req.model);
             let params = proto_params_to_engine(req.params);
             let start = std::time::Instant::now();
 
-            let result = mgr.generate(&req.model, &req.prompt, &params, None, |token| {
+            let result = mgr.generate(&key, &req.prompt, &params, None, |token| {
                 let resp = GenerateResponse {
                     token: token.to_string(),
                     done: false,
@@ -185,39 +190,17 @@ impl Spindll for SpindllService {
         let (tx, rx) = mpsc::channel(32);
 
         tokio::task::spawn_blocking(move || {
-            // Auto-load the model if it isn't already in the manager.
-            if !mgr.is_loaded(&req.model) {
-                let path = match store.resolve_model_path(&req.model) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let _ = tx.blocking_send(Err(Status::not_found(
-                            format!("model '{}' not found in store: {e}", req.model)
-                        )));
-                        return;
-                    }
-                };
-                let digest = store.resolve_model_digest(&req.model).unwrap_or_default();
-                // mmproj_path on autoload → first image req has vision.
-                #[cfg(feature = "vision")]
-                let mmproj_path = store.resolve_mmproj_path(&req.model).ok().flatten();
-                #[cfg(feature = "vision")]
-                let opts = crate::engine::manager::LoadOptions {
-                    digest,
-                    mmproj_path,
-                    ..Default::default()
-                };
-                #[cfg(not(feature = "vision"))]
-                let opts = crate::engine::manager::LoadOptions {
-                    digest,
-                    ..Default::default()
-                };
-                if let Err(e) = mgr.load_model_with_options(&req.model, &path, opts) {
-                    let _ = tx.blocking_send(Err(Status::internal(
-                        format!("failed to load model '{}': {e}", req.model)
+            // Auto-load if absent, and address the manager by the canonical key
+            // from here on — the alias would get a slot of its own.
+            let key = match crate::engine::ensure_loaded(&mgr, &store, &req.model) {
+                Ok(k) => k,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(Status::not_found(
+                        format!("model '{}': {e}", req.model)
                     )));
                     return;
                 }
-            }
+            };
 
             let params = proto_params_to_engine(req.params);
             let start = std::time::Instant::now();
@@ -276,7 +259,7 @@ impl Spindll for SpindllService {
                 {
                     crate::engine::multimodal::inject_system_text(&mut mm_messages, &preamble);
                 }
-                mgr.generate_chat_multimodal(&req.model, &mm_messages, &params, |token| {
+                mgr.generate_chat_multimodal(&key, &mm_messages, &params, |token| {
                     if has_tools {
                         output.push_str(token);
                         return true;
@@ -284,7 +267,7 @@ impl Spindll for SpindllService {
                     tx.blocking_send(Ok(token_resp(token))).is_ok()
                 })
             } else {
-                mgr.generate_chat(&req.model, &messages, &tool_specs, &tool_choice, &params, enc_key.as_ref(), |token| {
+                mgr.generate_chat(&key, &messages, &tool_specs, &tool_choice, &params, enc_key.as_ref(), |token| {
                     if has_tools {
                         output.push_str(token);
                         return true;
@@ -295,7 +278,7 @@ impl Spindll for SpindllService {
 
             #[cfg(not(feature = "vision"))]
             let result =
-                mgr.generate_chat(&req.model, &messages, &tool_specs, &tool_choice, &params, enc_key.as_ref(), |token| {
+                mgr.generate_chat(&key, &messages, &tool_specs, &tool_choice, &params, enc_key.as_ref(), |token| {
                     if has_tools {
                         output.push_str(token);
                         return true;
@@ -530,15 +513,10 @@ impl Spindll for SpindllService {
         // The closure returns Result<_, tonic::Status>; Status is large by design.
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
-            // Auto-load the model if not already loaded.
-            if !mgr.is_loaded(&req.model) {
-                let path = store
-                    .resolve_model_path(&req.model)
-                    .map_err(|e| Status::not_found(format!("model '{}' not found in store: {e}", req.model)))?;
-                let digest = store.resolve_model_digest(&req.model).unwrap_or_default();
-                mgr.load_model_with_digest(&req.model, &path, None, digest)
-                    .map_err(|e| Status::internal(format!("failed to load model '{}': {e}", req.model)))?;
-            }
+            // Auto-load if absent; the key it comes back under is the one the
+            // manager knows, which is not always the name the client sent.
+            let key = crate::engine::ensure_loaded(&mgr, &store, &req.model)
+                .map_err(|e| Status::not_found(format!("model '{}': {e}", req.model)))?;
 
             let messages: Vec<_> = req.messages.iter()
                 .map(|m| (m.role.clone(), m.content.clone()))
@@ -558,7 +536,7 @@ impl Spindll for SpindllService {
 
             let stats = mgr
                 .generate_chat(
-                    &req.model,
+                    &key,
                     &messages,
                     &[],
                     &crate::engine::tools::ToolChoice::None,
