@@ -20,7 +20,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::engine::streaming::GenerateParams;
 use crate::engine::tools::{ToolChoice, ToolSpec};
-use crate::http::{AppState, auto_load};
+use crate::engine::residency::ensure_loaded;
+use crate::http::AppState;
 
 // -- Request types -----------------------------------------------------------
 
@@ -523,7 +524,7 @@ pub(crate) async fn anthropic_messages(
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
 
         tokio::task::spawn_blocking(move || {
-            let key = match auto_load(&mgr, &store, &req.model) {
+            let key = match ensure_loaded(&mgr, &store, &req.model) {
                 Ok(k) => k,
                 Err(e) => {
                     let _ = tx.blocking_send(Ok(sse_named("error", &anth_error_body("api_error", &e.to_string()))));
@@ -645,7 +646,7 @@ pub(crate) async fn anthropic_messages(
         let model_id = req.model.clone();
         let stop_sequences = req.stop_sequences.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let key = auto_load(&mgr, &store, &req.model)?;
+            let key = ensure_loaded(&mgr, &store, &req.model)?;
             let mut output = String::new();
             let stats = generate(&mgr, &key, &req, &tool_specs, &tool_choice, &params, &mut |t| {
                 output.push_str(t);

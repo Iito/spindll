@@ -15,6 +15,7 @@ pub mod metrics;
 pub mod multimodal;
 pub mod ram_cache;
 pub mod reasoning;
+pub mod residency;
 pub mod streaming;
 pub mod tools;
 
@@ -26,6 +27,7 @@ pub use metrics::Metrics;
 #[cfg(feature = "vision")]
 pub use multimodal::{ContentPart, MultimodalMessage};
 pub use ram_cache::RamCache;
+pub use residency::{ensure_loaded, resident_key};
 pub use streaming::{GenerateParams, GenerateResult};
 pub use tools::{ToolCall, ToolChoice, ToolSpec};
 
