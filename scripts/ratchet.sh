@@ -28,6 +28,11 @@ cargo test --features "$FEATS" --lib --bins
 echo "==> hook tests"
 bash scripts/hook-tests.sh
 
+# And the docs have to keep describing the harness that actually exists. This
+# catches the class of drift that let clippy sit warn-only for months.
+echo "==> harness lint"
+python3 scripts/harness-lint.py
+
 ELAPSED=$(($(date +%s) - START))
 echo "==> ratchet green in ${ELAPSED}s"
 
