@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # scripts/ratchet.sh — fast pre-flight green gate for /implement.
-# Target: <60s on M-series mac, <90s on ubuntu. If it grows, trim the test filter.
+# Target: <60s on M-series mac, <90s on ubuntu. If it grows, trim the test
+# filter. Never raise the cap: a slow gate is a gate people skip.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -11,24 +12,26 @@ START=$(date +%s)
 echo "==> cargo check --features $FEATS"
 cargo check --features "$FEATS"
 
-# Clippy is currently warn-only until the pre-existing 13 lints on `main` are
-# resolved (tracked in docs/PUNCHLIST.md as the "[meta] clippy clean baseline" item).
-# Once that lands, change `|| true` -> `|| { echo "clippy red"; exit 1; }` and
-# upgrade to `-D warnings`.
-echo "==> cargo clippy --features $FEATS"
-cargo clippy --features "$FEATS" || echo "WARN: clippy red — see docs/PUNCHLIST.md '[meta] clippy clean baseline'" >&2
+# Strict since 2026-08-29. This was warn-only for months against a "13
+# pre-existing lints" baseline that had since been cleaned up, so every
+# ratchet=green in the worklog before that date meant "clippy unknown".
+echo "==> cargo clippy --features $FEATS -- -D warnings"
+cargo clippy --features "$FEATS" -- -D warnings
 
-# Fast unit subset: all lib tests (currently only `scheduler::budget` and
-# `model_store::registry` have #[cfg(test)] blocks, so this stays cheap).
 # --bins as well as --lib: the CLI's own #[cfg(test)] blocks live in the
 # `spindll` bin target, which `--lib` alone silently skips.
 echo "==> cargo test --features $FEATS --lib --bins"
 cargo test --features "$FEATS" --lib --bins
 
-ELAPSED=$(( $(date +%s) - START ))
+# The hooks are the enforcement layer for the AGENTS.md hard rules. They are
+# shell-speed to test, so there is no excuse for them rotting silently.
+echo "==> hook tests"
+bash scripts/hook-tests.sh
+
+ELAPSED=$(($(date +%s) - START))
 echo "==> ratchet green in ${ELAPSED}s"
 
 CAP="${RATCHET_CAP:-90}"
-if (( ELAPSED > CAP )); then
-  echo "WARN: ratchet exceeded ${CAP}s cap. Trim the --lib filter, do not raise the cap." >&2
+if ((ELAPSED > CAP)); then
+  echo "WARN: ratchet exceeded ${CAP}s cap. Trim the test filter, do not raise the cap." >&2
 fi
