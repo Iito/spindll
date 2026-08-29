@@ -1,0 +1,66 @@
+# Control bands for the maintain stage.
+#
+# Detection is deterministic on purpose. These numbers decide whether an agent
+# is invoked at all; an agent never decides whether a breach happened. That
+# split is what keeps "the harness noticed a regression" from becoming "the
+# harness talked itself into a regression".
+#
+# Evaluated by scripts/bands-check.py against samples in .refs/bands/<metric>.jsonl.
+
+# Rolling baseline: median and stddev of the last `window` samples, excluding
+# the one being judged. Below `min_samples` there is no baseline and nothing
+# fires — a fresh host is silent, not noisy.
+window: 20
+min_samples: 8
+
+# A breach must be both statistically odd AND big enough to care about. On a
+# very stable metric a 3-sigma move can still be 0.4%, which is noise wearing a
+# lab coat. Both gates must pass.
+min_relative_change: 0.02
+
+metrics:
+  decode_tps:
+    direction: higher_is_better
+    unit: tok/s
+    source: spindll bench <model> --json
+  prompt_eval_tps:
+    direction: higher_is_better
+    unit: tok/s
+    source: spindll bench <model> --json
+  peak_rss_mb:
+    direction: lower_is_better
+    unit: MB
+    source: spindll bench <model> --json
+  p50_ms:
+    direction: lower_is_better
+    unit: ms
+    source: spindll bench <model> --json
+  p95_ms:
+    direction: lower_is_better
+    unit: ms
+    source: spindll bench <model> --json
+
+# What a breach is allowed to trigger. Escalating autonomy, and nothing at any
+# tier publishes: tier 3 stops at a proposal that goes through the normal
+# ratchet and review gates like any other change.
+tiers:
+  - sigma: 1
+    action: log
+    autonomy: none
+    description: >
+      Record it and move on. One sample outside one sigma is weather.
+  - sigma: 2
+    action: diagnose
+    autonomy: read-only
+    description: >
+      Invoke an agent to diagnose only. It may read code, logs and history and
+      must write its findings to .refs/bands/findings-<date>.md. It changes
+      nothing.
+  - sigma: 3
+    action: propose
+    autonomy: propose-through-gates
+    description: >
+      Invoke an agent to diagnose and draft a fix as a new top item in
+      docs/PUNCHLIST.md, with acceptance criteria. The fix itself ships through
+      /implement — ratchet, review fanout, and the user's approval to publish.
+      Never a direct commit to main or next.
