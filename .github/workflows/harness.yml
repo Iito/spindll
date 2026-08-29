@@ -1,0 +1,48 @@
+name: Harness
+
+# The agent harness is config that behaves like code: hooks decide what an agent
+# is allowed to do, and AGENTS.md decides what it believes. Both have drifted
+# from reality before (clippy sat warn-only for months while the docs claimed
+# -D warnings), so both get tested on every change.
+#
+# No model, no API key, no network. Pure shell and python — a few seconds.
+
+on:
+  pull_request:
+    branches: [main, next]
+    paths:
+      - ".claude/**"
+      - "scripts/**"
+      - "AGENTS.md"
+      - "REVIEW.md"
+      - "bands.yaml"
+      - ".github/workflows/harness.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: harness-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Hook tests
+        run: bash scripts/hook-tests.sh
+
+      - name: Harness lint
+        run: python3 scripts/harness-lint.py
+
+      - name: Bands config is loadable
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 scripts/bands-check.py check --json
+
+      - name: Shell scripts parse
+        run: |
+          for f in scripts/*.sh .claude/hooks/*.sh; do
+            [ -e "$f" ] || continue
+            bash -n "$f"
+          done
