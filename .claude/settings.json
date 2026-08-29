@@ -4,27 +4,68 @@
     "CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING": "1",
     "MAX_THINKING_TOKENS": "128000"
   },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard-git.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
   "permissions": {
+    "deny": [
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git filter-branch:*)",
+      "Bash(git reset --hard:*)"
+    ],
     "allow": [
       "Bash(cargo *)",
       "Bash(rustc *)",
       "Bash(rustup *)",
       "Bash(rustfmt *)",
+      "Bash(swift build*)",
+      "Bash(swift package*)",
       "Bash(git status*)",
       "Bash(git diff*)",
       "Bash(git log*)",
+      "Bash(git show*)",
       "Bash(git branch*)",
       "Bash(git fetch*)",
-      "Bash(git show*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git checkout:*)",
+      "Bash(git switch:*)",
+      "Bash(git stash:*)",
+      "Bash(git merge:*)",
+      "Bash(git pull:*)",
+      "Bash(git remote*)",
+      "Bash(git worktree*)",
+      "Bash(git check-ignore:*)",
+      "Bash(git merge-base*)",
       "Bash(gh pr view*)",
       "Bash(gh pr list*)",
       "Bash(gh pr diff*)",
       "Bash(gh run list*)",
       "Bash(gh run view*)",
+      "Bash(gh run watch*)",
+      "Bash(gh issue view*)",
+      "Bash(gh issue list*)",
+      "Bash(gh api:*)",
+      "Bash(gh workflow list*)",
+      "Bash(gh workflow view*)",
       "Bash(scripts/ratchet.sh*)",
       "Bash(scripts/review-fanout.sh*)",
       "Bash(scripts/autoloop.sh*)",
       "Bash(scripts/mlx-validate.sh*)",
+      "Bash(scripts/hook-tests.sh*)",
+      "Bash(scripts/bands-check.sh*)",
       "Bash(bash scripts/*)",
       "Bash(spindll *)",
       "Bash(./target/release/spindll *)",
