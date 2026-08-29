@@ -1,150 +1,105 @@
 # Spindll — Agent Operating Manual
 
-Single source of truth for both **Claude Code** and **Codex CLI** running against this repo. `CLAUDE.md` and `.codex/AGENTS.md` are symlinks to this file. Edit here, both tools see it.
+Single source of truth for **Claude Code** and **Codex CLI**. `CLAUDE.md` and
+`.codex/AGENTS.md` are symlinks to this file.
 
-## What this project is
+Kept to one page on purpose. Detail lives in `.claude/skills/*/SKILL.md` —
+plain markdown, readable by any agent, loaded on demand:
 
-Spindll = Rust-native LLM inference engine. GGUF (via llama.cpp) + MLX (via Swift FFI on Apple Silicon). Single binary that pulls models from Ollama / HuggingFace and serves streaming inference over gRPC + HTTP/SSE + OpenAI-compatible `/v1`, plus agent-client dialects: Anthropic Messages (`/v1/messages`) and OpenAI Responses (`/v1/responses`, stateless subset).
+| Need | Read |
+|---|---|
+| Cutting a version, tagging, release notes, main/next sync | `.claude/skills/release-flow/SKILL.md` |
+| MLX gating, when validation is required, Apple-Silicon build quirks | `.claude/skills/mlx-validation/SKILL.md` |
+| Punchlist/worklog conventions, review fanout, autoloop, host split | `.claude/skills/harness-ops/SKILL.md` |
+| What a review finding must look like | `REVIEW.md` |
 
-Edition 2024. Active branch: usually `next` for in-flight work, `main` is stable. PRs land via review.
+## What this is
 
-## Build / test / run
+Rust-native LLM inference engine. GGUF via llama.cpp, MLX via a Swift FFI bridge
+on Apple Silicon. Single binary; pulls models from Ollama and HuggingFace; serves
+streaming inference over gRPC, HTTP/SSE, OpenAI-compatible `/v1`, Anthropic
+Messages (`/v1/messages`), and a stateless subset of OpenAI Responses
+(`/v1/responses`). Edition 2024.
+
+## Build and test
 
 ```bash
-# Default dev build
-cargo build --features cli,http
-# Apple Silicon w/ MLX
-cargo build --release --features cli,http,mlx
-# Linux w/ CUDA
-cargo build --release --features cli,http,cuda
-# Linux w/ Vulkan
-cargo build --release --features cli,http,vulkan
-# Test (fast subset)
-cargo test --features cli,http --lib
-# Bench (real model required — see scripts/autoloop.sh for harness)
-spindll bench <model-a> <model-b>
+cargo build --features cli,http                      # dev
+cargo build --release --features cli,http,mlx        # Apple Silicon
+cargo build --release --features cli,http,cuda       # Linux + CUDA
+bash scripts/ratchet.sh                              # the green gate, <60s
 ```
 
-Feature flags: `cli`, `http`, `cuda`, `metal`, `vulkan`, `mlx`. `mlx` is **Apple-Silicon only** — gate with `#[cfg(all(target_arch="aarch64", target_os="macos", feature="mlx"))]`.
+Feature flags: `cli`, `http`, `cuda`, `metal`, `vulkan`, `mlx`, `vision`, `rpc`.
+MLX is Apple-Silicon only — gate it
+`#[cfg(all(target_arch = "aarch64", target_os = "macos", feature = "mlx"))]`.
 
-Existing test modules: `src/scheduler/budget.rs`, `src/model_store/registry.rs`. Add `#[cfg(test)]` blocks alongside any new module.
+Add `#[cfg(test)]` blocks alongside any module you change.
 
-## Push / PR policy (HARD RULES)
+## Hard rules
 
-- **Never `git push` or `gh pr create` without explicit user approval each time.** The user's auto-memory pins this rule.
-- The ubuntu autoloop daemon honors this via a `~/.local/state/spindll-harness/push.allowed` lockfile that the user must touch (`touch ~/.local/state/spindll-harness/push.allowed`) before any push. The lockfile self-deletes after one consumed push.
-- **Never `--no-verify`**, never amend pushed commits, never force-push to `main` or `next`.
-- New work goes on a feature branch off `next`. Merge via PR.
+These are enforced by `.claude/hooks/guard-git.py`, not by your memory. The hook
+denies the call and tells you why; `scripts/hook-tests.sh` proves it still works.
 
-## Punchlist + worklog (the core control point)
+- **Never push, open a PR, or cut a release without the user's approval, each
+  time.** Approval is a lockfile the user touches by hand
+  (`~/.local/state/spindll-harness/push.allowed`); one touch authorises one
+  publish and the hook consumes it.
+- **Never `--no-verify`.** The pre-commit hook enforces this repo's commit
+  identity.
+- **Never amend a pushed commit. Never force-push main or next.**
+- **Never commit `docs/PUNCHLIST.md`, `docs/WORKLOG.md`, or `.refs/`** — they
+  are per-host local files.
+- **No new dependency without a >7-day age check.** If unsure, ask.
 
-Two **local, per-host** files drive `/implement` — untracked since 2026-08-21 (history keeps them up to `d0f6d7e`; `.git/info/exclude` hides them):
+## Branch flow
 
-- `docs/PUNCHLIST.md` — ordered checkbox list of shippable units. `/implement` consumes top-most `[ ]`.
-- `docs/WORKLOG.md` — append-only run log. One entry per `/implement` close: `## YYYY-MM-DD HH:MM  <agent>  <branch>  <ratchet?>  <review?>` + bullets.
+- **Quickfix or hotfix → branch off `main`, PR to `main`.** It reaches `next`
+  later via the user's main→next carry merge. Do not open a second PR for it.
+- **Feature work → branch off `next`, PR to `next`.** `next` merges to `main`
+  for releases.
+- **Release docs follow the release**: changelog and version commits for a tag
+  cut from `main` are main-line work, done in a detached sibling worktree.
+- **If the right base is ambiguous, ask "main or next?"** before branching.
 
-**Never `git add` or commit these files** — `git add` will refuse (excluded), and each host maintains its own copy. A fresh clone has neither: seed them from another host or from history (`git show d0f6d7e:docs/PUNCHLIST.md`), then add both paths to that clone's `.git/info/exclude`. Caution: checking out pre-removal commits silently overwrites the local copies (git treats ignored files as expendable) — back them up before history archaeology.
-
-Tag `mlx-validate-required` in a worklog entry whenever the change touches `mlx_bridge/`, `src/backend/mlx*.rs`, or any `feature = "mlx"`-gated path. These paths now also build in CI on every PR (`.github/workflows/ci-macos.yml`, `macos-26`); `scripts/mlx-validate.sh` remains the full release-level mac validator and picks these tags up.
-
-## The spec-driven loop (`/implement`)
-
-Mirrors PDF slide 15 (Lopopolo / shisad-dev `$implement v0.6.4`):
-
-```
-PUNCHLIST  →  CODER  →  TARGETED VALIDATION  →  REVIEW FANOUT  →  COLLATE-FIX-RESUBMIT  →  RELEASE CLOSE
-```
-
-Steps the slash command executes:
-1. Read top unchecked punchlist item.
-2. Write tests first (`#[cfg(test)]` next to the module under change).
-3. Implement code.
-4. **Ratchet gate** (`scripts/ratchet.sh`, target <60 s): `cargo check` + `cargo clippy -- -D warnings` + targeted `cargo test --lib`. Block until green.
-5. **Review fanout** (`scripts/review-fanout.sh <base>`): R1 Claude Opus 4.6 + R2 Codex GPT-5.4 (Pareto). Promote to R1+R2+R3 (GPT-5.3-codex) for release-tagged PRs.
-6. Remediate findings, re-run ratchet, re-run review fanout *only on non-green lanes*.
-7. Flip punchlist item `[x]`, append worklog entry.
-8. Stop. Do not push. User decides when to release.
-
-## Karpathy autoloop (`/autoloop`)
-
-Run on ubuntu via `systemd --user` timer. Form:
+## The loop (`/implement`)
 
 ```
-Define metric → Modify → Verify → Improved? Keep : Revert → Log → Repeat
+PUNCHLIST → tests first → code → RATCHET → REVIEW FANOUT → remediate → close
 ```
 
-Driver: `scripts/autoloop.sh <metric> <param-grid.json>`. Logs to `.refs/autoloop/log-<date>.jsonl`. Metrics: `prompt_eval_tps`, `decode_tps`, `peak_rss_mb`, `p50_ms`, `p95_ms`. Keep-threshold default = +2 % over baseline median of 3 runs.
+1. Take the top unchecked `docs/PUNCHLIST.md` item. Its acceptance criteria are
+   the spec.
+2. Write the failing test first.
+3. Implement. Stay narrow — no drive-by refactors.
+4. `bash scripts/ratchet.sh`. Block until green.
+5. `bash scripts/review-fanout.sh <base>`. Contract is `REVIEW.md`.
+6. Fix every `crit` and `high`. Re-run the ratchet, then re-run **only the lanes
+   that flagged**.
+7. Flip the checkbox, append a worklog entry, commit code only.
+8. **Stop.** The user decides when to publish.
 
-## Ratchet definition
+One item per run. Do not chain.
 
-`scripts/ratchet.sh` runs:
-- `cargo check --features cli,http`
-- `cargo clippy --features cli,http -- -D warnings`
-- `cargo test --features cli,http --lib budget registry` (the two existing test modules — fast)
+## Slash commands
 
-Target ≤ 60 s on M-series mac, ≤ 90 s on the ubuntu box. If it grows, trim the test filter, do not raise the cap. Full `cargo test --release --features cli,http,mlx` runs only at the mac MLX validator step (`scripts/mlx-validate.sh`); CI exercises the MLX path at debug level on a `macos-26` runner (`.github/workflows/ci-macos.yml`).
+| Command | Does |
+|---|---|
+| `/plan` | Interactive planning. Updates `docs/PUNCHLIST.md`. |
+| `/implement` | The loop above, on the next punchlist item. |
+| `/review` | Review fanout on the current diff. |
+| `/autoloop` | Perf sweep across a parameter grid. |
+| `/maintain` | Checks perf against `bands.yaml`; responds at the tier the numbers earned. |
+| `/status` | Metrics scraped from the worklog. |
 
-## Reviewer fanout policy
+## Security baseline
 
-- Pareto: 2 lanes (R1 Claude Opus 4.6, R2 Codex GPT-5.4).
-- Release-tagged: 3 lanes (R1+R2+R3 Codex GPT-5.3-codex).
-- Each reviewer reads the full diff vs base + a synopsis of the punchlist item. Output is markdown with severity (`crit`, `high`, `med`, `low`, `nit`).
-- Findings collated into `.refs/review/COLLATED-<sha>.md`.
-- A finding is **silenced** only with a one-line `# silenced: <why>` comment in the collated file. No silent drops.
+`.refs/` is a local sink — never commit logs. Never put provider API keys in the
+repo; they live in `~/.config/` or the environment. GitHub Action versions should
+move to commit-SHA pins (open TODO).
 
-## Cross-OS split
+## Lineage
 
-| Host | Role |
-|------|------|
-| **Ubuntu home server** | Primary 24/7 harness host. nightshift runs `/implement`, `/autoloop`, `/review` lanes. Skips MLX (Apple-only feature). |
-| **Mac (Apple Silicon)** | Local MLX validator + light interactive work. Runs `scripts/mlx-validate.sh` (release-level build) on branches tagged `mlx-validate-required`. Never run a nightshift schedule concurrently with the ubuntu one on the same branch. |
-| **Windows** | CI matrix only (`.github/workflows/ci.yml`). No local daemon. |
-
-**CI workflows.** `ci.yml` runs the Linux + Windows matrix (build/test, clippy, vision check), path-scoped to `src/**`, `proto/**`, `Cargo.*`, `build.rs` — it does **not** list `mlx_bridge/**`. `ci-macos.yml` runs a `macos-26` (Apple-Silicon, Xcode 26.6) `--features cli,http,mlx,vision` debug build + lib tests, scoped to the MLX-relevant paths *including* `mlx_bridge/**`. Net: a Swift-bridge-only change runs **only** the macOS job; shared-code changes run all three platforms. `scripts/mlx-validate.sh` stays the heavier release-level (release build) mac validator.
-
-Sync between hosts: `git origin` only. No rsync, no live coupling.
-
-### Scheduler: nightshift (not systemd)
-
-We use [nightshift](https://github.com/marcus/nightshift) instead of hand-rolled systemd timers. Why: budget guard, multi-provider (Claude + Codex + Copilot), commit-only safety mode, single config file (`nightshift.yml`) committed to the repo so each new host bootstraps the same way.
-
-Bootstrap on a fresh host (mac or ubuntu):
-```
-git clone https://github.com/Iito/spindll.git
-cd spindll
-brew install marcus/tap/nightshift     # or: go install github.com/marcus/nightshift/cmd/nightshift@latest
-nightshift daemon start
-```
-
-`nightshift.yml` (in repo root) sets:
-- `auto_create_pr: false` — agent stops at `git commit`, never pushes, never opens a PR. User does `gh pr create` manually.
-- Schedules: `/implement` every 30 min on ubuntu, `/autoloop` nightly 02:00.
-- Budget cap: 75 % of daily token allotment.
-
-## Security baseline (lightweight)
-
-- `.refs/` is a local sink (gitignored). Never commit logs.
-- Don't add a dependency without checking it's >7 days old (PDF slide 24). Future: `cargo-deny` config.
-- Don't bypass `cargo clippy -- -D warnings` in the ratchet.
-- All GitHub Action versions in `.github/workflows/*.yml` should move to commit-SHA pins (TODO, separate PR).
-- Never store provider API keys in repo. Keep them in `~/.config/` or env.
-
-## Slash command index
-
-| Command | What it does | Driver |
-|---------|--------------|--------|
-| `/plan` | Interactive Opus 4.7 planning. Updates `docs/PUNCHLIST.md`. | Claude Code |
-| `/implement` | Spec-driven loop end-to-end on the next punchlist item. | `.claude/commands/implement.md` |
-| `/review` | Multi-model review fanout on current diff. | `.claude/commands/review.md` → `scripts/review-fanout.sh` |
-| `/autoloop` | Karpathy perf sweep. | `.claude/commands/autoloop.md` → `scripts/autoloop.sh` |
-| `/status` | Post-sprint metrics from worklog. | `.claude/commands/status.md` |
-
-Codex CLI mirrors at `.codex/prompts/` (when added).
-
-## Pointers (PDF lineage)
-
-- Lopopolo "harness engineering": <https://openai.com/index/harness-engineering/>
-- shisad: <https://github.com/shisa-ai/shisad>
-- StrongDM dark factory: <https://factory.strongdm.ai/>
-- AgentsView: <https://github.com/wesm/agentsview>
-- Workflow writeup: <https://agenticcodingweekly.com> (ACW #14)
+Harness engineering: <https://openai.com/index/harness-engineering/> ·
+AI-native SDLC: <https://claude.com/blog/the-ai-native-sdlc-playbook> ·
+shisad: <https://github.com/shisa-ai/shisad>
