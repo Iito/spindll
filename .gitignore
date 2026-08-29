@@ -10,6 +10,8 @@ tools/
 # Per-file un-ignore requires ignoring the children, not the directory itself.
 .claude/*
 !.claude/commands/
+!.claude/hooks/
+!.claude/skills/
 !.claude/settings.json
 
 # Agent run artifacts (review outputs, autoloop trial logs, sessions)
