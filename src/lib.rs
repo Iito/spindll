@@ -66,5 +66,13 @@ mod http_responses;
 
 /// Auto-generated protobuf types for the spindll gRPC protocol.
 pub mod proto {
+    // Every generated service method returns `Result<Response<T>, tonic::Status>`,
+    // and `Status` is 176 bytes — past clippy's 128-byte `result_large_err`
+    // threshold. The lint started firing on this code in clippy 1.98 (silent on
+    // 1.95). It is tonic's type in tonic's generated code, so there is nothing
+    // here to fix; scoped to this module so `-D warnings` keeps its teeth
+    // everywhere spindll actually writes code.
+    #![allow(clippy::result_large_err)]
+
     tonic::include_proto!("spindll");
 }
