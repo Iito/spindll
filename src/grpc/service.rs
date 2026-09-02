@@ -141,13 +141,18 @@ impl Spindll for SpindllService {
         let req = request.into_inner();
         tracing::Span::current().record("model", req.model.as_str());
         let mgr = self.manager.clone();
+        let store = self.model_store.clone();
         let (tx, rx) = mpsc::channel(32);
 
         tokio::task::spawn_blocking(move || {
+            // Unlike `chat`, this RPC never auto-loads — but `Load` registers
+            // under the canonical key, so an alias still has to be mapped across
+            // or a just-loaded model reads as absent.
+            let key = crate::engine::resident_key(&mgr, &store, &req.model);
             let params = proto_params_to_engine(req.params);
             let start = std::time::Instant::now();
 
-            let result = mgr.generate(&req.model, &req.prompt, &params, None, |token| {
+            let result = mgr.generate(&key, &req.prompt, &params, None, |token| {
                 let resp = GenerateResponse {
                     token: token.to_string(),
                     done: false,
@@ -185,39 +190,17 @@ impl Spindll for SpindllService {
         let (tx, rx) = mpsc::channel(32);
 
         tokio::task::spawn_blocking(move || {
-            // Auto-load the model if it isn't already in the manager.
-            if !mgr.is_loaded(&req.model) {
-                let path = match store.resolve_model_path(&req.model) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let _ = tx.blocking_send(Err(Status::not_found(
-                            format!("model '{}' not found in store: {e}", req.model)
-                        )));
-                        return;
-                    }
-                };
-                let digest = store.resolve_model_digest(&req.model).unwrap_or_default();
-                // mmproj_path on autoload → first image req has vision.
-                #[cfg(feature = "vision")]
-                let mmproj_path = store.resolve_mmproj_path(&req.model).ok().flatten();
-                #[cfg(feature = "vision")]
-                let opts = crate::engine::manager::LoadOptions {
-                    digest,
-                    mmproj_path,
-                    ..Default::default()
-                };
-                #[cfg(not(feature = "vision"))]
-                let opts = crate::engine::manager::LoadOptions {
-                    digest,
-                    ..Default::default()
-                };
-                if let Err(e) = mgr.load_model_with_options(&req.model, &path, opts) {
-                    let _ = tx.blocking_send(Err(Status::internal(
-                        format!("failed to load model '{}': {e}", req.model)
+            // Auto-load if absent, and address the manager by the canonical key
+            // from here on — the alias would get a slot of its own.
+            let key = match crate::engine::ensure_loaded(&mgr, &store, &req.model) {
+                Ok(k) => k,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(Status::not_found(
+                        format!("model '{}': {e}", req.model)
                     )));
                     return;
                 }
-            }
+            };
 
             let params = proto_params_to_engine(req.params);
             let start = std::time::Instant::now();
@@ -276,7 +259,7 @@ impl Spindll for SpindllService {
                 {
                     crate::engine::multimodal::inject_system_text(&mut mm_messages, &preamble);
                 }
-                mgr.generate_chat_multimodal(&req.model, &mm_messages, &params, |token| {
+                mgr.generate_chat_multimodal(&key, &mm_messages, &params, |token| {
                     if has_tools {
                         output.push_str(token);
                         return true;
@@ -284,7 +267,7 @@ impl Spindll for SpindllService {
                     tx.blocking_send(Ok(token_resp(token))).is_ok()
                 })
             } else {
-                mgr.generate_chat(&req.model, &messages, &tool_specs, &tool_choice, &params, enc_key.as_ref(), |token| {
+                mgr.generate_chat(&key, &messages, &tool_specs, &tool_choice, &params, enc_key.as_ref(), |token| {
                     if has_tools {
                         output.push_str(token);
                         return true;
@@ -295,7 +278,7 @@ impl Spindll for SpindllService {
 
             #[cfg(not(feature = "vision"))]
             let result =
-                mgr.generate_chat(&req.model, &messages, &tool_specs, &tool_choice, &params, enc_key.as_ref(), |token| {
+                mgr.generate_chat(&key, &messages, &tool_specs, &tool_choice, &params, enc_key.as_ref(), |token| {
                     if has_tools {
                         output.push_str(token);
                         return true;
@@ -440,20 +423,19 @@ impl Spindll for SpindllService {
         let req = request.into_inner();
         tracing::Span::current().record("model", req.model.as_str());
 
-        if self.manager.is_loaded(&req.model) {
+        let resolved = self.model_store
+            .resolve(&req.model)
+            .map_err(|e| Status::not_found(e.to_string()))?;
+
+        // Residency is keyed on the canonical name — checking the alias here
+        // would miss a resident model and load the same weights a second time.
+        if self.manager.is_loaded(&resolved.key) {
             return Ok(Response::new(LoadResponse {
                 success: true,
-                message: format!("{} already loaded", req.model),
+                message: format!("{} already loaded", resolved.key),
                 already_loaded: true,
             }));
         }
-
-        let model_path = self.model_store
-            .resolve_model_path(&req.model)
-            .map_err(|e| Status::not_found(e.to_string()))?;
-        let digest = self.model_store
-            .resolve_model_digest(&req.model)
-            .unwrap_or_default();
 
         let gpu_layers = if req.gpu_layers < 0 { None } else { Some(req.gpu_layers as u32) };
 
@@ -468,24 +450,28 @@ impl Spindll for SpindllService {
             Some(std::time::Duration::from_secs(req.idle_reload_secs as u64))
         };
 
-        self.manager
-            .load_model_with_options(
-                &req.model,
-                &model_path,
-                LoadOptions {
-                    gpu_layers,
-                    digest,
-                    priority,
-                    idle_reload,
-                    #[cfg(feature = "vision")]
-                    mmproj_path: self.model_store.resolve_mmproj_path(&req.model).unwrap_or(None),
-                },
-            )
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let manager = self.manager.clone();
+        let key = resolved.key.clone();
+        let opts = LoadOptions {
+            gpu_layers,
+            digest: resolved.digest,
+            priority,
+            idle_reload,
+            #[cfg(feature = "vision")]
+            mmproj_path: resolved.mmproj_path,
+        };
+
+        // Minutes of blocking mmap + GPU upload; keep it off the async worker.
+        tokio::task::spawn_blocking(move || {
+            manager.load_model_with_options(&key, &resolved.path, opts)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("load task failed: {e}")))?
+        .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(LoadResponse {
             success: true,
-            message: format!("loaded {}", req.model),
+            message: format!("loaded {}", resolved.key),
             already_loaded: false,
         }))
     }
@@ -497,8 +483,18 @@ impl Spindll for SpindllService {
     ) -> Result<Response<UnloadResponse>, Status> {
         let req = request.into_inner();
         tracing::Span::current().record("model", req.model.as_str());
-        self.manager
-            .unload_model(&req.model)
+
+        // Resolve the alias the same way `load` does; a name the registry
+        // doesn't know is still tried verbatim so a model loaded from outside
+        // the registry stays unloadable.
+        let alias = req.model;
+        let key = self.model_store.resolve_key(&alias).unwrap_or_else(|_| alias.clone());
+        let manager = self.manager.clone();
+
+        // unload re-warms the RAM cache, reading the whole model file.
+        tokio::task::spawn_blocking(move || manager.unload_model_or_alias(&key, &alias))
+            .await
+            .map_err(|e| Status::internal(format!("unload task failed: {e}")))?
             .map_err(|e| Status::not_found(e.to_string()))?;
 
         Ok(Response::new(UnloadResponse { success: true }))
@@ -517,15 +513,10 @@ impl Spindll for SpindllService {
         // The closure returns Result<_, tonic::Status>; Status is large by design.
         #[allow(clippy::result_large_err)]
         let result = tokio::task::spawn_blocking(move || {
-            // Auto-load the model if not already loaded.
-            if !mgr.is_loaded(&req.model) {
-                let path = store
-                    .resolve_model_path(&req.model)
-                    .map_err(|e| Status::not_found(format!("model '{}' not found in store: {e}", req.model)))?;
-                let digest = store.resolve_model_digest(&req.model).unwrap_or_default();
-                mgr.load_model_with_digest(&req.model, &path, None, digest)
-                    .map_err(|e| Status::internal(format!("failed to load model '{}': {e}", req.model)))?;
-            }
+            // Auto-load if absent; the key it comes back under is the one the
+            // manager knows, which is not always the name the client sent.
+            let key = crate::engine::ensure_loaded(&mgr, &store, &req.model)
+                .map_err(|e| Status::not_found(format!("model '{}': {e}", req.model)))?;
 
             let messages: Vec<_> = req.messages.iter()
                 .map(|m| (m.role.clone(), m.content.clone()))
@@ -545,7 +536,7 @@ impl Spindll for SpindllService {
 
             let stats = mgr
                 .generate_chat(
-                    &req.model,
+                    &key,
                     &messages,
                     &[],
                     &crate::engine::tools::ToolChoice::None,

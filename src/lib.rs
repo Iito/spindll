@@ -57,7 +57,11 @@ pub mod grpc;
 pub mod backend;
 #[cfg(feature = "http")]
 pub mod http;
+// Both dialects are axum routers layered onto `http`'s state — they cannot
+// build without it.
+#[cfg(feature = "http")]
 mod http_anthropic;
+#[cfg(feature = "http")]
 mod http_responses;
 
 /// Auto-generated protobuf types for the spindll gRPC protocol.

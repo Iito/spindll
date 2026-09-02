@@ -46,8 +46,31 @@ enum Commands {
         purge: bool,
     },
 
+    /// Load a model into memory on the running server
+    Load {
+        /// Model name (any form `spindll list` prints)
+        model: String,
+
+        /// gRPC port of the running server (default: from the server lockfile)
+        #[arg(long)]
+        port: Option<u16>,
+    },
+
+    /// Unload a model from memory on the running server (keeps it on disk)
+    Unload {
+        /// Model name (any form `spindll list` prints)
+        model: String,
+
+        /// gRPC port of the running server (default: from the server lockfile)
+        #[arg(long)]
+        port: Option<u16>,
+    },
+
     /// Start the gRPC server (models loaded dynamically via Load RPC)
     Serve {
+        /// Model to load immediately after the server starts (optional)
+        model: Option<String>,
+
         /// Port to listen on
         #[arg(long, default_value = "50051")]
         port: u16,
@@ -84,8 +107,12 @@ enum Commands {
         #[arg(long, default_value = "0")]
         batch_slots: usize,
 
-        /// RAM cache for recently-evicted models (e.g. "8G", default 4G when enabled)
-        #[arg(long)]
+        /// RAM cache for recently-evicted models (e.g. --ram-cache=8G, default 4G when enabled)
+        ///
+        /// `require_equals` keeps the optional value from swallowing the
+        /// positional model name: without it `serve --ram-cache mymodel`
+        /// parses the model as the cache size and preloads nothing.
+        #[arg(long, require_equals = true)]
         ram_cache: Option<Option<String>>,
 
         /// HTTP/SSE server port (requires --features http, 0 = disabled)
@@ -200,6 +227,43 @@ enum Commands {
         #[arg(long)]
         port: Option<u16>,
     },
+}
+
+/// gRPC port for the client subcommands: explicit flag, else the running
+/// server's lockfile.
+///
+/// The lockfile is read only when no flag was given — reading it unlinks a
+/// stale entry as a side effect, which a command told exactly where to connect
+/// has no business triggering. There is deliberately no default port: guessing
+/// one sends a mutating request at whatever else happens to be listening.
+fn server_grpc_port(flag: Option<u16>) -> anyhow::Result<u16> {
+    if let Some(p) = flag {
+        return Ok(p);
+    }
+    match spindll::lockfile::Lockfile::read() {
+        Some(lock) => Ok(lock.grpc_port),
+        None => anyhow::bail!("no running server found (no lockfile); specify --port"),
+    }
+}
+
+/// Connect to a running server's gRPC endpoint.
+///
+/// gRPC rather than HTTP because the service is compiled into every build,
+/// while `http` is optional: `spindll load` has to work on a `--features cli`
+/// binary and on a server started with `--http-port 0`. It also gets a typed
+/// response, so a stranger answering on the port fails the handshake instead of
+/// being mistaken for success.
+async fn connect_server(
+    port: u16,
+) -> anyhow::Result<spindll::proto::spindll_client::SpindllClient<tonic::transport::Channel>> {
+    spindll::proto::spindll_client::SpindllClient::connect(format!("http://127.0.0.1:{port}"))
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot reach a spindll server on 127.0.0.1:{port} — \
+                 start one with `spindll serve` ({e})"
+            )
+        })
 }
 
 /// Parse a human-readable size like "2G", "512M" into bytes. Defaults to 2GB.
@@ -446,7 +510,33 @@ async fn main() -> anyhow::Result<()> {
             let store = spindll::model_store::ModelStore::new(None);
             store.remove(&model, purge)?;
         }
+        Commands::Load { model, port } => {
+            let port = server_grpc_port(port)?;
+            let resp = connect_server(port)
+                .await?
+                .load(spindll::proto::LoadRequest {
+                    model: model.clone(),
+                    gpu_layers: -1, // -1 = let the server decide
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("load failed: {}", e.message()))?
+                .into_inner();
+            // The server reports the canonical name it loaded under, which is
+            // the name to use for unload and in API requests.
+            println!("{}", resp.message);
+        }
+        Commands::Unload { model, port } => {
+            let port = server_grpc_port(port)?;
+            connect_server(port)
+                .await?
+                .unload(spindll::proto::UnloadRequest { model: model.clone() })
+                .await
+                .map_err(|e| anyhow::anyhow!("unload failed: {}", e.message()))?;
+            println!("unloaded {model}");
+        }
         Commands::Serve {
+            model,
             port,
             ctx_size,
             gpu_layers,
@@ -520,6 +610,35 @@ async fn main() -> anyhow::Result<()> {
 
             let manager = manager.into_arc();
             let store = std::sync::Arc::new(spindll::model_store::ModelStore::new(None));
+
+            // Preload before anything binds. Loading after the ports are open
+            // races inbound requests: `auto_load` sees the model as absent
+            // until the very end of the load and starts a second copy of the
+            // same weights, doubling peak memory against a one-model budget.
+            // Serving only once the model is ready also means a failure is
+            // fatal and visible, instead of a warm-looking server with nothing
+            // in it.
+            if let Some(name) = &model {
+                let resolved = store.resolve(name)?;
+                println!("preloading {} ...", resolved.key);
+                let mgr = manager.clone();
+                let key = resolved.key.clone();
+                tokio::task::spawn_blocking(move || {
+                    mgr.load_model_with_options(
+                        &key,
+                        &resolved.path,
+                        spindll::engine::LoadOptions {
+                            digest: resolved.digest,
+                            #[cfg(feature = "vision")]
+                            mmproj_path: resolved.mmproj_path,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("preload task failed: {e}"))??;
+                println!("{} ready", resolved.key);
+            }
 
             #[cfg(feature = "http")]
             if http_port > 0 {
@@ -897,22 +1016,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Status { port } => {
-            let port = match port {
-                Some(p) => p,
-                None => match spindll::lockfile::Lockfile::read() {
-                    Some(lf) => lf.grpc_port,
-                    None => {
-                        anyhow::bail!("no running server found (no lockfile); specify --port")
-                    }
-                },
-            };
-            let addr = format!("http://localhost:{port}");
-            let mut client =
-                spindll::proto::spindll_client::SpindllClient::connect(addr)
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("cannot connect to server on port {port}: {e}")
-                    })?;
+            let port = server_grpc_port(port)?;
+            let mut client = connect_server(port).await?;
 
             let resp = client
                 .status(spindll::proto::StatusRequest {})
@@ -981,6 +1086,40 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grpc_port_flag_wins_without_touching_the_lockfile() {
+        // Reading the lockfile unlinks stale entries, so a command told which
+        // port to use must not consult it at all.
+        assert_eq!(server_grpc_port(Some(9999)).unwrap(), 9999);
+    }
+
+    /// `serve --ram-cache <model>` must not bind the model name to the flag.
+    #[test]
+    fn ram_cache_does_not_swallow_the_positional_model() {
+        use clap::Parser;
+
+        // Bare flag + positional: the cache takes its default, the model binds
+        // to the positional. Without require_equals the name became the size.
+        let cli = Cli::try_parse_from(["spindll", "serve", "--ram-cache", "qwen3:8b"]).unwrap();
+        match cli.command {
+            Commands::Serve { model, ram_cache, .. } => {
+                assert_eq!(model.as_deref(), Some("qwen3:8b"));
+                assert_eq!(ram_cache, Some(None), "flag present, value defaulted");
+            }
+            _ => panic!("expected serve"),
+        }
+
+        // Explicit size still reaches the flag.
+        let cli = Cli::try_parse_from(["spindll", "serve", "--ram-cache=8G", "qwen3:8b"]).unwrap();
+        match cli.command {
+            Commands::Serve { model, ram_cache, .. } => {
+                assert_eq!(model.as_deref(), Some("qwen3:8b"));
+                assert_eq!(ram_cache, Some(Some("8G".to_string())));
+            }
+            _ => panic!("expected serve"),
+        }
+    }
 
     #[test]
     fn manager_memory_budget_zero_passthrough() {

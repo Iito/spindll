@@ -20,8 +20,10 @@ cargo clippy --features "$FEATS" || echo "WARN: clippy red — see docs/PUNCHLIS
 
 # Fast unit subset: all lib tests (currently only `scheduler::budget` and
 # `model_store::registry` have #[cfg(test)] blocks, so this stays cheap).
-echo "==> cargo test --features $FEATS --lib"
-cargo test --features "$FEATS" --lib
+# --bins as well as --lib: the CLI's own #[cfg(test)] blocks live in the
+# `spindll` bin target, which `--lib` alone silently skips.
+echo "==> cargo test --features $FEATS --lib --bins"
+cargo test --features "$FEATS" --lib --bins
 
 ELAPSED=$(( $(date +%s) - START ))
 echo "==> ratchet green in ${ELAPSED}s"

@@ -40,6 +40,19 @@ pub struct ModelStore {
     base_dir: PathBuf,
 }
 
+/// A user-supplied model name resolved against the registry. See
+/// [`ModelStore::resolve`].
+#[derive(Debug, Clone)]
+pub struct ResolvedModel {
+    /// Canonical registry key — the name to load, unload, and report under.
+    pub key: String,
+    pub path: PathBuf,
+    pub digest: String,
+    pub format: registry::ModelFormat,
+    #[cfg(feature = "vision")]
+    pub mmproj_path: Option<PathBuf>,
+}
+
 impl ModelStore {
     /// Create a store rooted at the given directory, or `~/.spindll` if `None`.
     pub fn new(base_dir: Option<PathBuf>) -> Self {
@@ -439,6 +452,30 @@ impl ModelStore {
             }
 
         Ok(None)
+    }
+
+    /// Everything a load needs about a model, from one registry read.
+    ///
+    /// Callers must load and unload under [`ResolvedModel::key`], never the
+    /// string the user typed: the alias `llama3.1:8b` and the canonical id
+    /// `/v1/models` advertises have to name the same resident model, or the
+    /// same weights end up loaded twice under two keys.
+    pub fn resolve(&self, model: &str) -> anyhow::Result<ResolvedModel> {
+        let key = self.resolve_key(model)?;
+        let reg = registry::Registry::load(&self.registry_path())?;
+        let entry = &reg.models[&key];
+
+        let path = std::fs::canonicalize(&entry.path)
+            .map_err(|_| anyhow::anyhow!("model file missing: {}", entry.path.display()))?;
+
+        Ok(ResolvedModel {
+            digest: entry.digest.clone(),
+            format: entry.format.clone(),
+            #[cfg(feature = "vision")]
+            mmproj_path: self.resolve_mmproj_path(&key).unwrap_or(None),
+            key,
+            path,
+        })
     }
 
     /// Import all models from Ollama's local storage.
@@ -1155,6 +1192,43 @@ mod tests {
 
         let resolved = store.resolve_key("llama3.1:8b").unwrap();
         assert_eq!(resolved, "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit");
+    }
+
+    /// An alias must resolve to the canonical key, so callers register the
+    /// model under the same name `/v1/models` advertises instead of loading a
+    /// second copy under the alias.
+    #[test]
+    fn resolve_returns_the_canonical_key_for_an_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(store.models_dir()).unwrap();
+        // resolve() canonicalizes, so the entry needs a real path on disk.
+        let model_dir = store.models_dir().join("mlx-community/Meta-Llama-3.1-8B-Instruct-4bit");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let mut entry =
+            mlx_entry("mlx-community/Meta-Llama-3.1-8B-Instruct-4bit", "llama3.1-8b");
+        entry.path = model_dir;
+        write_entry(
+            &store.registry_path(),
+            "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
+            entry,
+        );
+
+        let resolved = store.resolve("llama3.1:8b").unwrap();
+        assert_eq!(resolved.key, "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit");
+        assert!(resolved.path.exists());
+        // Resolving the canonical key is a fixed point.
+        assert_eq!(store.resolve(&resolved.key).unwrap().key, resolved.key);
+    }
+
+    #[test]
+    fn resolve_reports_an_unknown_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(store.models_dir()).unwrap();
+
+        let err = store.resolve("nope:7b").unwrap_err().to_string();
+        assert!(err.contains("not found in registry"), "got: {err}");
     }
 
     /// Regression: MLX entry uses remove_dir_all (remove_file errors on dirs).

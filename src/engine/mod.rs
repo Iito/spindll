@@ -4,6 +4,7 @@
 //! Inference engine — model loading, text generation, KV caching, and metrics.
 
 pub mod batch;
+pub mod cache_policy;
 pub(crate) mod chat_template;
 #[cfg(feature = "grammar")]
 pub(crate) mod grammar;
@@ -15,10 +16,12 @@ pub mod metrics;
 pub mod multimodal;
 pub mod ram_cache;
 pub mod reasoning;
+pub mod residency;
 pub mod streaming;
 pub mod tools;
 
 pub use batch::{BatchEvent, BatchRequest, BatchScheduler};
+pub use cache_policy::{CachePolicy, Decision, RecomputeReason, TierProfile};
 pub use kv_cache::KvCache;
 pub use kv_ram_cache::KvRamCache;
 pub use manager::{EvictionPriority, LoadOptions, ModelManager};
@@ -26,6 +29,7 @@ pub use metrics::Metrics;
 #[cfg(feature = "vision")]
 pub use multimodal::{ContentPart, MultimodalMessage};
 pub use ram_cache::RamCache;
+pub use residency::{ensure_loaded, resident_key};
 pub use streaming::{GenerateParams, GenerateResult};
 pub use tools::{ToolCall, ToolChoice, ToolSpec};
 
