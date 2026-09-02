@@ -291,10 +291,13 @@ impl MlxSwiftEngine {
             result
         });
 
-        let mut completion_tokens = 0u32;
+        // The bridge returns the number of tokens it actually sampled; count
+        // chunks here only to drive `on_token`. A detokenizer chunk is not a
+        // token — a token that does not complete a codepoint yields no chunk at
+        // all — so counting chunks under-reports the budget spent, and
+        // `oai_finish_reason` then reads a real cap hit as "stop". See #81.
         for token in &rx {
             if token.is_empty() { continue; }
-            completion_tokens += 1;
             if !on_token(&token) { break; }
         }
         drop(rx);
@@ -311,7 +314,11 @@ impl MlxSwiftEngine {
             );
         }
 
-        Ok(GenerateResult { prompt_tokens: 0, completion_tokens, cache_hit: false })
+        Ok(GenerateResult {
+            prompt_tokens: 0,
+            completion_tokens: raw_result as u32,
+            cache_hit: false,
+        })
     }
 
     /// Generate tokens from `prompt`, calling `on_token` for each text chunk.
@@ -383,14 +390,16 @@ impl MlxSwiftEngine {
             result
         });
 
-        let mut completion_tokens = 0u32;
+        // The bridge returns the number of tokens it actually sampled; count
+        // chunks here only to drive `on_token`. A detokenizer chunk is not a
+        // token — a token that does not complete a codepoint yields no chunk at
+        // all — so counting chunks under-reports the budget spent, and
+        // `oai_finish_reason` then reads a real cap hit as "stop". See #81.
         for token in &rx {
-            // The Swift bridge emits an empty string as the EOS indicator;
-            // skip it so completion_tokens reflects actual content tokens only.
+            // The Swift bridge emits an empty string as the EOS indicator.
             if token.is_empty() {
                 continue;
             }
-            completion_tokens += 1;
             if !on_token(&token) {
                 // Dropping rx causes the next send() to fail, making the callback
                 // return 0 and signalling Swift to stop generation.
@@ -409,7 +418,7 @@ impl MlxSwiftEngine {
 
         Ok(GenerateResult {
             prompt_tokens:     0,
-            completion_tokens,
+            completion_tokens: raw_result as u32,
             cache_hit:         false,
         })
     }
@@ -537,10 +546,13 @@ impl MlxSwiftEngine {
             result
         });
 
-        let mut completion_tokens = 0u32;
+        // The bridge returns the number of tokens it actually sampled; count
+        // chunks here only to drive `on_token`. A detokenizer chunk is not a
+        // token — a token that does not complete a codepoint yields no chunk at
+        // all — so counting chunks under-reports the budget spent, and
+        // `oai_finish_reason` then reads a real cap hit as "stop". See #81.
         for token in &rx {
             if token.is_empty() { continue; }
-            completion_tokens += 1;
             if !on_token(&token) { break; }
         }
         drop(rx);
@@ -559,7 +571,11 @@ impl MlxSwiftEngine {
             );
         }
 
-        Ok(GenerateResult { prompt_tokens: prompt_tokens_estimate, completion_tokens, cache_hit: false })
+        Ok(GenerateResult {
+            prompt_tokens: prompt_tokens_estimate,
+            completion_tokens: raw_result as u32,
+            cache_hit: false,
+        })
     }
 }
 
