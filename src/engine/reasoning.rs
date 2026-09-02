@@ -179,6 +179,9 @@ pub struct ReasoningCollector {
     content: String,
     reasoning_pieces: u32,
     content_pieces: u32,
+    /// Pieces the splitter withheld while deciding whether their bytes begin a
+    /// delimiter. Attributed once the text resolves to one side or the other.
+    pending_pieces: u32,
 }
 
 impl ReasoningCollector {
@@ -189,17 +192,31 @@ impl ReasoningCollector {
             content: String::new(),
             reasoning_pieces: 0,
             content_pieces: 0,
+            pending_pieces: 0,
         }
     }
 
     pub fn push(&mut self, piece: &str) {
         let (r, c) = self.splitter.push(piece);
+
+        // A withheld piece emits nothing yet but was still a sampled token.
+        // Counting only pieces that produced text under-reports reasoning, and
+        // `completion_tokens - reasoning_tokens` then looks like answer tokens
+        // that were generated and thrown away. That arithmetic is what #81 read
+        // as dropped content.
+        if r.is_empty() && c.is_empty() {
+            if !piece.is_empty() {
+                self.pending_pieces += 1;
+            }
+            return;
+        }
+
         if !r.is_empty() {
-            self.reasoning_pieces += 1;
+            self.reasoning_pieces += 1 + std::mem::take(&mut self.pending_pieces);
             self.reasoning.push_str(&r);
         }
         if !c.is_empty() {
-            self.content_pieces += 1;
+            self.content_pieces += 1 + std::mem::take(&mut self.pending_pieces);
             self.content.push_str(&c);
         }
     }
@@ -207,12 +224,22 @@ impl ReasoningCollector {
     pub fn finish(mut self) -> SplitOutput {
         let (r, c) = self.splitter.finish();
         if !r.is_empty() {
-            self.reasoning_pieces += 1;
+            self.reasoning_pieces += 1 + std::mem::take(&mut self.pending_pieces);
             self.reasoning.push_str(&r);
         }
         if !c.is_empty() {
-            self.content_pieces += 1;
+            self.content_pieces += 1 + std::mem::take(&mut self.pending_pieces);
             self.content.push_str(&c);
+        }
+        // Nothing flushed at all: attribute the stragglers to whichever side
+        // actually saw text, so no sampled token goes unaccounted for.
+        if self.pending_pieces > 0 {
+            let pending = std::mem::take(&mut self.pending_pieces);
+            if self.content.is_empty() {
+                self.reasoning_pieces += pending;
+            } else {
+                self.content_pieces += pending;
+            }
         }
 
         // Retroactive forced-open recovery: no reasoning was recognized, but
@@ -369,15 +396,45 @@ mod tests {
 
     #[test]
     fn collector_counts_pieces_per_side() {
+        let pieces = ["<think>", "a", "b", "</think>", "x", "y"];
         let mut c = ReasoningCollector::new(false);
-        for p in ["<think>", "a", "b", "</think>", "x", "y"] {
+        for p in pieces {
             c.push(p);
         }
         let out = c.finish();
         assert_eq!(out.reasoning.as_deref(), Some("ab"));
         assert_eq!(out.content, "xy");
-        assert_eq!(out.reasoning_pieces, 2);
-        assert_eq!(out.content_pieces, 2);
+        // Delimiters are sampled tokens too, so they count. `<think>` lands on
+        // reasoning; `</think>` is attributed to the side that follows it,
+        // which costs one token of precision and buys the invariant below.
+        assert_eq!(out.reasoning_pieces, 3);
+        assert_eq!(out.content_pieces, 3);
+    }
+
+    #[test]
+    fn every_piece_is_accounted_for_on_one_side_or_the_other() {
+        // The property #81 turned on: with pieces going uncounted whenever the
+        // splitter withheld them, `completion_tokens - reasoning_tokens` left a
+        // phantom remainder that read as answer tokens generated and discarded.
+        for (forced, pieces) in [
+            (false, &["<think>", "a", "b", "</think>", "x", "y"][..]),
+            (false, &["<think>", "never closed"][..]),
+            (true, &["mid", "thought", "</think>", "\n\n", "answer"][..]),
+            (true, &["</th", "ink>", "answer"][..]),
+            (false, &["no tags at all"][..]),
+            (false, &["<thi", "nk>", "r", "</thi", "nk>", "c"][..]),
+        ] {
+            let mut c = ReasoningCollector::new(forced);
+            for p in pieces {
+                c.push(p);
+            }
+            let out = c.finish();
+            assert_eq!(
+                out.reasoning_pieces + out.content_pieces,
+                pieces.len() as u32,
+                "unaccounted pieces for {pieces:?} (forced_open={forced})"
+            );
+        }
     }
 
     #[test]

@@ -1865,7 +1865,11 @@ pub(crate) mod tests {
         assert_eq!(msg["reasoning_content"], "why");
         assert_eq!(msg["content"], "hi");
         assert_eq!(json["choices"][0]["finish_reason"], "stop");
-        assert_eq!(json["usage"]["completion_tokens_details"]["reasoning_tokens"], 1);
+        // `<think>` and "why" both cost a token, so reasoning is 2 of the 5.
+        assert_eq!(json["usage"]["completion_tokens_details"]["reasoning_tokens"], 2);
+        // #81: reasoning must never under-report, or the remainder against
+        // completion_tokens looks like answer tokens that were thrown away.
+        assert_eq!(json["usage"]["completion_tokens"], 5);
     }
 
     #[tokio::test]
