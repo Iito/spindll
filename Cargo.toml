@@ -13,6 +13,11 @@ name = "spindll"
 path = "src/main.rs"
 required-features = ["cli"]
 
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+required-features = ["cli"]
+
 
 [features]
 # cli adds the standalone binary extras (argument parsing, pretty logging).
