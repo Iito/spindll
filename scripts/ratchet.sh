@@ -11,12 +11,12 @@ START=$(date +%s)
 echo "==> cargo check --features $FEATS"
 cargo check --features "$FEATS"
 
-# Clippy is currently warn-only until the pre-existing 13 lints on `main` are
-# resolved (tracked in docs/PUNCHLIST.md as the "[meta] clippy clean baseline" item).
-# Once that lands, change `|| true` -> `|| { echo "clippy red"; exit 1; }` and
-# upgrade to `-D warnings`.
-echo "==> cargo clippy --features $FEATS"
-cargo clippy --features "$FEATS" || echo "WARN: clippy red — see docs/PUNCHLIST.md '[meta] clippy clean baseline'" >&2
+# --all-targets so #[cfg(test)] code is linted too, not just the build; --locked
+# so a stale Cargo.lock cannot pass the gate. Deliberately NOT --all-features:
+# cuda/vulkan/metal are mutually exclusive GPU backends, and enabling cuda makes
+# llama-cpp-sys-2's build script fail without a CUDA toolchain installed.
+echo "==> cargo clippy --features $FEATS --all-targets --locked -- -D warnings"
+cargo clippy --features "$FEATS" --all-targets --locked -- -D warnings
 
 # Fast unit subset: all lib tests (currently only `scheduler::budget` and
 # `model_store::registry` have #[cfg(test)] blocks, so this stays cheap).

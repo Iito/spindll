@@ -10,10 +10,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **`spindll rm` no longer strips vision from a model you kept** — a vision repo ships one projector file shared by every quant variant it holds, and removing any single variant deleted it. The variants you kept stayed listed and loadable but silently lost image support, with nothing left on disk to recover from. The projector is now removed only once no remaining model refers to it.
+- **`spindll rm <repo>` refuses an ambiguous name instead of guessing** — when a repo holds two or more variants, the bare repo name matched whichever entry the registry happened to iterate first, so which model got deleted varied between runs. An ambiguous name now fails with the list of matching models so you can name one exactly; `DELETE /models/{id}` is covered by the same guard. Name resolution is stable overall now, so every command that takes a partial name resolves it identically on every run.
 - **A model is resident under exactly one name** — loading `llama3.1:8b` and requesting `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit` (the id `/v1/models` advertises) put the same weights in memory twice, each counted separately against the eviction budget. Every load path now resolves to the canonical registry key, and `unload` accepts either form.
 - **`/load` and `/unload` no longer block an async worker** — both ran their synchronous work inline, stalling in-flight SSE streams on that thread; unload additionally re-reads the whole model to warm the RAM cache.
 - **The server shuts down on SIGINT/SIGTERM** — nothing handled either signal, so the lockfile survived every ordinary Ctrl-C and the next client command read a dead server's ports out of it. The lockfile is now also only removed by the process that wrote it, so a second `serve` that fails to bind can't erase a healthy server's record.
 - **`spindll serve --ram-cache <model>` no longer swallows the model name** — the optional flag value consumed the positional argument, silently falling back to the default cache size and preloading nothing.
+- **`cargo build --all-targets` works without extra features** — the benchmark client at `src/bin/bench.rs` was picked up as an ordinary binary with no feature gate, so any all-targets build or `cargo clippy --all-targets` on a default-feature checkout failed on missing argument-parsing dependencies. It now declares the `cli` feature it needs and is skipped unless that feature is on.
 - **`cargo build --features cli` compiles again** — the Anthropic and Responses dialect modules were not gated behind the `http` feature they depend on.
 
 ## [0.9.3] - 2026-08-22
