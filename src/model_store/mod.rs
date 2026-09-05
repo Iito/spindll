@@ -339,12 +339,36 @@ impl ModelStore {
     /// Accepted formats (tried in order):
     ///   - Exact registry key:   `ollama/llama3.1/8b.gguf`
     ///   - Ollama name+tag:      `llama3.1:8b`  → `ollama/llama3.1/8b.gguf`
-    ///   - Ollama name only:     `llama3.1`     → first matching `ollama/llama3.1/*.gguf`
-    ///   - HuggingFace repo:     `TheBloke/Llama-3-8B-GGUF` → first matching key
+    ///   - Ollama name only:     `llama3.1`     → preferred `ollama/llama3.1/*.gguf`
+    ///   - HuggingFace repo:     `TheBloke/Llama-3-8B-GGUF` → preferred variant
+    ///
+    /// When a name matches several variants of one repo, the quant the pull
+    /// path would have downloaded wins. Destructive callers must not use this:
+    /// see [`Self::resolve_key_unique`].
     pub fn resolve_key(&self, model: &str) -> anyhow::Result<String> {
-        self.resolve_key_candidates(model)?
+        let candidates = self.resolve_key_candidates(model)?;
+        if candidates.len() < 2 {
+            return candidates
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("model '{model}' not found in registry"));
+        }
+
+        // Several variants of one repo match. Rank them the way `pull` ranks a
+        // repo's files: `QUANT_PRIORITY` puts q4_k_m first and pushes
+        // fp16/bf16/f32 last, because they are research-precision and 3-4x the
+        // size. Picking the lowest-sorting key instead would land `run <repo>`
+        // on `…-bf16.gguf` — the one variant `pull` would never choose. Key
+        // order breaks ties, so the choice stays identical on every run.
+        let reg = registry::Registry::load(&self.registry_path())?;
+        let rank = |key: &String| {
+            reg.models
+                .get(key)
+                .map_or(usize::MAX, |e| download::rank_quant(&e.filename))
+        };
+        candidates
             .into_iter()
-            .next()
+            .min_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)))
             .ok_or_else(|| anyhow::anyhow!("model '{model}' not found in registry"))
     }
 
@@ -370,8 +394,10 @@ impl ModelStore {
     }
 
     /// Every registry key `model` could name, taken from the first naming rule
-    /// that matches anything. Sorted, so a caller that picks one picks the same
-    /// one on every run — `models` is a `HashMap` and its order is not stable.
+    /// that matches anything. Sorted, so the list a caller sees is the same on
+    /// every run — `models` is a `HashMap` and its order is not stable. Sort
+    /// order is presentation only: [`Self::resolve_key`] picks by quant
+    /// preference, not by taking the first element.
     ///
     /// A result longer than one element means the name is ambiguous.
     fn resolve_key_candidates(&self, model: &str) -> anyhow::Result<Vec<String>> {
@@ -475,16 +501,9 @@ impl ModelStore {
                 return Ok(Some(stored.clone()));
             }
 
-        // Auto-discover: scan the model's parent directory.
-        let search_dir = if entry.path.is_dir() {
-            // MLX or directory-based model — scan the model directory itself.
-            entry.path.clone()
-        } else {
-            // GGUF file — scan its parent directory.
-            entry.path.parent().map(|p| p.to_path_buf()).unwrap_or_default()
-        };
-
-        if search_dir.is_dir()
+        // Auto-discover: scan the directory the model lives in.
+        if let Some(search_dir) = projector_search_dir(entry)
+            && search_dir.is_dir()
             && let Some(found) = discover_mmproj(&search_dir) {
                 return Ok(Some(found));
             }
@@ -878,19 +897,32 @@ impl ModelStore {
             // one living outside (imported in place) is not ours to delete.
             //
             // It is also shared: `download.rs` writes one mmproj per repo, so
-            // every quant of that repo records the same path. Deleting it while
-            // another entry still points at it strips vision from a model the
-            // user kept, with nothing on disk left for the discovery fallback
-            // to find. `reg` no longer holds this entry, so any hit is a keeper.
+            // every variant of that repo can use it — the ones recording the
+            // path, and the ones recording `None` that let
+            // `resolve_mmproj_path` discover it by scanning their directory.
+            // A recorded path is therefore not the only kind of reference: any
+            // surviving entry that searches this projector's directory is one
+            // too. Deleting it under either strips vision from a model the user
+            // kept, with nothing on disk left for the fallback to find. `reg`
+            // no longer holds this entry, so any hit is a keeper.
             if let Some(mmproj) = &entry.mmproj_path
                 && mmproj.starts_with(&models_dir)
-                && !reg
-                    .models
-                    .values()
-                    .any(|e| e.mmproj_path.as_deref() == Some(mmproj.as_path()))
+                && !reg.models.values().any(|e| {
+                    e.mmproj_path.as_deref() == Some(mmproj.as_path())
+                        || projector_search_dir(e).as_deref() == mmproj.parent()
+                })
                 && mmproj.symlink_metadata().is_ok()
+                && let Err(err) = std::fs::remove_file(mmproj)
             {
-                std::fs::remove_file(mmproj)?;
+                // Not `?`: the weights are already gone and `reg.save` is still
+                // ahead of us, so returning here would leave the registry
+                // listing a model with no file behind it. Leak the projector
+                // and keep the two consistent — the dir-prune loop below takes
+                // the same way out.
+                eprintln!(
+                    "warning: could not delete projector {}: {err}",
+                    mmproj.display()
+                );
             }
             // Prune directories the deletion emptied (repo dir, then org dir).
             // remove_dir refuses non-empty dirs, so this stops at the first
@@ -917,6 +949,20 @@ impl ModelStore {
             println!("kept {}", key);
         }
         Ok(())
+    }
+}
+
+/// The directory an entry's projector is looked for in: the model directory
+/// itself for MLX, the containing directory for a GGUF file.
+///
+/// [`ModelStore::resolve_mmproj_path`] scans it when an entry records no
+/// `mmproj_path`, so `remove` has to read it as a live reference to whatever
+/// projector sits there. Both callers go through this function; if they drift
+/// apart, `rm` starts deleting projectors that models still use.
+fn projector_search_dir(entry: &registry::ModelEntry) -> Option<PathBuf> {
+    match entry.format {
+        registry::ModelFormat::Mlx => Some(entry.path.clone()),
+        registry::ModelFormat::Gguf => entry.path.parent().map(|p| p.to_path_buf()),
     }
 }
 
@@ -1444,10 +1490,150 @@ mod tests {
         write_entry(&store.registry_path(), "TheBloke/Llama-GGUF/llama-q4_k_m.gguf", e4);
 
         store.remove("TheBloke/Llama-GGUF (q8_0)", false).unwrap();
+        // Asserting only the end state passes with no guard at all: the
+        // projector has to be observed surviving the first removal.
+        assert!(
+            mmproj.exists(),
+            "projector must survive while q4_k_m still references it"
+        );
+
         store.remove("TheBloke/Llama-GGUF (q4_k_m)", false).unwrap();
 
         assert!(!mmproj.exists(), "last reference gone — projector must be deleted");
         assert!(!repo_dir.exists(), "emptied repo dir must be pruned");
+    }
+
+    /// `resolve_mmproj_path` falls back to scanning the model's directory, so a
+    /// variant recording no `mmproj_path` still uses the repo's shared
+    /// projector. Deleting the one entry that records the path must not strip
+    /// vision from that sibling.
+    #[test]
+    fn remove_keeps_projector_a_sibling_discovers_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(store.models_dir()).unwrap();
+
+        let repo_dir = store.models_dir().join("TheBloke/Llama-GGUF");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let q8 = repo_dir.join("llama-q8_0.gguf");
+        let q4 = repo_dir.join("llama-q4_k_m.gguf");
+        let mmproj = repo_dir.join("mmproj-llama-f16.gguf");
+        std::fs::write(&q8, b"a").unwrap();
+        std::fs::write(&q4, b"b").unwrap();
+        std::fs::write(&mmproj, b"p").unwrap();
+
+        let mut e8 = gguf_entry("TheBloke/Llama-GGUF", "llama-q8_0.gguf");
+        e8.path = q8.clone();
+        e8.mmproj_path = Some(mmproj.clone());
+        // `import`, `add_manual` and the GGUF pull path all record `None`.
+        let mut e4 = gguf_entry("TheBloke/Llama-GGUF", "llama-q4_k_m.gguf");
+        e4.path = q4.clone();
+        e4.mmproj_path = None;
+        write_entry(&store.registry_path(), "TheBloke/Llama-GGUF/llama-q8_0.gguf", e8);
+        write_entry(&store.registry_path(), "TheBloke/Llama-GGUF/llama-q4_k_m.gguf", e4);
+
+        store.remove("TheBloke/Llama-GGUF (q8_0)", false).unwrap();
+
+        assert!(
+            mmproj.exists(),
+            "projector the surviving variant discovers on disk must survive"
+        );
+        assert_eq!(
+            store
+                .resolve_mmproj_path("TheBloke/Llama-GGUF/llama-q4_k_m.gguf")
+                .unwrap(),
+            Some(mmproj),
+            "surviving variant must keep vision"
+        );
+    }
+
+    /// A projector that cannot be deleted must not abort the removal before the
+    /// registry is written: the weights are already gone, so an early return
+    /// leaves the registry advertising a model with no file behind it.
+    #[cfg(unix)]
+    #[test]
+    fn remove_saves_registry_when_projector_delete_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(store.models_dir()).unwrap();
+
+        let repo_dir = store.models_dir().join("TheBloke/Llama-GGUF");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let q8 = repo_dir.join("llama-q8_0.gguf");
+        std::fs::write(&q8, b"a").unwrap();
+
+        // Unlink needs write permission on the parent directory, so a projector
+        // in a read-only directory fails to delete while the weight file, in a
+        // writable one, goes away.
+        let locked = store.models_dir().join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        let mmproj = locked.join("mmproj-llama-f16.gguf");
+        std::fs::write(&mmproj, b"p").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // root ignores the mode bits — skip rather than assert a false pass.
+        if std::fs::write(locked.join("probe"), b"x").is_ok() {
+            let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+            return;
+        }
+
+        let key = "TheBloke/Llama-GGUF/llama-q8_0.gguf";
+        let mut e8 = gguf_entry("TheBloke/Llama-GGUF", "llama-q8_0.gguf");
+        e8.path = q8.clone();
+        e8.mmproj_path = Some(mmproj.clone());
+        write_entry(&store.registry_path(), key, e8);
+
+        let result = store.remove("TheBloke/Llama-GGUF (q8_0)", false);
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+
+        assert!(
+            result.is_ok(),
+            "an undeletable projector must not fail the removal: {result:?}"
+        );
+        assert!(!q8.exists(), "weights must be deleted");
+        let reg = Registry::load(&store.registry_path()).unwrap();
+        assert!(
+            !reg.models.contains_key(key),
+            "registry must not list a model whose weights are gone"
+        );
+    }
+
+    /// `spindll run <repo>` must land on the variant the pull path would have
+    /// downloaded, not on whichever filename sorts first.
+    #[test]
+    fn resolve_prefers_quant_priority_over_lexicographic_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(store.models_dir()).unwrap();
+
+        let repo_dir = store.models_dir().join("TheBloke/Llama-GGUF");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        // "llama-bf16.gguf" sorts before "llama-q4_k_m.gguf", but QUANT_PRIORITY
+        // deprioritizes research-precision weights at 3-4x the size.
+        let bf16 = repo_dir.join("llama-bf16.gguf");
+        let q4 = repo_dir.join("llama-q4_k_m.gguf");
+        std::fs::write(&bf16, b"a").unwrap();
+        std::fs::write(&q4, b"b").unwrap();
+
+        let mut ebf = gguf_entry("TheBloke/Llama-GGUF", "llama-bf16.gguf");
+        ebf.path = bf16;
+        let mut e4 = gguf_entry("TheBloke/Llama-GGUF", "llama-q4_k_m.gguf");
+        e4.path = q4.clone();
+        write_entry(&store.registry_path(), "TheBloke/Llama-GGUF/llama-bf16.gguf", ebf);
+        write_entry(&store.registry_path(), "TheBloke/Llama-GGUF/llama-q4_k_m.gguf", e4);
+
+        assert_eq!(
+            store.resolve_key("TheBloke/Llama-GGUF").unwrap(),
+            "TheBloke/Llama-GGUF/llama-q4_k_m.gguf",
+            "bare repo name must resolve to the preferred quant"
+        );
+
+        // The whole load path, not just the key.
+        let resolved = store.resolve("TheBloke/Llama-GGUF").unwrap();
+        assert_eq!(resolved.key, "TheBloke/Llama-GGUF/llama-q4_k_m.gguf");
+        assert_eq!(resolved.path, std::fs::canonicalize(&q4).unwrap());
     }
 
     #[test]
