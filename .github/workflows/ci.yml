@@ -74,8 +74,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Mirrors scripts/ratchet.sh. --all-targets so #[cfg(test)] code is linted
+      # too, not just the build; --locked so a stale Cargo.lock cannot pass; and
+      # -D warnings so a lint actually fails the job. Deliberately NOT
+      # --all-features: cuda/vulkan/metal are mutually exclusive GPU backends and
+      # enabling cuda fails llama-cpp-sys-2's build script without a CUDA toolchain.
       - name: Clippy
-        run: cargo clippy --features cli,http
+        run: cargo clippy --features cli,http --all-targets --locked -- -D warnings
 
   vision-feature-check:
     name: vision feature check (${{ matrix.os }})
