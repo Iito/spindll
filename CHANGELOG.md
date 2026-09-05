@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
 - **`/load` and `/unload` no longer block an async worker** — both ran their synchronous work inline, stalling in-flight SSE streams on that thread; unload additionally re-reads the whole model to warm the RAM cache.
 - **The server shuts down on SIGINT/SIGTERM** — nothing handled either signal, so the lockfile survived every ordinary Ctrl-C and the next client command read a dead server's ports out of it. The lockfile is now also only removed by the process that wrote it, so a second `serve` that fails to bind can't erase a healthy server's record.
 - **`spindll serve --ram-cache <model>` no longer swallows the model name** — the optional flag value consumed the positional argument, silently falling back to the default cache size and preloading nothing.
+- **`cargo build --all-targets` works without extra features** — the benchmark client at `src/bin/bench.rs` was picked up as an ordinary binary with no feature gate, so any all-targets build or `cargo clippy --all-targets` on a default-feature checkout failed on missing argument-parsing dependencies. It now declares the `cli` feature it needs and is skipped unless that feature is on.
 - **`cargo build --features cli` compiles again** — the Anthropic and Responses dialect modules were not gated behind the `http` feature they depend on.
 
 ## [0.9.3] - 2026-08-22
