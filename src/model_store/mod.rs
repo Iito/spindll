@@ -342,11 +342,44 @@ impl ModelStore {
     ///   - Ollama name only:     `llama3.1`     → first matching `ollama/llama3.1/*.gguf`
     ///   - HuggingFace repo:     `TheBloke/Llama-3-8B-GGUF` → first matching key
     pub fn resolve_key(&self, model: &str) -> anyhow::Result<String> {
+        self.resolve_key_candidates(model)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("model '{model}' not found in registry"))
+    }
+
+    /// Resolve `model` to exactly one registry key, refusing ambiguous names.
+    ///
+    /// Destructive callers must use this instead of [`Self::resolve_key`]: the
+    /// prefix rules can match several entries, and silently picking one deletes
+    /// a model the user never named.
+    pub fn resolve_key_unique(&self, model: &str) -> anyhow::Result<String> {
+        let candidates = self.resolve_key_candidates(model)?;
+        if candidates.len() > 1 {
+            anyhow::bail!(
+                "'{}' matches {} models — name one exactly:\n  {}",
+                model,
+                candidates.len(),
+                candidates.join("\n  ")
+            );
+        }
+        candidates
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("model '{model}' not found in registry"))
+    }
+
+    /// Every registry key `model` could name, taken from the first naming rule
+    /// that matches anything. Sorted, so a caller that picks one picks the same
+    /// one on every run — `models` is a `HashMap` and its order is not stable.
+    ///
+    /// A result longer than one element means the name is ambiguous.
+    fn resolve_key_candidates(&self, model: &str) -> anyhow::Result<Vec<String>> {
         let reg = registry::Registry::load(&self.registry_path())?;
 
         // 1. Exact match
         if reg.models.contains_key(model) {
-            return Ok(model.to_string());
+            return Ok(vec![model.to_string()]);
         }
 
         // 1b. Display-name form: `<repo> (<quant>)` as printed by `spindll list`
@@ -355,12 +388,13 @@ impl ModelStore {
         if let Some((base, rest)) = model.rsplit_once(" (")
             && let Some(quant) = rest.strip_suffix(')') {
                 let prefix = format!("{base}/");
-                if let Some(key) = reg.models.iter().find_map(|(k, e)| {
+                let matches = sorted_keys(reg.models.iter().filter_map(|(k, e)| {
                     (k.starts_with(&prefix)
                         && download::extract_quant(&e.filename) == Some(quant))
-                        .then(|| k.clone())
-                }) {
-                    return Ok(key);
+                        .then_some(k)
+                }));
+                if !matches.is_empty() {
+                    return Ok(matches);
                 }
             }
 
@@ -368,28 +402,32 @@ impl ModelStore {
         if let Some((name, tag)) = model.split_once(':') {
             let key = format!("ollama/{name}/{tag}.gguf");
             if reg.models.contains_key(&key) {
-                return Ok(key);
+                return Ok(vec![key]);
             }
         }
 
-        // 3. Bare name  →  first ollama/name/*.gguf entry
+        // 3. Bare name  →  ollama/name/*.gguf entries
         let prefix = format!("ollama/{model}/");
-        if let Some(key) = reg.models.keys().find(|k| k.starts_with(&prefix)) {
-            return Ok(key.clone());
+        let matches = sorted_keys(reg.models.keys().filter(|k| k.starts_with(&prefix)));
+        if !matches.is_empty() {
+            return Ok(matches);
         }
 
         // 4. HuggingFace repo prefix
         let hf_prefix = format!("{model}/");
-        if let Some(key) = reg.models.keys().find(|k| k.starts_with(&hf_prefix)) {
-            return Ok(key.clone());
+        let matches = sorted_keys(reg.models.keys().filter(|k| k.starts_with(&hf_prefix)));
+        if !matches.is_empty() {
+            return Ok(matches);
         }
 
         // 5. Match by base_model (finds MLX entries for Ollama-style names)
         let normalized = model.replace([':', ' '], "-");
-        if let Some((key, _)) = reg.models.iter().find(|(_, e)| {
-            !e.base_model.is_empty() && e.base_model.eq_ignore_ascii_case(&normalized)
-        }) {
-            return Ok(key.clone());
+        let matches = sorted_keys(reg.models.iter().filter_map(|(k, e)| {
+            (!e.base_model.is_empty() && e.base_model.eq_ignore_ascii_case(&normalized))
+                .then_some(k)
+        }));
+        if !matches.is_empty() {
+            return Ok(matches);
         }
 
         anyhow::bail!(
@@ -793,7 +831,9 @@ impl ModelStore {
         // Accept every name form `resolve_key` understands — including the
         // `<repo> (<quant>)` display form `spindll list` prints, which users
         // paste straight back into `spindll rm`.
-        let key = self.resolve_key(model)?;
+        // `resolve_key_unique`, not `resolve_key`: a name that prefix-matches
+        // several variants must stop the deletion, not pick one of them.
+        let key = self.resolve_key_unique(model)?;
         let mut reg = registry::Registry::load(&self.registry_path())?;
         let entry = reg.models.remove(&key)
             .ok_or_else(|| anyhow::anyhow!("model '{}' not found", key))?;
@@ -833,10 +873,21 @@ impl ModelStore {
                     registry::ModelFormat::Gguf => std::fs::remove_file(&entry.path)?,
                 }
             }
+            let models_dir = self.models_dir();
             // A projector materialized into the store belongs to this model;
             // one living outside (imported in place) is not ours to delete.
+            //
+            // It is also shared: `download.rs` writes one mmproj per repo, so
+            // every quant of that repo records the same path. Deleting it while
+            // another entry still points at it strips vision from a model the
+            // user kept, with nothing on disk left for the discovery fallback
+            // to find. `reg` no longer holds this entry, so any hit is a keeper.
             if let Some(mmproj) = &entry.mmproj_path
-                && mmproj.starts_with(self.models_dir())
+                && mmproj.starts_with(&models_dir)
+                && !reg
+                    .models
+                    .values()
+                    .any(|e| e.mmproj_path.as_deref() == Some(mmproj.as_path()))
                 && mmproj.symlink_metadata().is_ok()
             {
                 std::fs::remove_file(mmproj)?;
@@ -846,7 +897,7 @@ impl ModelStore {
             // level still holding other variants or an unrelated model.
             let mut dir = entry.path.parent();
             while let Some(d) = dir {
-                if d == self.models_dir() || !d.starts_with(self.models_dir()) {
+                if d == models_dir.as_path() || !d.starts_with(&models_dir) {
                     break;
                 }
                 if std::fs::remove_dir(d).is_err() {
@@ -867,6 +918,17 @@ impl ModelStore {
         }
         Ok(())
     }
+}
+
+/// Collect registry keys into a stable, sorted list.
+///
+/// `Registry::models` is a `HashMap`, so iteration order varies per process.
+/// Anything user-visible — a chosen key, an "ambiguous name" candidate list —
+/// has to be ordered here or it changes run to run.
+fn sorted_keys<'a>(keys: impl Iterator<Item = &'a String>) -> Vec<String> {
+    let mut sorted: Vec<String> = keys.cloned().collect();
+    sorted.sort();
+    sorted
 }
 
 /// True when `dir` holds at least one `*.safetensors` file — single-file
@@ -1328,6 +1390,78 @@ mod tests {
         std::fs::create_dir_all(&repo_dir).unwrap();
         let q8 = repo_dir.join("llama-q8_0.gguf");
         let q4 = repo_dir.join("llama-q4_k_m.gguf");
+        // `download.rs` materializes the projector into the repo dir, not a
+        // per-variant dir, so every quant of the repo shares this one file.
+        let mmproj = repo_dir.join("mmproj-llama-f16.gguf");
+        std::fs::write(&q8, b"a").unwrap();
+        std::fs::write(&q4, b"b").unwrap();
+        std::fs::write(&mmproj, b"p").unwrap();
+
+        let mut e8 = gguf_entry("TheBloke/Llama-GGUF", "llama-q8_0.gguf");
+        e8.path = q8.clone();
+        e8.mmproj_path = Some(mmproj.clone());
+        let mut e4 = gguf_entry("TheBloke/Llama-GGUF", "llama-q4_k_m.gguf");
+        e4.path = q4.clone();
+        e4.mmproj_path = Some(mmproj.clone());
+        write_entry(&store.registry_path(), "TheBloke/Llama-GGUF/llama-q8_0.gguf", e8);
+        write_entry(&store.registry_path(), "TheBloke/Llama-GGUF/llama-q4_k_m.gguf", e4);
+
+        store.remove("TheBloke/Llama-GGUF (q8_0)", false).unwrap();
+
+        assert!(!q8.exists());
+        assert!(q4.exists(), "sibling variant must survive");
+        assert!(
+            mmproj.exists(),
+            "projector the surviving variant still points at must survive"
+        );
+        assert!(repo_dir.exists(), "repo dir still holding a variant must survive");
+    }
+
+    #[test]
+    fn remove_deletes_mmproj_once_no_variant_references_it() {
+        // The other half of the shared-projector rule: the last entry holding a
+        // reference must still clean it up, or the store leaks the file forever.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(store.models_dir()).unwrap();
+
+        let repo_dir = store.models_dir().join("TheBloke/Llama-GGUF");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let q8 = repo_dir.join("llama-q8_0.gguf");
+        let q4 = repo_dir.join("llama-q4_k_m.gguf");
+        let mmproj = repo_dir.join("mmproj-llama-f16.gguf");
+        std::fs::write(&q8, b"a").unwrap();
+        std::fs::write(&q4, b"b").unwrap();
+        std::fs::write(&mmproj, b"p").unwrap();
+
+        let mut e8 = gguf_entry("TheBloke/Llama-GGUF", "llama-q8_0.gguf");
+        e8.path = q8.clone();
+        e8.mmproj_path = Some(mmproj.clone());
+        let mut e4 = gguf_entry("TheBloke/Llama-GGUF", "llama-q4_k_m.gguf");
+        e4.path = q4.clone();
+        e4.mmproj_path = Some(mmproj.clone());
+        write_entry(&store.registry_path(), "TheBloke/Llama-GGUF/llama-q8_0.gguf", e8);
+        write_entry(&store.registry_path(), "TheBloke/Llama-GGUF/llama-q4_k_m.gguf", e4);
+
+        store.remove("TheBloke/Llama-GGUF (q8_0)", false).unwrap();
+        store.remove("TheBloke/Llama-GGUF (q4_k_m)", false).unwrap();
+
+        assert!(!mmproj.exists(), "last reference gone — projector must be deleted");
+        assert!(!repo_dir.exists(), "emptied repo dir must be pruned");
+    }
+
+    #[test]
+    fn remove_refuses_ambiguous_repo_prefix() {
+        // `TheBloke/Llama-GGUF` prefix-matches two registry keys. Picking one by
+        // HashMap iteration order would delete a model the user never named.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(store.models_dir()).unwrap();
+
+        let repo_dir = store.models_dir().join("TheBloke/Llama-GGUF");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let q8 = repo_dir.join("llama-q8_0.gguf");
+        let q4 = repo_dir.join("llama-q4_k_m.gguf");
         std::fs::write(&q8, b"a").unwrap();
         std::fs::write(&q4, b"b").unwrap();
 
@@ -1338,11 +1472,15 @@ mod tests {
         write_entry(&store.registry_path(), "TheBloke/Llama-GGUF/llama-q8_0.gguf", e8);
         write_entry(&store.registry_path(), "TheBloke/Llama-GGUF/llama-q4_k_m.gguf", e4);
 
-        store.remove("TheBloke/Llama-GGUF (q8_0)", false).unwrap();
+        let err = store
+            .remove("TheBloke/Llama-GGUF", false)
+            .expect_err("ambiguous name must not delete anything");
+        let msg = err.to_string();
+        assert!(msg.contains("llama-q8_0.gguf"), "error must list candidates: {msg}");
+        assert!(msg.contains("llama-q4_k_m.gguf"), "error must list candidates: {msg}");
 
-        assert!(!q8.exists());
-        assert!(q4.exists(), "sibling variant must survive");
-        assert!(repo_dir.exists(), "repo dir still holding a variant must survive");
+        assert!(q8.exists(), "no model may be deleted for an ambiguous name");
+        assert!(q4.exists(), "no model may be deleted for an ambiguous name");
     }
 
     #[test]
