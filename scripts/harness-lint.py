@@ -19,6 +19,7 @@ Run: python3 scripts/harness-lint.py
 import json
 import os
 import re
+import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -61,6 +62,13 @@ check(
 
 HARNESS_DIRS = {"scripts", ".claude", "docs", ".github", ".codex", "proto", "src", "bench"}
 
+# Paths the docs name that must NOT exist in a clean checkout. The punchlist and
+# worklog are per-host and untracked on purpose — AGENTS.md's own hard rule says
+# never to commit them — so asserting they exist fails in CI and on every fresh
+# clone, which is exactly what it did until this exemption landed. They get a
+# real check below instead: that nobody has committed them.
+LOCAL_ONLY = {"docs/PUNCHLIST.md", "docs/WORKLOG.md"}
+
 print("== every path AGENTS.md names actually exists ==")
 # Backticked things that look like repo paths: have a slash or a known suffix,
 # no spaces, no glob beyond the skills wildcard.
@@ -80,6 +88,8 @@ for doc in ["AGENTS.md", "REVIEW.md"] + sorted(
         # Only police the harness's own surface. Paths outside it are usually
         # files the docs tell you to *create* (a worktree-local .cargo/config.toml,
         # a param grid), and linting those turns the check into noise.
+        if path in LOCAL_ONLY:
+            continue
         first = path.split("/")[0]
         if "/" in path and first not in HARNESS_DIRS:
             continue
@@ -90,6 +100,21 @@ for doc in ["AGENTS.md", "REVIEW.md"] + sorted(
             continue
         seen.add(key)
         check("%s -> %s" % (doc, path), os.path.exists(path), "referenced but missing")
+
+print("== the per-host files stay per-host ==")
+try:
+    tracked = subprocess.run(
+        ["git", "ls-files", "--"] + sorted(LOCAL_ONLY),
+        capture_output=True, text=True, check=False,
+    ).stdout.split()
+except OSError:
+    tracked = []  # no git here; the CI job and the ratchet both have one
+check(
+    "punchlist and worklog are not committed",
+    not tracked,
+    "tracked: %s — each host keeps its own copy, and a checkout of an older "
+    "commit silently overwrites it" % ", ".join(tracked),
+)
 
 print("== the ratchet does what the docs say it does ==")
 check(
