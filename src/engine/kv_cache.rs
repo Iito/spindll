@@ -315,9 +315,9 @@ mod tests {
 
     /// Reinterpret a byte slice as f32 embeddings.
     fn bytes_to_f32(data: &[u8]) -> Vec<f32> {
-        data.chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect()
+        // as_chunks, not chunks_exact(4): it yields `&[u8; 4]` directly, so the
+        // fallible try_into/unwrap goes away. Both drop a trailing partial chunk.
+        data.as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect()
     }
 
     /// Cosine similarity between two f32 vectors.
