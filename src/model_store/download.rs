@@ -25,10 +25,6 @@ pub(crate) const QUANT_PRIORITY: &[&str] = &[
 /// variant string appears in the filename.
 const FULL_PRECISION: &[&str] = &["fp16", "bf16", "f32"];
 
-/// Extract a quant tag from a GGUF filename, e.g.
-///   "qwen2.5-3b-instruct-q4_k_m.gguf" -> Some("q4_k_m")
-///   "qwen2.5-3b-instruct-fp16-00001-of-00002.gguf" -> Some("fp16")
-///   "model.gguf" -> None
 /// Repo files worth mirroring for an MLX model: weights, configs/tokenizers,
 /// and the standalone `chat_template.jinja` newer repos ship — the template
 /// used to live inside tokenizer_config.json, and without the file the MLX
@@ -42,6 +38,10 @@ fn is_mlx_repo_file(name: &str) -> bool {
         || name.ends_with(".jinja")
 }
 
+/// Extract a quant tag from a GGUF filename, e.g.
+///   "qwen2.5-3b-instruct-q4_k_m.gguf" -> Some("q4_k_m")
+///   "qwen2.5-3b-instruct-fp16-00001-of-00002.gguf" -> Some("fp16")
+///   "model.gguf" -> None
 pub(crate) fn extract_quant(filename: &str) -> Option<&'static str> {
     let lower = filename.to_lowercase();
     QUANT_PRIORITY.iter().chain(FULL_PRECISION.iter()).find(|&q| lower.contains(q)).map(|v| v as _)
