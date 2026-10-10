@@ -38,6 +38,20 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # llama-cpp-2 pulls llama-cpp-sys-2 with default features, and that default is
+  # `common` — so LLAMA_BUILD_COMMON is ON no matter what we declare, and
+  # llama.cpp adds vendor/cpp-httplib, which runs find_package(OpenSSL).
+  #
+  # On macos-26 that half-succeeds: cmake finds libcrypto in the Cellar but no
+  # headers, so OPENSSL_VERSION comes back empty and the OpenSSL::SSL imported
+  # target is never defined — then cpp-httplib links against it and the generate
+  # step dies. Nothing we build uses llama.cpp's HTTP client (LLAMA_CURL=OFF, no
+  # server, no tools; model downloads go through reqwest), so skip the probe and
+  # let cpp-httplib take its "HTTPS support disabled" branch.
+  #
+  # llama-cpp-sys-2's build.rs forwards every CMAKE_*-prefixed env var as a
+  # cache entry, which is why setting this here reaches cmake at all.
+  CMAKE_DISABLE_FIND_PACKAGE_OpenSSL: "ON"
 
 jobs:
   mlx-build:
