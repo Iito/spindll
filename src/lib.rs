@@ -73,6 +73,10 @@ pub mod proto {
     // here to fix; scoped to this module so `-D warnings` keeps its teeth
     // everywhere spindll actually writes code.
     #![allow(clippy::result_large_err)]
+    // Same story, different lint: tonic marks generated client methods
+    // `#[must_use]` while they already return a `#[must_use]` type. Nothing to
+    // fix on our side, so allow it here rather than loosening the gate globally.
+    #![allow(clippy::double_must_use)]
 
     tonic::include_proto!("spindll");
 }
