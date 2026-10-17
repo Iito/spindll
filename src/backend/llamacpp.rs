@@ -4,12 +4,14 @@
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::OnceLock;
+#[cfg(feature = "vision")]
+use std::sync::Mutex;
 
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::LlamaModel;
 #[cfg(feature = "vision")]
 use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText, mtmd_default_marker};
 #[cfg(feature = "vision")]
@@ -20,6 +22,8 @@ use crate::engine::apply_chat_template_with_fallback;
 use crate::engine::tools::{ToolChoice, ToolSpec};
 #[cfg(feature = "vision")]
 use crate::engine::multimodal::{ContentPart, MultimodalMessage};
+#[cfg(feature = "vision")]
+use crate::engine::token_piece;
 use super::traits::{BackendLoadParams, BackendModel, EmbedResult, InferenceBackend};
 
 static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
@@ -176,7 +180,7 @@ impl InferenceBackend for LlamaCppBackend {
                 .map_err(|e| anyhow::anyhow!("failed to init multimodal context: {e}"))?;
             anyhow::ensure!(ctx.support_vision(), "mmproj loaded but model does not support vision");
             tracing::info!(mmproj = %mmproj_path.display(), "vision pipeline initialised");
-            Some(ctx)
+            Some(Mutex::new(ctx))
         } else {
             None
         };
@@ -207,8 +211,10 @@ pub struct LlamaCppModel {
     /// Optional chat-template override loaded from a sidecar `.jinja` file next
     /// to the model. Takes precedence over the GGUF's embedded template.
     chat_template_override: Option<String>,
+    /// Image encoding mutates the projector context and is not thread-safe, so
+    /// concurrent multimodal requests on this model take turns through it.
     #[cfg(feature = "vision")]
-    mtmd_ctx: Option<MtmdContext>,
+    mtmd_ctx: Option<Mutex<MtmdContext>>,
 }
 
 impl LlamaCppModel {
@@ -284,10 +290,7 @@ impl BackendModel for LlamaCppModel {
     }
 
     fn embed(&self, text: &str) -> anyhow::Result<EmbedResult> {
-        let tokens = self
-            .model
-            .str_to_token(text, AddBos::Always)
-            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        let tokens = self.model.vocab().tokenize(text.as_bytes(), true, true); // add_special, parse_special
 
         if tokens.is_empty() {
             anyhow::bail!("empty input produces no tokens");
@@ -316,12 +319,14 @@ impl BackendModel for LlamaCppModel {
 
         let raw = match ctx.embeddings_seq_ith(0) {
             Ok(emb) => emb.to_vec(),
-            Err(llama_cpp_2::EmbeddingsError::NonePoolType) => {
+            // No pooled sequence embedding: the model uses LLAMA_POOLING_TYPE_NONE
+            // (embeddings are always enabled on this context), so take the last
+            // token's embedding instead.
+            Err(_) => {
                 ctx.embeddings_ith(last_idx)
                     .map_err(|e| anyhow::anyhow!("embeddings_ith failed: {e}"))?
                     .to_vec()
             }
-            Err(e) => anyhow::bail!("embeddings_seq_ith failed: {e}"),
         };
 
         let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -349,7 +354,7 @@ impl BackendModel for LlamaCppModel {
         params: &GenerateParams,
         on_token: &mut dyn FnMut(&str) -> bool,
     ) -> anyhow::Result<GenerateResult> {
-        let mtmd_ctx = self.mtmd_ctx.as_ref()
+        let mtmd = self.mtmd_ctx.as_ref()
             .ok_or_else(|| anyhow::anyhow!("model was not loaded with a multimodal projector"))?;
 
         let marker = mtmd_default_marker();
@@ -385,11 +390,16 @@ impl BackendModel for LlamaCppModel {
             self.chat_template_override.as_deref(),
         )?;
 
+        // Hold the projector context from bitmap decode through prompt
+        // evaluation; generation below runs without it.
+        let mut mtmd_ctx = mtmd.lock()
+            .map_err(|_| anyhow::anyhow!("multimodal context lock poisoned"))?;
+
         // Create bitmaps from image bytes.
         let bitmaps: Vec<MtmdBitmap> = image_bytes.iter()
             .map(|data| {
                 // placeholder = false → decode the actual pixels (preserves pre-0.1.150 behavior)
-                MtmdBitmap::from_buffer(mtmd_ctx, data, false)
+                MtmdBitmap::from_buffer(&mtmd_ctx, data, false)
                     .map_err(|e| anyhow::anyhow!("failed to create bitmap: {e}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -417,13 +427,14 @@ impl BackendModel for LlamaCppModel {
 
         // Evaluate all chunks (text + image embeddings) into the context.
         let n_past = chunks.eval_chunks(
-            mtmd_ctx,
-            &ctx,
+            &mut mtmd_ctx,
+            &mut ctx,
             0,                    // n_past
             0,                    // seq_id
             self.n_ctx as i32,    // n_batch
             true,                 // logits_last
         ).map_err(|e| anyhow::anyhow!("multimodal eval failed: {e}"))?;
+        drop(mtmd_ctx);
 
         if params.prefill_only {
             return Ok(GenerateResult {
@@ -441,6 +452,7 @@ impl BackendModel for LlamaCppModel {
             LlamaSampler::dist(params.seed),
         ]);
 
+        let vocab = self.model.vocab();
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut completion_tokens = 0u32;
 
@@ -452,14 +464,12 @@ impl BackendModel for LlamaCppModel {
             let token = sampler.sample(&ctx, -1);
             sampler.accept(token);
 
-            if self.model.is_eog_token(token) {
+            if vocab.is_eog(token) {
                 break;
             }
 
             completion_tokens += 1;
-            let piece = self.model
-                .token_to_piece(token, &mut decoder, true, None)
-                .map_err(|e| anyhow::anyhow!("token decode error: {e}"))?;
+            let piece = token_piece(&vocab, token, &mut decoder);
 
             if !on_token(&piece) {
                 break;

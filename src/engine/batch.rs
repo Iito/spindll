@@ -8,7 +8,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use std::num::NonZeroU32;
@@ -76,6 +76,7 @@ impl BatchScheduler {
         let mut ctx = model
             .new_context(backend, ctx_params)
             .map_err(|e| anyhow::anyhow!("failed to create batch context: {e}"))?;
+        let vocab = model.vocab();
 
         let mut slots: HashMap<i32, Slot> = HashMap::new();
         let mut free_ids: Vec<i32> = (0..max_sequences as i32).rev().collect();
@@ -174,7 +175,7 @@ impl BatchScheduler {
                 let token = slot.sampler.sample(&ctx, bi);
                 slot.sampler.accept(token);
 
-                if model.is_eog_token(token) || slot.completion_tokens >= slot.max_tokens {
+                if vocab.is_eog(token) || slot.completion_tokens >= slot.max_tokens {
                     let _ = slot.response_tx.blocking_send(BatchEvent::Done {
                         prompt_tokens: slot.prompt_tokens,
                         completion_tokens: slot.completion_tokens,
@@ -184,21 +185,11 @@ impl BatchScheduler {
                 }
 
                 slot.completion_tokens += 1;
-                match model.token_to_piece(token, &mut slot.decoder, true, None) {
-                    Ok(piece) => {
-                        if slot.response_tx.blocking_send(BatchEvent::Token(piece)).is_err() {
-                            // Client disconnected.
-                            finished.push(seq_id);
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = slot.response_tx.blocking_send(
-                            BatchEvent::Error(format!("token decode: {e}")),
-                        );
-                        finished.push(seq_id);
-                        continue;
-                    }
+                let piece = super::token_piece(&vocab, token, &mut slot.decoder);
+                if slot.response_tx.blocking_send(BatchEvent::Token(piece)).is_err() {
+                    // Client disconnected.
+                    finished.push(seq_id);
+                    continue;
                 }
 
                 slot.pending_token = Some(token);
@@ -234,23 +225,14 @@ fn try_accept(
         }
     };
 
-    let tokens = match model.str_to_token(&req.prompt, AddBos::Always) {
-        Ok(t) if !t.is_empty() => t,
-        Ok(_) => {
-            let _ = req.response_tx.blocking_send(BatchEvent::Error(
-                "prompt produced no tokens".into(),
-            ));
-            free_ids.push(seq_id);
-            return;
-        }
-        Err(e) => {
-            let _ = req.response_tx.blocking_send(BatchEvent::Error(
-                format!("tokenization failed: {e}"),
-            ));
-            free_ids.push(seq_id);
-            return;
-        }
-    };
+    let tokens = model.vocab().tokenize(req.prompt.as_bytes(), true, true); // add_special, parse_special
+    if tokens.is_empty() {
+        let _ = req.response_tx.blocking_send(BatchEvent::Error(
+            "prompt produced no tokens".into(),
+        ));
+        free_ids.push(seq_id);
+        return;
+    }
 
     let per_seq_ctx = n_ctx / max_sequences.max(1) as u32;
     let (tokens, truncated) = super::streaming::truncate_to_fit(
