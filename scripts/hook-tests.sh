@@ -52,6 +52,15 @@ want 2 "force-push shorthand to next"    'git push -f origin next'
 want 2 "force-with-lease to main"        'git push --force-with-lease origin HEAD:main'
 want 2 "git add -f PUNCHLIST"            'git add -f docs/PUNCHLIST.md'
 want 2 "git add --force .refs"           'git add --force .refs/review/x.md'
+want 2 "push after git -C <dir>"         'git -C /tmp/wt push origin HEAD'
+want 2 "push after git -c <k=v>"         'git -c core.sshCommand=ssh push origin HEAD'
+want 2 "push after --git-dir=<path>"     'git --git-dir=.git push origin HEAD'
+want 2 "push after --work-tree <path>"   'git --work-tree /tmp/wt push'
+want 2 "push after stacked git options"  'git --no-pager -C . -c x.y=z push'
+want 2 "git add -f PUNCHLIST after -C"   'git -C . add -f docs/PUNCHLIST.md'
+want 2 "gh pr create after -R <repo>"    'gh pr -R Iito/spindll create --fill'
+want 2 "gh pr merge after --repo=<repo>" 'gh pr --repo=Iito/spindll merge 86'
+want 2 "gh release create after -R"      'gh release -R Iito/spindll create v9.9.9'
 
 echo "== allowances =="
 want 0 "plain commit"                    'git commit -m "feat: thing"'
@@ -61,6 +70,8 @@ want 0 "add -f on a normal path"         'git add -f target/keep.txt'
 want 0 "cargo build"                     'cargo build --features cli,http'
 want 0 "fetch"                           'git fetch origin'
 want 0 "log"                             'git log --oneline -5'
+want 0 "status after git -C <dir>"       'git -C /tmp/wt status --short'
+want 0 "gh pr list after -R <repo>"      'gh pr -R Iito/spindll list'
 
 echo "== false positives the string-matching version got wrong =="
 want 0 "grep for the phrase git push"    "grep -rn 'git push' docs/"
@@ -71,11 +82,16 @@ EOF"
 want 0 "test name containing next"       'cargo test next_token'
 want 0 "branch named next-thing"         'git checkout -b feat/next-thing'
 want 0 "no-verify inside a quoted docstring" 'echo "never pass --no-verify"'
+want 0 "-C into a directory named push"  'git -C push status'
+want 0 "-c value mentioning push"        'git -c alias.p=push log --oneline -1'
 
 echo "== the lockfile is consumed exactly once =="
 touch "$SPINDLL_PUSH_LOCK"
 want 0 "push with approval"              'git push origin HEAD'
 want 2 "next push needs a fresh touch"   'git push origin HEAD'
+touch "$SPINDLL_PUSH_LOCK"
+want 0 "push after -C with approval"     'git -C /tmp/wt push origin HEAD'
+want 2 "and that consumed it too"        'git -C /tmp/wt push origin HEAD'
 
 echo
 printf 'hook-tests: %d passed, %d failed\n' "$PASS" "$FAIL"

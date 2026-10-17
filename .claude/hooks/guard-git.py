@@ -34,6 +34,15 @@ SEPARATORS = set(";&|()")
 FORCE_FLAGS = {"--force", "-f", "--force-with-lease"}
 PROTECTED = {"main", "next"}
 LOCAL_ONLY = ("PUNCHLIST", "WORKLOG", ".refs")
+# Options that can sit between the command and the subcommand the rules key
+# on, and that take the next token as their value: `git -C <dir> push`,
+# `gh pr -R <repo> create`. Any other leading `-...` token (`--no-pager`,
+# `--git-dir=<path>`) is self-contained.
+GIT_VALUE_OPTS = {
+    "-C", "-c", "--git-dir", "--work-tree", "--namespace",
+    "--config-env", "--super-prefix", "--attr-source",
+}
+GH_VALUE_OPTS = {"-R", "--repo"}
 
 
 def deny(msg):
@@ -87,6 +96,14 @@ def head(seg):
     return None, []
 
 
+def strip_options(args, value_opts):
+    """args with leading options dropped; those in value_opts take the next token too."""
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        i += 2 if args[i] in value_opts else 1
+    return args[i:]
+
+
 def git(*args):
     try:
         return subprocess.run(
@@ -109,14 +126,21 @@ def require_approval(what):
 
 
 def check(cmd, args):
-    argset = set(args)
-
-    if "--no-verify" in argset:
+    if "--no-verify" in args:
         deny(
             "--no-verify is banned. The pre-commit hook enforces this repo's "
             "commit identity, and stepping around it is how the wrong author "
             "lands in history."
         )
+
+    # The rules below key on the subcommand's position, so read it past the
+    # options allowed in front of it. Otherwise `git -C <dir> push` is not a
+    # push and walks straight past the approval gate.
+    if cmd == "git":
+        args = strip_options(args, GIT_VALUE_OPTS)
+    elif cmd == "gh":
+        args = args[:1] + strip_options(args[1:], GH_VALUE_OPTS)
+    argset = set(args)
 
     if cmd == "git" and args[:1] == ["push"]:
         if argset & FORCE_FLAGS:
