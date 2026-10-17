@@ -3,7 +3,6 @@
 
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::AddBos;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::sampling::LlamaSampler;
 
@@ -127,21 +126,19 @@ pub struct GenerateResult {
 ///
 /// Chat templates emit `bos_token` themselves, so the rendered prompt already
 /// starts with `<bos>` (parsed as the BOS token). Tokenizing with
-/// `AddBos::Always` then prepends a *second* BOS. A double BOS degrades output
+/// `add_special` then prepends a *second* BOS. A double BOS degrades output
 /// and, on models whose BOS/EOS differ from the Llama defaults (e.g. Gemma /
 /// Gemma 4), makes the model emit end-of-turn immediately — empty output. We
-/// keep `AddBos::Always` (so raw, non-templated prompts still get a BOS) and
+/// keep `add_special` (so raw, non-templated prompts still get a BOS) and
 /// drop the duplicate when the text already supplied one.
-fn tokenize_prompt(
-    model: &LlamaModel,
-    prompt: &str,
-) -> anyhow::Result<Vec<llama_cpp_2::token::LlamaToken>> {
-    let mut tokens = model.str_to_token(prompt, AddBos::Always)?;
-    let bos = model.token_bos();
+fn tokenize_prompt(model: &LlamaModel, prompt: &str) -> Vec<llama_cpp_2::token::LlamaToken> {
+    let vocab = model.vocab();
+    let mut tokens = vocab.tokenize(prompt.as_bytes(), true, true); // add_special, parse_special
+    let bos = vocab.bos();
     if tokens.len() >= 2 && tokens[0] == bos && tokens[1] == bos {
         tokens.remove(1);
     }
-    Ok(tokens)
+    tokens
 }
 
 /// Generate tokens from a prompt, calling `on_token` for each piece of text produced.
@@ -153,7 +150,7 @@ pub fn generate_streaming(
     params: &GenerateParams,
     mut on_token: impl FnMut(&str) -> bool, // return false to stop
 ) -> anyhow::Result<GenerateResult> {
-    let tokens = tokenize_prompt(model, prompt)?;
+    let tokens = tokenize_prompt(model, prompt);
     if tokens.is_empty() {
         anyhow::bail!("prompt produced no tokens");
     }
@@ -202,6 +199,7 @@ pub fn generate_streaming(
     #[cfg(not(feature = "grammar"))]
     let mut sampler = LlamaSampler::chain_simple(base);
 
+    let vocab = model.vocab();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut n_cur = batch.n_tokens();
     let mut completion_tokens = 0u32;
@@ -212,14 +210,12 @@ pub fn generate_streaming(
         let token = sampler.sample(ctx, batch.n_tokens() - 1);
         sampler.accept(token);
 
-        if model.is_eog_token(token) {
+        if vocab.is_eog(token) {
             break;
         }
 
         completion_tokens += 1;
-        let piece = model
-            .token_to_piece(token, &mut decoder, true, None)
-            .map_err(|e| anyhow::anyhow!("token decode error: {e}"))?;
+        let piece = super::token_piece(&vocab, token, &mut decoder);
 
         if !on_token(&piece) {
             break;
@@ -267,7 +263,7 @@ pub fn generate_streaming_cached(
     encryption_key: Option<&[u8; 32]>,
     mut on_token: impl FnMut(&str) -> bool,
 ) -> anyhow::Result<GenerateResult> {
-    let tokens = tokenize_prompt(model, prompt)?;
+    let tokens = tokenize_prompt(model, prompt);
     if tokens.is_empty() {
         anyhow::bail!("prompt produced no tokens");
     }
@@ -416,6 +412,7 @@ pub fn generate_streaming_cached(
     #[cfg(not(feature = "grammar"))]
     let mut sampler = LlamaSampler::chain_simple(base);
 
+    let vocab = model.vocab();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut n_cur = tokens.len() as i32;
     let mut completion_tokens = 0u32;
@@ -442,14 +439,12 @@ pub fn generate_streaming_cached(
         let token = sampler.sample(ctx, logit_idx);
         sampler.accept(token);
 
-        if model.is_eog_token(token) {
+        if vocab.is_eog(token) {
             break;
         }
 
         completion_tokens += 1;
-        let piece = model
-            .token_to_piece(token, &mut decoder, true, None)
-            .map_err(|e| anyhow::anyhow!("token decode error: {e}"))?;
+        let piece = super::token_piece(&vocab, token, &mut decoder);
 
         if !on_token(&piece) {
             break;

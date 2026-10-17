@@ -37,6 +37,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
+use llama_cpp_2::vocab::LlamaVocab;
 use std::num::NonZeroU32;
 use std::path::Path;
 
@@ -294,8 +295,9 @@ fn try_render_jinja(
     messages: &[(String, String)],
     tools: Option<&serde_json::Value>,
 ) -> anyhow::Result<String> {
-    let bos = special_token_text(model, model.token_bos());
-    let eos = special_token_text(model, model.token_eos());
+    let vocab = model.vocab();
+    let bos = special_token_text(&vocab, vocab.bos());
+    let eos = special_token_text(&vocab, vocab.eos());
 
     match chat_template::render(source, messages, tools, &bos, &eos, true) {
         Ok(rendered) => Ok(rendered),
@@ -315,13 +317,38 @@ fn try_render_jinja(
 }
 
 /// The textual form of a special token (e.g. `<s>`, `<|begin_of_text|>`) for the
-/// Jinja context. `special = true` renders the token's special-token text rather
-/// than plaintext. Empty if the model can't render it.
-fn special_token_text(model: &LlamaModel, token: llama_cpp_2::token::LlamaToken) -> String {
-    let mut decoder = encoding_rs::UTF_8.new_decoder();
-    model
-        .token_to_piece(token, &mut decoder, true, None)
-        .unwrap_or_default()
+/// Jinja context. Empty if the model can't render it.
+fn special_token_text(vocab: &LlamaVocab<'_>, token: llama_cpp_2::token::LlamaToken) -> String {
+    token_piece(vocab, token, &mut encoding_rs::UTF_8.new_decoder())
+}
+
+/// Render `token` as text, special tokens as their special-token text rather
+/// than plaintext. `decoder` holds a UTF-8 sequence split across tokens until
+/// its last byte arrives, so a streaming caller keeps one decoder per sequence.
+pub(crate) fn token_piece(
+    vocab: &LlamaVocab<'_>,
+    token: llama_cpp_2::token::LlamaToken,
+    decoder: &mut encoding_rs::Decoder,
+) -> String {
+    decode_piece(decoder, &vocab.token_to_piece(token, true, None))
+}
+
+/// Decode one token's bytes through `decoder`. Invalid bytes become U+FFFD; an
+/// incomplete trailing sequence stays in the decoder for the next token.
+fn decode_piece(decoder: &mut encoding_rs::Decoder, bytes: &[u8]) -> String {
+    // `decode_to_string` never grows its destination. The decoder's bound also
+    // covers a partial sequence held over from the previous token.
+    let mut out = String::with_capacity(
+        decoder
+            .max_utf8_buffer_length(bytes.len())
+            .expect("token piece too large to decode"),
+    );
+    let (result, read, _) = decoder.decode_to_string(bytes, &mut out, false);
+    debug_assert!(
+        matches!(result, encoding_rs::CoderResult::InputEmpty) && read == bytes.len(),
+        "the capacity bound must let the decoder consume the whole piece"
+    );
+    out
 }
 
 /// llama.cpp's built-in (non-Jinja) formatter: substring-detects the format or
@@ -510,5 +537,40 @@ mod chat_template_tests {
         let msgs = vec![m("user", "Hi"), m("assistant", "Hello")];
         assert_eq!(fold_system_into_user(&msgs), msgs);
         assert!(!has_system_message(&msgs));
+    }
+}
+
+#[cfg(test)]
+mod token_piece_tests {
+    use super::decode_piece;
+
+    #[test]
+    fn char_split_across_pieces_comes_out_whole() {
+        // Byte-fallback vocabs emit "é" (C3 A9) as one token per byte.
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        assert_eq!(decode_piece(&mut decoder, &[0xC3]), "");
+        assert_eq!(decode_piece(&mut decoder, &[0xA9]), "é");
+    }
+
+    #[test]
+    fn four_byte_char_split_three_ways() {
+        // U+1F600 is F0 9F 98 80; the tail piece also carries a plain byte.
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        assert_eq!(decode_piece(&mut decoder, &[0xF0]), "");
+        assert_eq!(decode_piece(&mut decoder, &[0x9F, 0x98]), "");
+        assert_eq!(decode_piece(&mut decoder, &[0x80, b'!']), "\u{1F600}!");
+    }
+
+    #[test]
+    fn invalid_byte_becomes_replacement_char() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        assert_eq!(decode_piece(&mut decoder, &[b'a', 0xFF, b'b']), "a\u{FFFD}b");
+    }
+
+    #[test]
+    fn empty_piece_is_empty_text() {
+        // A token that renders to nothing yields "", not an error.
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        assert_eq!(decode_piece(&mut decoder, &[]), "");
     }
 }
