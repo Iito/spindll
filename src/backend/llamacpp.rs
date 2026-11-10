@@ -133,15 +133,7 @@ impl InferenceBackend for LlamaCppBackend {
         path: &Path,
         params: BackendLoadParams,
     ) -> anyhow::Result<Box<dyn BackendModel>> {
-        let gpu_layers = params.n_gpu_layers.unwrap_or(if cfg!(target_os = "macos")
-            || cfg!(feature = "cuda")
-            || cfg!(feature = "metal")
-            || cfg!(feature = "vulkan")
-        {
-            999
-        } else {
-            0
-        });
+        let gpu_layers = params.n_gpu_layers.unwrap_or(super::default_gpu_layers());
 
         let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
         let model = LlamaModel::load_from_file(shared_backend(), path, &model_params)
