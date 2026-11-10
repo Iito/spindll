@@ -141,9 +141,12 @@ unsafe fn slice_mut<'a, T>(ptr: *mut T, len: usize, what: &str) -> anyhow::Resul
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spindll_scorer_config_default(config: *mut SpindllScorerConfig) {
-    if let Some(config) = unsafe { config.as_mut() } {
-        *config = (&ScorerConfig::default()).into();
-    }
+    guard((), || {
+        if let Some(config) = unsafe { config.as_mut() } {
+            *config = (&ScorerConfig::default()).into();
+        }
+        Ok(())
+    });
 }
 
 #[unsafe(no_mangle)]
@@ -282,13 +285,16 @@ pub unsafe extern "C" fn spindll_scorer_top_next(
             Some(unsafe { slice(allowed, s.scorer.n_vocab(), "allowed") }?)
         };
         let top = s.scorer.top_next(k, allowed)?;
-        let out_tokens = unsafe { slice_mut(tokens, top.len(), "tokens") }?;
-        let out_logprobs = unsafe { slice_mut(logprobs, top.len(), "logprobs") }?;
-        for (i, (token, logprob)) in top.iter().enumerate() {
+        // The caller's arrays hold k entries: size the writes by k, never by
+        // what came back, so a broken promise inside can't write past them.
+        let n = top.len().min(k);
+        let out_tokens = unsafe { slice_mut(tokens, n, "tokens") }?;
+        let out_logprobs = unsafe { slice_mut(logprobs, n, "logprobs") }?;
+        for (i, (token, logprob)) in top.iter().take(n).enumerate() {
             out_tokens[i] = *token;
             out_logprobs[i] = *logprob;
         }
-        Ok(i32::try_from(top.len())?)
+        Ok(i32::try_from(n)?)
     })
 }
 
