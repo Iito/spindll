@@ -13,6 +13,10 @@
 # downloadable component — the guard step fetches it when absent so
 # build.rs's metallib compilation works.
 #
+# The ios-check job lints the library for iPhone and the Simulator: the
+# iOS-only branches (memory budget, lockfile) compile in no other job. It also
+# checks the keyboard-extension build, llama.cpp without Metal.
+#
 # Path-scoped to MLX-relevant changes (incl. mlx_bridge/**, which ci.yml omits)
 # so a Swift-bridge-only change runs ONLY this job, not the Linux/Windows matrix.
 name: CI (macOS)
@@ -88,3 +92,40 @@ jobs:
 
       - name: Test (lib)
         run: cargo test --features cli,http,mlx,vision --lib
+
+  ios-check:
+    name: iOS library check
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: brew install cmake protobuf
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-ios
+
+      - name: Clippy (iPhone)
+        run: cargo clippy --lib --target aarch64-apple-ios -- -D warnings
+
+      - name: Clippy (Simulator)
+        run: cargo clippy --lib --target aarch64-apple-ios-sim -- -D warnings
+
+      # llama.cpp builds Metal in by default on Apple, and its setup costs
+      # 55 MB the moment the backend starts, even on the CPU: most of a
+      # keyboard extension's ~76 MB. llama-cpp-sys-2 forwards GGML_* to CMake.
+      - name: Check without Metal (keyboard build)
+        env:
+          GGML_METAL: "OFF"
+        run: cargo check --lib --target aarch64-apple-ios
