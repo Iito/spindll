@@ -16,3 +16,6 @@ tools/
 
 # Agent run artifacts (review outputs, autoloop trial logs, sessions)
 .refs/
+
+# Built by scripts/build-ios-xcframework.sh
+/ios/SpindllKit/SpindllFFI.xcframework/
