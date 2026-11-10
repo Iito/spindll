@@ -168,6 +168,59 @@ pub struct SplitOutput {
     pub content_pieces: u32,
 }
 
+/// Attributes every fed piece to reasoning or content. The collector and the
+/// streaming path both count through this, so they report the same usage.
+///
+/// Counting only pieces that produced text under-reports reasoning: delimiter
+/// tokens emit nothing, and the splitter withholds pieces while deciding
+/// whether their bytes begin a tag. The shortfall then shows up as
+/// `completion_tokens - reasoning_tokens`, which reads as answer tokens that
+/// were generated and thrown away. That arithmetic is what #81 read as
+/// dropped content.
+#[derive(Debug, Default)]
+pub struct PieceTally {
+    /// Pieces attributed to the think block.
+    pub reasoning: u32,
+    /// Pieces attributed to the visible answer.
+    pub content: u32,
+    /// Pieces fed but not yet attributed: delimiters and withheld bytes.
+    pending: u32,
+}
+
+impl PieceTally {
+    /// Record one fed `piece` and the text the splitter emitted for it.
+    pub fn record(&mut self, piece: &str, reasoning: &str, content: &str) {
+        if !piece.is_empty() {
+            self.pending += 1;
+        }
+        self.settle(reasoning, content);
+    }
+
+    /// Record the splitter's end-of-stream flush. The flush is not a piece of
+    /// its own: it releases bytes of pieces already fed, so it settles what is
+    /// pending without adding one. Whatever is still pending afterwards goes
+    /// to the side that saw text, so no fed piece goes uncounted.
+    pub fn finish(&mut self, reasoning: &str, content: &str) {
+        self.settle(reasoning, content);
+        let pending = std::mem::take(&mut self.pending);
+        if self.content == 0 {
+            self.reasoning += pending;
+        } else {
+            self.content += pending;
+        }
+    }
+
+    fn settle(&mut self, reasoning: &str, content: &str) {
+        // A piece whose text resolves to both sides carries the close tag, so
+        // like a bare `</think>` it goes to the side that follows the tag.
+        if !content.is_empty() {
+            self.content += std::mem::take(&mut self.pending);
+        } else if !reasoning.is_empty() {
+            self.reasoning += std::mem::take(&mut self.pending);
+        }
+    }
+}
+
 /// Accumulating wrapper for the non-streaming paths: feed every piece, then
 /// [`finish`](ReasoningCollector::finish). Because nothing is emitted until
 /// the end, it can also recover the forced-open case *retroactively* when the
@@ -177,11 +230,7 @@ pub struct ReasoningCollector {
     splitter: ReasoningSplitter,
     reasoning: String,
     content: String,
-    reasoning_pieces: u32,
-    content_pieces: u32,
-    /// Pieces the splitter withheld while deciding whether their bytes begin a
-    /// delimiter. Attributed once the text resolves to one side or the other.
-    pending_pieces: u32,
+    tally: PieceTally,
 }
 
 impl ReasoningCollector {
@@ -190,57 +239,24 @@ impl ReasoningCollector {
             splitter: ReasoningSplitter::new(forced_open),
             reasoning: String::new(),
             content: String::new(),
-            reasoning_pieces: 0,
-            content_pieces: 0,
-            pending_pieces: 0,
+            tally: PieceTally::default(),
         }
     }
 
     pub fn push(&mut self, piece: &str) {
         let (r, c) = self.splitter.push(piece);
-
-        // A withheld piece emits nothing yet but was still a sampled token.
-        // Counting only pieces that produced text under-reports reasoning, and
-        // `completion_tokens - reasoning_tokens` then looks like answer tokens
-        // that were generated and thrown away. That arithmetic is what #81 read
-        // as dropped content.
-        if r.is_empty() && c.is_empty() {
-            if !piece.is_empty() {
-                self.pending_pieces += 1;
-            }
-            return;
-        }
-
-        if !r.is_empty() {
-            self.reasoning_pieces += 1 + std::mem::take(&mut self.pending_pieces);
-            self.reasoning.push_str(&r);
-        }
-        if !c.is_empty() {
-            self.content_pieces += 1 + std::mem::take(&mut self.pending_pieces);
-            self.content.push_str(&c);
-        }
+        self.tally.record(piece, &r, &c);
+        self.reasoning.push_str(&r);
+        self.content.push_str(&c);
     }
 
     pub fn finish(mut self) -> SplitOutput {
         let (r, c) = self.splitter.finish();
-        if !r.is_empty() {
-            self.reasoning_pieces += 1 + std::mem::take(&mut self.pending_pieces);
-            self.reasoning.push_str(&r);
-        }
-        if !c.is_empty() {
-            self.content_pieces += 1 + std::mem::take(&mut self.pending_pieces);
-            self.content.push_str(&c);
-        }
-        // Nothing flushed at all: attribute the stragglers to whichever side
-        // actually saw text, so no sampled token goes unaccounted for.
-        if self.pending_pieces > 0 {
-            let pending = std::mem::take(&mut self.pending_pieces);
-            if self.content.is_empty() {
-                self.reasoning_pieces += pending;
-            } else {
-                self.content_pieces += pending;
-            }
-        }
+        self.tally.finish(&r, &c);
+        self.reasoning.push_str(&r);
+        self.content.push_str(&c);
+        let mut reasoning_pieces = self.tally.reasoning;
+        let mut content_pieces = self.tally.content;
 
         // Retroactive forced-open recovery: no reasoning was recognized, but
         // the stream carries a closing tag with no opener before it.
@@ -248,10 +264,10 @@ impl ReasoningCollector {
             && let Some(i) = self.content.find(THINK_CLOSE)
             && !self.content[..i].contains(THINK_OPEN)
         {
-            let total = self.content_pieces.max(1);
+            let total = content_pieces.max(1);
             let share = i as f64 / self.content.len().max(1) as f64;
-            self.reasoning_pieces = (total as f64 * share).round() as u32;
-            self.content_pieces = total - self.reasoning_pieces;
+            reasoning_pieces = (total as f64 * share).round() as u32;
+            content_pieces = total - reasoning_pieces;
             let after = self.content[i + THINK_CLOSE.len()..].trim_start().to_string();
             self.reasoning = self.content[..i].to_string();
             self.content = after;
@@ -261,8 +277,8 @@ impl ReasoningCollector {
         SplitOutput {
             reasoning: (!reasoning.is_empty()).then(|| reasoning.to_string()),
             content: self.content,
-            reasoning_pieces: self.reasoning_pieces,
-            content_pieces: self.content_pieces,
+            reasoning_pieces,
+            content_pieces,
         }
     }
 }
@@ -423,6 +439,13 @@ mod tests {
             (true, &["</th", "ink>", "answer"][..]),
             (false, &["no tags at all"][..]),
             (false, &["<thi", "nk>", "r", "</thi", "nk>", "c"][..]),
+            // The stream ends while the splitter holds a partial tag. The final
+            // flush releases bytes of a piece that was already fed, so it is
+            // not a piece of its own and must not be counted again.
+            (false, &["<think>", "abc</"][..]),
+            (false, &["<think>", "abc", "</"][..]),
+            (true, &["</th"][..]),
+            (false, &["<thi"][..]),
         ] {
             let mut c = ReasoningCollector::new(forced);
             for p in pieces {
