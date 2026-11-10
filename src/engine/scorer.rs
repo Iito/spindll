@@ -98,6 +98,9 @@ impl Scorer {
     /// Load `path` (a GGUF file) and start the session's worker thread.
     pub fn load(path: &Path, config: ScorerConfig) -> anyhow::Result<Self> {
         config.validate()?;
+        // Checked here, not left to llama.cpp: llama-cpp-2 debug-asserts that
+        // the path exists, which would kill the worker without a message.
+        ensure!(path.is_file(), "model not found: {}", path.display());
         let (jobs, inbox) = mpsc::channel::<Job>();
         let (ready_tx, ready) = mpsc::sync_channel::<anyhow::Result<(usize, i32, i32)>>(1);
         let path = path.to_path_buf();
@@ -583,6 +586,14 @@ mod tests {
     #[test]
     fn argmax_takes_the_first_maximum() {
         assert_eq!(argmax(&[1.0, 3.0, 3.0, 2.0]), 1);
+    }
+
+    #[test]
+    fn loading_a_missing_file_says_so() {
+        let err = Scorer::load(Path::new("/nonexistent/model.gguf"), ScorerConfig::default())
+            .err()
+            .expect("a missing file must not load");
+        assert!(err.to_string().contains("model not found"), "{err}");
     }
 
     #[test]
