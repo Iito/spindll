@@ -82,6 +82,7 @@ impl ScorerConfig {
     }
 }
 
+/// Work for the worker thread, run against the session that thread owns.
 type Job = Box<dyn for<'m> FnOnce(&mut Session<'m>) + Send>;
 
 /// A scoring session on one model. See the module docs.
@@ -647,6 +648,7 @@ mod tests {
                 prefix.push(token);
             }
             s.set_context_tokens(&prefix).unwrap();
+            // Already normalized, so this sums probabilities: P(any terminator).
             let ends = s.next_logprobs(&terminators).unwrap();
             expected.push(total + log_sum_exp(&ends));
         }
