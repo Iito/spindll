@@ -21,7 +21,7 @@ use tower_http::cors::CorsLayer;
 use crate::engine::{GenerateParams, ModelManager};
 #[cfg(feature = "vision")]
 use crate::engine::multimodal::{check_image_len, ContentPart, MAX_IMAGE_BYTES, MultimodalMessage};
-use crate::engine::reasoning::{ReasoningCollector, ReasoningSplitter};
+use crate::engine::reasoning::{PieceTally, ReasoningCollector, ReasoningSplitter};
 use crate::engine::residency::ensure_loaded;
 use crate::model_store::registry::Registry;
 use crate::model_store::ModelStore;
@@ -1065,7 +1065,7 @@ async fn oai_chat_completions(
                 // No tools — stream tokens directly, splitting think-block
                 // reasoning into `delta.reasoning_content` as it arrives.
                 let mut splitter = ReasoningSplitter::new(forced_open);
-                let mut reasoning_pieces = 0u32;
+                let mut tally = PieceTally::default();
                 let send_delta = |delta: serde_json::Value| -> bool {
                     let chunk = serde_json::json!({
                         "id": &completion_id,
@@ -1082,9 +1082,9 @@ async fn oai_chat_completions(
                 };
                 let mut on_tok = |token: &str| -> bool {
                     let (r, c) = splitter.push(token);
+                    tally.record(token, &r, &c);
                     let mut alive = true;
                     if !r.is_empty() {
-                        reasoning_pieces += 1;
                         alive &= send_delta(serde_json::json!({ "reasoning_content": r }));
                     }
                     if !c.is_empty() {
@@ -1102,8 +1102,8 @@ async fn oai_chat_completions(
                         // Flush whatever the splitter still holds — a pending
                         // partial tag, or a think block max_tokens cut short.
                         let (r, c) = splitter.finish();
+                        tally.finish(&r, &c);
                         if !r.is_empty() {
-                            reasoning_pieces += 1;
                             let _ = send_delta(serde_json::json!({ "reasoning_content": r }));
                         }
                         if !c.is_empty() {
@@ -1128,7 +1128,7 @@ async fn oai_chat_completions(
                                 "created": created,
                                 "model": &req.model,
                                 "choices": [],
-                                "usage": oai_usage(stats, reasoning_pieces),
+                                "usage": oai_usage(stats, tally.reasoning),
                             });
                             let _ = tx.blocking_send(Ok(sse_data(&usage_chunk)));
                         }
@@ -1820,7 +1820,9 @@ pub(crate) mod tests {
         assert!(text.contains(r#""content":"hi""#), "{text}");
         assert!(!text.contains("<think>"), "think tags must not leak: {text}");
         assert!(text.contains(r#""finish_reason":"stop""#), "{text}");
-        assert!(text.contains(r#""reasoning_tokens":1"#), "{text}");
+        // Same accounting as the non-streaming path: `<think>` and "why" both
+        // cost a token. The two paths used to count separately and disagree.
+        assert!(text.contains(r#""reasoning_tokens":2"#), "{text}");
     }
 
     #[tokio::test]
@@ -1843,6 +1845,34 @@ pub(crate) mod tests {
         assert!(text.contains(r#""reasoning_content":"I am reasoning.""#), "{text}");
         assert!(text.contains(r#""content":"42""#), "{text}");
         assert!(!text.contains("</think>"), "close tag must not leak: {text}");
+    }
+
+    #[tokio::test]
+    async fn oai_chat_cap_inside_think_block_bills_every_token_to_reasoning() {
+        // #81's shape: max_tokens lands inside the think block while the
+        // splitter is holding a partial closing tag. Every sampled token went
+        // to reasoning, so on both paths reasoning_tokens must equal
+        // completion_tokens: no phantom answer tokens, and never more
+        // reasoning than was sampled.
+        for stream in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, mgr) = setup_with_backend(dir.path(), Box::new(ScriptedBackend {
+                template: "prompt",
+                pieces: &["<think>", "abc", "</"],
+            }));
+            let (status, text) = post_json(router(mgr, store), "/v1/chat/completions", serde_json::json!({
+                "model": "test-org/test-model",
+                "messages": [{"role": "user", "content": "q"}],
+                "stream": stream,
+                "max_tokens": 3,
+                "stream_options": {"include_usage": true}
+            })).await;
+
+            assert_eq!(status, 200, "stream={stream}");
+            assert!(text.contains(r#""finish_reason":"length""#), "stream={stream}: {text}");
+            assert!(text.contains(r#""completion_tokens":3"#), "stream={stream}: {text}");
+            assert!(text.contains(r#""reasoning_tokens":3"#), "stream={stream}: {text}");
+        }
     }
 
     #[tokio::test]
