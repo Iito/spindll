@@ -298,6 +298,18 @@ pub fn generate_streaming_cached(
     let n_ctx = n_ctx_u32 as usize;
 
     let token_ids: Vec<i32> = tokens.iter().map(|t| t.0).collect();
+
+    // With no content digest, this model's entries cannot be told apart from
+    // another model's under the same name, so they could be restored into the
+    // wrong weights. Run uncached; re-importing the model records a digest.
+    let cacheable = !model_digest.is_empty();
+    if !cacheable {
+        tracing::warn!(
+            model = model_name,
+            "kv cache: model has no content digest; running uncached (re-import it to cache)"
+        );
+    }
+    let ram_cache = ram_cache.filter(|_| cacheable);
     let ram_hash = ram_cache
         .map(|_| KvRamCache::hash_key(prompt, model_name, model_digest, encryption_key));
 
@@ -325,7 +337,8 @@ pub fn generate_streaming_cached(
     // ── Tier 2: Disk cache ─────────────────────────────────────────────
     let cache_hit = if cache_hit {
         true
-    } else if let Some(cache_path) = cache.lookup(prompt, model_name, model_digest, encryption_key)
+    } else if cacheable
+        && let Some(cache_path) = cache.lookup(prompt, model_name, model_digest, encryption_key)
     {
         let loaded = if encryption_key.is_some() {
             load_state_from_disk(&cache_path, encryption_key).and_then(|plain| {
@@ -379,7 +392,7 @@ pub fn generate_streaming_cached(
     tracing::Span::current().record("cache_hit", cache_hit);
 
     // ── Save on miss ───────────────────────────────────────────────────
-    if !cache_hit {
+    if !cache_hit && cacheable {
         // Save to RAM cache.
         if let (Some(rc), Some(hash)) = (ram_cache, ram_hash.as_deref()) {
             snapshot_to_ram(ctx, rc, hash, &token_ids);
@@ -562,6 +575,29 @@ mod kv_restore_tests {
         let short = tokenize_prompt(&model, "Hello").unwrap();
         encode_prompt(&model, &mut small, &short)
             .expect("the context must stay usable after a refused restore");
+    }
+
+    #[test]
+    #[ignore] // requires a downloaded model: cargo test -- --ignored
+    fn model_without_a_digest_runs_uncached() {
+        // Without a content digest this model's entries cannot be told apart
+        // from another model's under the same name, so it must not use them.
+        let model = small_model();
+        let dir = tempfile::tempdir().unwrap();
+        let disk = KvCache::with_dir(dir.path().to_path_buf(), 1 << 30);
+        let ram = KvRamCache::new(1 << 30);
+        let params = GenerateParams { max_tokens: 4, temperature: 0.0, ..Default::default() };
+
+        for _ in 0..2 {
+            let mut ctx = context(&model, 512);
+            let result = generate_streaming_cached(
+                &model, &mut ctx, "Hello", &params, "m", "", &disk, Some(&ram), None, |_| true,
+            )
+            .unwrap();
+            assert!(!result.cache_hit, "a model without a digest must never hit");
+        }
+        assert_eq!(ram.stats().0, 0, "nothing may be cached in RAM");
+        assert!(disk.lookup("Hello", "m", "", None).is_none(), "nothing may be cached on disk");
     }
 
     #[test]
