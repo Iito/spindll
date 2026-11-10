@@ -180,17 +180,7 @@ impl ModelManager {
             }
         }
 
-        let default_gpu_layers = gpu_layers.unwrap_or({
-            if cfg!(target_os = "macos")
-                || cfg!(feature = "cuda")
-                || cfg!(feature = "metal")
-                || cfg!(feature = "vulkan")
-            {
-                999
-            } else {
-                0
-            }
-        });
+        let default_gpu_layers = gpu_layers.unwrap_or(crate::backend::default_gpu_layers());
 
         let memory_budget = if memory_budget == 0 {
             crate::scheduler::budget::total_memory_bytes()
