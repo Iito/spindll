@@ -615,14 +615,15 @@ mod tests {
     fn reusing_a_prefix_gives_the_same_prediction_as_a_fresh_context() {
         let s = scorer();
         let probe: Vec<i32> = (0..s.n_vocab() as i32).step_by(97).collect();
-
-        s.set_context("I would like").unwrap();
-        s.set_context(CONTEXT).unwrap();
-        let reused = s.next_logprobs(&probe).unwrap();
-
-        let fresh = scorer();
-        fresh.set_context(CONTEXT).unwrap();
-        assert_close(&reused, &fresh.next_logprobs(&probe).unwrap(), "next");
+        // Typing extends the context, a backspace-and-retype changes it
+        // mid-way, and deleting shrinks it. Each must leave no stale cells.
+        for text in ["I would like", CONTEXT, "I would like to see the", "I would like"] {
+            s.set_context(text).unwrap();
+            let fresh = scorer();
+            fresh.set_context(text).unwrap();
+            let reused = s.next_logprobs(&probe).unwrap();
+            assert_close(&reused, &fresh.next_logprobs(&probe).unwrap(), text);
+        }
     }
 
     #[test]
