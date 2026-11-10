@@ -69,7 +69,6 @@ serde_json   = "1"
 thiserror    = "2"
 anyhow       = "1"
 tracing      = "0.1"
-sysinfo      = "0.35"
 memory-stats = "1"
 libc         = "0.2"
 urlencoding  = "2"
@@ -90,6 +89,12 @@ tower-http = { version = "0.6", features = ["cors"], optional = true }
 # cli binary only
 clap               = { version = "4", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+# Not on iOS: the sandbox hides other processes, the memory budget comes from
+# os_proc_available_memory() there, and sysinfo 0.35's process code calls
+# macOS-only libc APIs that newer libc releases no longer expose on iOS.
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+sysinfo = "0.35"
 
 [dev-dependencies]
 tempfile = "3"
