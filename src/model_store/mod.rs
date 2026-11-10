@@ -629,11 +629,16 @@ impl ModelStore {
 
     /// Import all models from HuggingFace's local cache.
     pub fn import_from_hf(&self) -> anyhow::Result<u32> {
-        self.ensure_dirs()?;
         let Some(hf_cache) = import::hf_cache_dir() else {
             anyhow::bail!("cannot determine home directory (HOME/USERPROFILE unset)");
         };
-        let models = import::discover_hf_models(&hf_cache)?;
+        self.import_from_hf_dir(&hf_cache)
+    }
+
+    /// Import every GGUF and MLX model in a HuggingFace hub cache directory.
+    fn import_from_hf_dir(&self, hf_cache: &std::path::Path) -> anyhow::Result<u32> {
+        self.ensure_dirs()?;
+        let models = import::discover_hf_models(hf_cache)?;
 
         if models.is_empty() {
             println!("no huggingface models found in cache");
@@ -675,11 +680,17 @@ impl ModelStore {
                         {
                             entry.mmproj_path = imported_mmproj_path;
                         }
+                        // Imported before digests were recorded: fill it in so
+                        // the model can use the KV cache again.
+                        if entry.digest.is_empty() {
+                            entry.digest = import_digest(&dest, &entry.format);
+                        }
                     } else {
                         let (gguf_name, gguf_desc, gguf_arch, gguf_ctx) =
                             registry::read_gguf_metadata(&dest);
                         let base_model = derive_base_model(&gguf_name, &repo_id);
                         let size = std::fs::metadata(&gguf_path)?.len();
+                        let digest = import_digest(&dest, &registry::ModelFormat::Gguf);
 
                         reg.add(
                             key,
@@ -692,7 +703,7 @@ impl ModelStore {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap()
                                     .as_secs(),
-                                digest: String::new(),
+                                digest,
                                 model_name: gguf_name,
                                 description: gguf_desc,
                                 architecture: gguf_arch,
@@ -716,8 +727,14 @@ impl ModelStore {
                 }
 
                 let key = repo_id.clone();
-                if !reg.models.contains_key(&key) {
+                if let Some(entry) = reg.models.get_mut(&key) {
+                    // Imported before digests were recorded: fill it in.
+                    if entry.digest.is_empty() {
+                        entry.digest = import_digest(&dest_dir, &entry.format);
+                    }
+                } else {
                     let size = registry::dir_size(&snapshot_path)?;
+                    let digest = import_digest(&dest_dir, &registry::ModelFormat::Mlx);
 
                     reg.add(
                         key,
@@ -730,7 +747,7 @@ impl ModelStore {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap()
                                 .as_secs(),
-                            digest: String::new(),
+                            digest,
                             model_name: repo_id.clone(),
                             description: String::new(),
                             architecture: String::new(),
@@ -808,14 +825,19 @@ impl ModelStore {
             }
         };
         let base_model = derive_base_model(&model_name, &filename);
+        let digest = import_digest(&dest, &format);
 
         let mut reg = registry::Registry::load(&self.registry_path())?;
-        if reg.models.contains_key(&key) {
-            println!("model already imported");
-            return Ok(());
-        }
+        let refreshed = match reg.models.get(&key) {
+            Some(existing) if existing.digest == digest => {
+                println!("model already imported");
+                return Ok(());
+            }
+            Some(_) => true,
+            None => false,
+        };
         reg.add(
-            key,
+            key.clone(),
             registry::ModelEntry {
                 repo: "manual".to_string(),
                 filename: filename.to_string(),
@@ -825,7 +847,7 @@ impl ModelStore {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs(),
-                digest: String::new(),
+                digest,
                 model_name,
                 description,
                 architecture,
@@ -838,6 +860,11 @@ impl ModelStore {
             },
         );
         reg.save(&self.registry_path())?;
+        if refreshed {
+            // Same name, new bytes: the new digest stops cache entries made
+            // with the old weights from matching.
+            println!("re-imported {key}: contents changed");
+        }
         Ok(())
     }
 
@@ -1065,6 +1092,25 @@ pub fn discover_mmproj(dir: &std::path::Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Content digest for an imported model, by the download path's rule: the
+/// `.gguf` itself, or `config.json` for an MLX directory. KV cache keys carry
+/// it, and an empty digest keeps the model out of the cache, so a hashing
+/// failure degrades to running uncached instead of failing the import.
+fn import_digest(path: &std::path::Path, format: &registry::ModelFormat) -> String {
+    let target = match format {
+        registry::ModelFormat::Gguf => path.to_path_buf(),
+        registry::ModelFormat::Mlx => path.join("config.json"),
+    };
+    download::sha256_file(&target).unwrap_or_else(|e| {
+        tracing::warn!(
+            path = %target.display(),
+            error = %e,
+            "could not hash imported model; it will run without the KV cache"
+        );
+        String::new()
+    })
 }
 
 fn is_primary_gguf(path: &std::path::Path) -> bool {
@@ -1881,5 +1927,106 @@ mod tests {
 
         let err = store.import_from_path(src.to_str().unwrap()).unwrap_err().to_string();
         assert!(err.contains("*.safetensors"), "{err}");
+    }
+
+    fn registered_digest(store: &ModelStore, key: &str) -> String {
+        Registry::load(&store.registry_path()).unwrap().models[key].digest.clone()
+    }
+
+    fn write_mlx_dir(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("config.json"), br#"{"model_type":"llama"}"#).unwrap();
+        std::fs::write(dir.join("model.safetensors"), b"weights").unwrap();
+    }
+
+    #[test]
+    fn import_from_path_records_the_download_digest() {
+        // Same rule as the download path: the .gguf itself, or config.json for
+        // MLX. With no digest, the KV cache key carries no content identity and
+        // a re-import under the same name reused the old model's state.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().join("store")));
+        let gguf = dir.path().join("tiny.gguf");
+        std::fs::write(&gguf, b"placeholder gguf bytes").unwrap();
+        let mlx = dir.path().join("tiny-mlx");
+        write_mlx_dir(&mlx);
+
+        store.import_from_path(gguf.to_str().unwrap()).unwrap();
+        store.import_from_path(mlx.to_str().unwrap()).unwrap();
+
+        assert_eq!(
+            registered_digest(&store, "manual/tiny.gguf"),
+            download::sha256_file(&gguf).unwrap()
+        );
+        assert_eq!(
+            registered_digest(&store, "manual/tiny-mlx"),
+            download::sha256_file(&mlx.join("config.json")).unwrap()
+        );
+    }
+
+    #[test]
+    fn reimporting_changed_bytes_refreshes_the_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().join("store")));
+        let gguf = dir.path().join("tiny.gguf");
+
+        std::fs::write(&gguf, b"first weights").unwrap();
+        store.import_from_path(gguf.to_str().unwrap()).unwrap();
+        let before = registered_digest(&store, "manual/tiny.gguf");
+
+        std::fs::write(&gguf, b"second weights").unwrap();
+        store.import_from_path(gguf.to_str().unwrap()).unwrap();
+        let after = registered_digest(&store, "manual/tiny.gguf");
+
+        assert_ne!(before, after, "new bytes under the same name need a new cache identity");
+        assert_eq!(after, download::sha256_file(&gguf).unwrap());
+    }
+
+    #[test]
+    fn import_from_hf_records_the_download_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().join("store")));
+        let hub = dir.path().join("hub");
+        let gguf_snapshot = hub.join("models--org--tiny-GGUF/snapshots/abc");
+        std::fs::create_dir_all(&gguf_snapshot).unwrap();
+        let gguf = gguf_snapshot.join("tiny-q4_k_m.gguf");
+        std::fs::write(&gguf, b"placeholder gguf bytes").unwrap();
+        let mlx_snapshot = hub.join("models--org--tiny-mlx/snapshots/def");
+        write_mlx_dir(&mlx_snapshot);
+
+        assert_eq!(store.import_from_hf_dir(&hub).unwrap(), 2);
+
+        assert_eq!(
+            registered_digest(&store, "org/tiny-GGUF/tiny-q4_k_m.gguf"),
+            download::sha256_file(&gguf).unwrap()
+        );
+        assert_eq!(
+            registered_digest(&store, "org/tiny-mlx"),
+            download::sha256_file(&mlx_snapshot.join("config.json")).unwrap()
+        );
+    }
+
+    #[test]
+    fn import_from_hf_backfills_a_missing_digest() {
+        // Entries imported before digests were computed run uncached until
+        // they get one. The next import fills it in.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().join("store")));
+        let hub = dir.path().join("hub");
+        let snapshot = hub.join("models--org--tiny-GGUF/snapshots/abc");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("tiny-q4_k_m.gguf"), b"placeholder gguf bytes").unwrap();
+        let key = "org/tiny-GGUF/tiny-q4_k_m.gguf";
+
+        store.import_from_hf_dir(&hub).unwrap();
+        let mut reg = Registry::load(&store.registry_path()).unwrap();
+        reg.models.get_mut(key).unwrap().digest.clear();
+        reg.save(&store.registry_path()).unwrap();
+
+        store.import_from_hf_dir(&hub).unwrap();
+        assert_eq!(
+            registered_digest(&store, key),
+            download::sha256_file(&snapshot.join("tiny-q4_k_m.gguf")).unwrap()
+        );
     }
 }
