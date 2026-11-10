@@ -54,9 +54,17 @@ impl Lockfile {
     }
 }
 
+#[cfg(not(target_os = "ios"))]
 fn process_alive(pid: u32) -> bool {
     use sysinfo::System;
     let mut sys = System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]), true);
     sys.process(sysinfo::Pid::from_u32(pid)).is_some()
+}
+
+/// iOS sandboxes other processes out of sight, and spindll runs embedded in
+/// the app there, so the only server a lockfile can name is this process.
+#[cfg(target_os = "ios")]
+fn process_alive(pid: u32) -> bool {
+    pid == std::process::id()
 }

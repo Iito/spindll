@@ -193,7 +193,7 @@ impl ModelManager {
         });
 
         let memory_budget = if memory_budget == 0 {
-            sysinfo::System::new_all().total_memory()
+            crate::scheduler::budget::total_memory_bytes()
         } else {
             memory_budget
         };

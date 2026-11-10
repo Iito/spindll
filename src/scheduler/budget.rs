@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Iito <https://github.com/Iito> and sarmientoF <https://github.com/sarmientoF>
 
+#[cfg(not(target_os = "ios"))]
 use sysinfo::System;
 
 /// System memory information and the computed budget for model loading.
@@ -21,9 +22,7 @@ impl MemoryBudget {
     /// wired+active pages the OS is using, so reserving an extra margin on
     /// top of that double-counts the OS overhead.
     pub fn detect(budget_str: Option<&str>) -> Self {
-        let sys = System::new_all();
-        let total_ram = sys.total_memory();
-        let available_ram = available_memory_platform(&sys);
+        let (total_ram, available_ram) = memory_snapshot();
 
         let budget = match budget_str {
             Some(s) => match parse_size(s) {
@@ -145,9 +144,40 @@ unsafe fn libc_sysctl(name: *const i8, val: *mut std::ffi::c_void, len: *mut usi
     unsafe { sysctlbyname(name, val, len, std::ptr::null_mut(), 0); }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn available_memory_platform(sys: &System) -> u64 {
     sys.available_memory()
+}
+
+/// `(total RAM, RAM available for models)` in bytes.
+#[cfg(not(target_os = "ios"))]
+fn memory_snapshot() -> (u64, u64) {
+    // Memory only: `System::new_all()` also walks every process, disk and
+    // network interface, which costs milliseconds and none of it is used here.
+    let mut sys = System::new();
+    sys.refresh_memory();
+    (sys.total_memory(), available_memory_platform(&sys))
+}
+
+/// iOS terminates a process that crosses its jetsam limit, which sits far
+/// below physical RAM and depends on the process: an app on an iPhone 16 Pro
+/// Max starts with about 3.4 GB of headroom, a keyboard extension on an
+/// iPhone 15 with about 76 MB. That headroom is the real budget, so it stands
+/// in for both values.
+#[cfg(target_os = "ios")]
+fn memory_snapshot() -> (u64, u64) {
+    unsafe extern "C" {
+        /// Bytes this process can still allocate before iOS terminates it.
+        fn os_proc_available_memory() -> usize;
+    }
+    let headroom = unsafe { os_proc_available_memory() } as u64;
+    (headroom, headroom)
+}
+
+/// Memory the model manager budgets against when none is configured:
+/// physical RAM, or on iOS this process's headroom under its jetsam limit.
+pub fn total_memory_bytes() -> u64 {
+    memory_snapshot().0
 }
 
 fn parse_size(s: &str) -> Option<u64> {
@@ -165,6 +195,14 @@ fn parse_size(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_snapshot_is_consistent() {
+        let (total, available) = memory_snapshot();
+        assert!(total > 0, "total must be nonzero");
+        assert!(available <= total, "available {available} exceeds total {total}");
+        assert_eq!(total_memory_bytes(), total);
+    }
 
     #[test]
     fn parse_size_units() {
