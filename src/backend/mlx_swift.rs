@@ -27,6 +27,11 @@ unsafe extern "C" {
     fn mlx_model_load(model_path: *const c_char) -> *mut MlxModelHandle;
     fn mlx_model_free(handle: *mut MlxModelHandle);
 
+    // The three generate calls return the number of tokens sampled, stop token
+    // excluded, or -1 on error. Report that count as completion_tokens, never
+    // the number of callback chunks: a token that does not complete a codepoint
+    // yields no chunk, so counting chunks under-reports the budget spent and
+    // `oai_finish_reason` reads a real cap hit as "stop" (#81).
     fn mlx_generate(
         handle:       *mut MlxModelHandle,
         prompt:       *const c_char,
@@ -291,11 +296,7 @@ impl MlxSwiftEngine {
             result
         });
 
-        // The bridge returns the number of tokens it actually sampled; count
-        // chunks here only to drive `on_token`. A detokenizer chunk is not a
-        // token — a token that does not complete a codepoint yields no chunk at
-        // all — so counting chunks under-reports the budget spent, and
-        // `oai_finish_reason` then reads a real cap hit as "stop". See #81.
+        // Chunks only drive `on_token`; usage takes the bridge's sampled count.
         for token in &rx {
             if token.is_empty() { continue; }
             if !on_token(&token) { break; }
@@ -390,11 +391,7 @@ impl MlxSwiftEngine {
             result
         });
 
-        // The bridge returns the number of tokens it actually sampled; count
-        // chunks here only to drive `on_token`. A detokenizer chunk is not a
-        // token — a token that does not complete a codepoint yields no chunk at
-        // all — so counting chunks under-reports the budget spent, and
-        // `oai_finish_reason` then reads a real cap hit as "stop". See #81.
+        // Chunks only drive `on_token`; usage takes the bridge's sampled count.
         for token in &rx {
             // The Swift bridge emits an empty string as the EOS indicator.
             if token.is_empty() {
@@ -546,11 +543,7 @@ impl MlxSwiftEngine {
             result
         });
 
-        // The bridge returns the number of tokens it actually sampled; count
-        // chunks here only to drive `on_token`. A detokenizer chunk is not a
-        // token — a token that does not complete a codepoint yields no chunk at
-        // all — so counting chunks under-reports the budget spent, and
-        // `oai_finish_reason` then reads a real cap hit as "stop". See #81.
+        // Chunks only drive `on_token`; usage takes the bridge's sampled count.
         for token in &rx {
             if token.is_empty() { continue; }
             if !on_token(&token) { break; }
