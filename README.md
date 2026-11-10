@@ -148,6 +148,12 @@ manager.generate("llama3.1:8b", "Hello!", &GenerateParams::default(), None, |tok
 
 See [docs/api-rust.md](docs/api-rust.md) for the full library API including batch scheduling, KV cache, and server startup.
 
+## iOS
+
+The library builds for iPhone (`aarch64-apple-ios`) and the Simulator
+(`aarch64-apple-ios-sim`). See [docs/IOS.md](docs/IOS.md) for the build, the
+memory budget, and the Metal-free build a keyboard extension needs.
+
 ## Architecture
 
 ```
