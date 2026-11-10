@@ -557,7 +557,7 @@ mod kv_restore_tests {
     fn snapshot_that_cannot_fit_is_refused_and_the_context_stays_usable() {
         let model = small_model();
         let long = "The quick brown fox jumps over the lazy dog. ".repeat(30);
-        let tokens = tokenize_prompt(&model, &long).unwrap();
+        let tokens = tokenize_prompt(&model, &long);
         assert!(tokens.len() > 256, "need more cells than the small context holds");
 
         let mut big = context(&model, 1024);
@@ -567,7 +567,7 @@ mod kv_restore_tests {
         let mut small = context(&model, 256);
         assert!(!restore_seq0(&mut small, &snapshot), "a snapshot that cannot fit must be refused");
 
-        let short = tokenize_prompt(&model, "Hello").unwrap();
+        let short = tokenize_prompt(&model, "Hello");
         encode_prompt(&model, &mut small, &short)
             .expect("the context must stay usable after a refused restore");
     }
