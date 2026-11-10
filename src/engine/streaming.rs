@@ -6,6 +6,7 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::AddBos;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::{LlamaStateSeqFlags, SeqState};
 
 use super::kv_cache::{KvCache, load_state_from_disk, save_state_to_disk};
 use super::kv_ram_cache::KvRamCache;
@@ -240,13 +241,27 @@ pub fn generate_streaming(
     })
 }
 
-/// Snapshot the current context state into the RAM cache.
+/// Snapshot sequence 0's KV state into the RAM cache.
 fn snapshot_to_ram(ctx: &LlamaContext, rc: &KvRamCache, hash: &str, tokens: &[i32]) {
-    let state_size = ctx.get_state_size();
-    let mut buf = vec![0u8; state_size];
-    let actual = unsafe { ctx.copy_state_data(buf.as_mut_ptr()) };
-    buf.truncate(actual);
-    rc.insert(hash, &buf, tokens);
+    match ctx.state_seq_get(0, LlamaStateSeqFlags::empty()) {
+        Ok(state) => rc.insert(hash, state, tokens),
+        Err(e) => tracing::warn!(error = %e, "kv ram cache: snapshot failed, skipping insert"),
+    }
+}
+
+/// Restore a RAM snapshot into sequence 0. `state_seq_set` gives llama.cpp the
+/// buffer length, so a snapshot that does not fit this context is refused
+/// instead of being read past its end. A refused restore counts as a miss, and
+/// the KV cache is cleared so the prefill that follows starts clean.
+fn restore_seq0(ctx: &mut LlamaContext, state: &SeqState) -> bool {
+    match ctx.state_seq_set(state, 0) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "kv ram cache: restore refused; falling back to prefill");
+            ctx.clear_kv_cache();
+            false
+        }
+    }
 }
 
 /// Generate with KV cache support. On cache hit, restores saved state instead
@@ -288,25 +303,15 @@ pub fn generate_streaming_cached(
 
     // ── Tier 1: RAM cache ──────────────────────────────────────────────
     let cache_hit = if let (Some(rc), Some(hash)) = (ram_cache, ram_hash.as_deref()) {
-        if let Some((raw_state, cached_tokens)) = rc.lookup(hash) {
+        if let Some((state, cached_tokens)) = rc.lookup(hash) {
             if cached_tokens.len() == token_ids.len()
                 && cached_tokens.iter().zip(token_ids.iter()).all(|(a, b)| a == b)
             {
-                let read = unsafe { ctx.set_state_data(&raw_state) };
-                // Require a full restore — partial reads leave ctx in a
-                // half-loaded state and would silently skip prompt prefill.
-                if read == raw_state.len() {
+                let restored = restore_seq0(ctx, &state);
+                if restored {
                     tracing::debug!("kv cache: ram hit");
-                    true
-                } else {
-                    tracing::warn!(
-                        read,
-                        expected = raw_state.len(),
-                        "kv ram cache: partial restore; falling back to prefill"
-                    );
-                    ctx.clear_kv_cache();
-                    false
                 }
+                restored
             } else {
                 false
             }
@@ -484,4 +489,99 @@ fn encode_prompt(
     }
     ctx.decode(&mut batch)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod kv_restore_tests {
+    use super::*;
+    use crate::backend::llamacpp::shared_backend;
+    use llama_cpp_2::context::params::LlamaContextParams;
+    use llama_cpp_2::model::params::LlamaModelParams;
+    use std::num::NonZeroU32;
+    use std::path::PathBuf;
+
+    fn small_model() -> LlamaModel {
+        let path = PathBuf::from(std::env::var("HOME").unwrap()).join(
+            ".spindll/models/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+        );
+        assert!(path.exists(), "model not found: {}", path.display());
+        LlamaModel::load_from_file(shared_backend(), &path, &LlamaModelParams::default()).unwrap()
+    }
+
+    fn context(model: &LlamaModel, n_ctx: u32) -> LlamaContext<'_> {
+        let params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(n_ctx))
+            .with_n_batch(n_ctx);
+        model.new_context(shared_backend(), params).unwrap()
+    }
+
+    #[test]
+    #[ignore] // requires a downloaded model: cargo test -- --ignored
+    fn ram_hit_reproduces_the_prefill_output() {
+        let model = small_model();
+        let dir = tempfile::tempdir().unwrap();
+        let disk = KvCache::with_dir(dir.path().to_path_buf(), 1 << 30);
+        let ram = KvRamCache::new(1 << 30);
+        let params = GenerateParams { max_tokens: 12, temperature: 0.0, ..Default::default() };
+
+        let run = || {
+            let mut ctx = context(&model, 512);
+            let mut out = String::new();
+            let result = generate_streaming_cached(
+                &model, &mut ctx, "The capital of France is", &params,
+                "m", "d", &disk, Some(&ram), None,
+                |piece| { out.push_str(piece); true },
+            )
+            .unwrap();
+            (result.cache_hit, out)
+        };
+        let (first_hit, first) = run();
+        let (second_hit, second) = run();
+
+        assert!(!first_hit, "the first run must miss");
+        assert!(second_hit, "the second run must hit the RAM tier");
+        assert!(!first.is_empty());
+        assert_eq!(first, second, "a restored state must generate what a prefill does");
+    }
+
+    #[test]
+    #[ignore] // requires a downloaded model: cargo test -- --ignored
+    fn snapshot_that_cannot_fit_is_refused_and_the_context_stays_usable() {
+        let model = small_model();
+        let long = "The quick brown fox jumps over the lazy dog. ".repeat(30);
+        let tokens = tokenize_prompt(&model, &long).unwrap();
+        assert!(tokens.len() > 256, "need more cells than the small context holds");
+
+        let mut big = context(&model, 1024);
+        encode_prompt(&model, &mut big, &tokens).unwrap();
+        let snapshot = big.state_seq_get(0, LlamaStateSeqFlags::empty()).unwrap();
+
+        let mut small = context(&model, 256);
+        assert!(!restore_seq0(&mut small, &snapshot), "a snapshot that cannot fit must be refused");
+
+        let short = tokenize_prompt(&model, "Hello").unwrap();
+        encode_prompt(&model, &mut small, &short)
+            .expect("the context must stay usable after a refused restore");
+    }
+
+    #[test]
+    fn cache_path_never_hands_raw_bytes_to_llama() {
+        // The RAM tier used to restore raw bytes through llama.cpp's unsized
+        // whole-context setter, so a snapshot taken from a differently shaped
+        // context could read past the end of its buffer. Keep those calls out.
+        // The names are built from parts so this test does not match itself.
+        let banned = [
+            ["set_", "state_data"].concat(),
+            ["copy_", "state_data"].concat(),
+        ];
+        let sources = [
+            ("streaming.rs", include_str!("streaming.rs")),
+            ("kv_ram_cache.rs", include_str!("kv_ram_cache.rs")),
+        ];
+        for (file, src) in sources {
+            for call in &banned {
+                assert!(!src.contains(call.as_str()), "{file} calls {call}");
+            }
+        }
+    }
 }
