@@ -125,6 +125,7 @@ jobs:
       # llama.cpp builds Metal in by default on Apple, and its setup costs
       # 55 MB the moment the backend starts, even on the CPU: most of a
       # keyboard extension's ~76 MB. llama-cpp-sys-2 forwards GGML_* to CMake.
+      # A check, not clippy: the iPhone step above already lints this target.
       - name: Check without Metal (keyboard build)
         env:
           GGML_METAL: "OFF"
