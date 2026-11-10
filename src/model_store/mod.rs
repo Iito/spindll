@@ -828,16 +828,22 @@ impl ModelStore {
         let digest = import_digest(&dest, &format);
 
         let mut reg = registry::Registry::load(&self.registry_path())?;
-        let refreshed = match reg.models.get(&key) {
+        let note = match reg.models.get(&key) {
             Some(existing) if existing.digest == digest => {
                 println!("model already imported");
                 return Ok(());
             }
-            Some(_) => true,
-            None => false,
+            // Imported before digests were recorded: same model, now hashed.
+            Some(existing) if existing.digest.is_empty() => {
+                Some(format!("recorded a content digest for {key}"))
+            }
+            // Same name, new bytes: the new digest stops cache entries made
+            // with the old weights from matching.
+            Some(_) => Some(format!("re-imported {key}: contents changed")),
+            None => None,
         };
         reg.add(
-            key.clone(),
+            key,
             registry::ModelEntry {
                 repo: "manual".to_string(),
                 filename: filename.to_string(),
@@ -860,10 +866,8 @@ impl ModelStore {
             },
         );
         reg.save(&self.registry_path())?;
-        if refreshed {
-            // Same name, new bytes: the new digest stops cache entries made
-            // with the old weights from matching.
-            println!("re-imported {key}: contents changed");
+        if let Some(note) = note {
+            println!("{note}");
         }
         Ok(())
     }
@@ -1980,6 +1984,23 @@ mod tests {
 
         assert_ne!(before, after, "new bytes under the same name need a new cache identity");
         assert_eq!(after, download::sha256_file(&gguf).unwrap());
+    }
+
+    #[test]
+    fn reimporting_a_path_backfills_a_missing_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(Some(dir.path().join("store")));
+        let gguf = dir.path().join("tiny.gguf");
+        std::fs::write(&gguf, b"placeholder gguf bytes").unwrap();
+        let key = "manual/tiny.gguf";
+
+        store.import_from_path(gguf.to_str().unwrap()).unwrap();
+        let mut reg = Registry::load(&store.registry_path()).unwrap();
+        reg.models.get_mut(key).unwrap().digest.clear();
+        reg.save(&store.registry_path()).unwrap();
+
+        store.import_from_path(gguf.to_str().unwrap()).unwrap();
+        assert_eq!(registered_digest(&store, key), download::sha256_file(&gguf).unwrap());
     }
 
     #[test]
