@@ -7,10 +7,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto");
     tonic_build::compile_protos("proto/spindll.proto")?;
 
-    // MLX Swift bridge — only on aarch64 macOS with `--features mlx`.
+    // MLX Swift bridge — only on aarch64 macOS with `--features mlx`. The cfg
+    // is the build host; the target has to be macOS too, or a cross-build for
+    // iOS would link the macOS bridge into an iOS binary.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if std::env::var("CARGO_FEATURE_MLX").is_ok() {
-        build_mlx_bridge()?;
+        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+            build_mlx_bridge()?;
+        } else {
+            println!("cargo:warning=mlx: the MLX bridge builds for macOS only; skipping it for this target");
+        }
     }
 
     Ok(())
