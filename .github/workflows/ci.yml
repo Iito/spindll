@@ -12,6 +12,7 @@ on:
       - "tests/**"
       - "proto/**"
       - "build.rs"
+      - "ffi/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".cargo/**"
@@ -81,6 +82,13 @@ jobs:
       # enabling cuda fails llama-cpp-sys-2's build script without a CUDA toolchain.
       - name: Clippy
         run: cargo clippy --features cli,http --all-targets --locked -- -D warnings
+
+      # The C API crate is a workspace member, which root commands leave out.
+      # Its model-backed tests are #[ignore]d, so this needs no model.
+      - name: Clippy and tests (ffi)
+        run: |
+          cargo clippy -p spindll-ffi --all-targets --locked -- -D warnings
+          cargo test -p spindll-ffi --locked
 
   vision-feature-check:
     name: vision feature check (${{ matrix.os }})
