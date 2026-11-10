@@ -2093,6 +2093,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "spindll-ffi"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "spindll",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

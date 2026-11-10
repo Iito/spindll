@@ -103,3 +103,8 @@ http-body-util = "0.1"
 
 [build-dependencies]
 tonic-build = "0.13"
+
+# spindll-ffi is the C API for apps that link spindll as a static library.
+# Commands run at the root still act on the root package only.
+[workspace]
+members = [".", "ffi"]
