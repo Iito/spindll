@@ -1,0 +1,20 @@
+[package]
+name = "spindll-ffi"
+version = "0.10.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "C API over spindll's Scorer, for apps that link spindll as a static library"
+publish = false
+
+[lib]
+name = "spindll_ffi"
+crate-type = ["staticlib", "rlib"]
+
+[features]
+# The keyboard build leaves Metal out (see scripts/build-ios-xcframework.sh);
+# an app build can turn it on.
+metal = ["spindll/metal"]
+
+[dependencies]
+spindll = { path = ".." }
+anyhow = "1"

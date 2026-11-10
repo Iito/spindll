@@ -1,0 +1,4 @@
+module SpindllFFI {
+    header "spindll.h"
+    export *
+}
