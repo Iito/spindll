@@ -3,6 +3,10 @@
 
 mod traits;
 pub mod llamacpp;
+pub use traits::{BackendLoadParams, BackendModel, EmbedResult, InferenceBackend};
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+pub mod mlx_swift;
 
 /// Layers llama.cpp offloads when the caller leaves it unset: all of them
 /// wherever a GPU backend is built in, none otherwise. On iOS that means CPU
@@ -21,7 +25,3 @@ pub(crate) const fn default_gpu_layers() -> u32 {
         0
     }
 }
-pub use traits::{BackendLoadParams, BackendModel, EmbedResult, InferenceBackend};
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
-pub mod mlx_swift;
