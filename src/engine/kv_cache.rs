@@ -1,6 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Iito <https://github.com/Iito> and sarmientoF <https://github.com/sarmientoF>
 
+//! Disk tier of the GGUF KV cache.
+//!
+//! Entries are llama.cpp state files, written and read through
+//! `state_save_file` / `state_load_file`. llama.cpp checks its own header and
+//! bounds every read by the file, so a stale or foreign entry fails to load
+//! instead of being read past its end.
+//!
+//! Known gap: because llama.cpp opens the state file itself, an encrypted
+//! entry still passes through a plaintext `.tmp` file next to it. A save writes
+//! the plaintext and then encrypts it; a load decrypts it and then hands the
+//! plaintext file to llama.cpp. The file is removed straight away, but
+//! plaintext KV does touch the disk. Closing this needs either a sized
+//! in-memory restore of the whole state or a validated byte accessor on
+//! `SeqState`, and `llama-cpp-2` offers neither today.
+
 use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
     AeadCore, ChaCha20Poly1305,
