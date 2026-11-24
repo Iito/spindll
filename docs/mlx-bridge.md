@@ -54,10 +54,10 @@ use this when caption fidelity on fine detail matters more than TTFT.
 
 ## Token streaming
 
-Both generate paths use `NaiveStreamingDetokenizer` and:
+All three generate paths use `NaiveStreamingDetokenizer` and:
 
 1. Stop on EOS, UNK, any `eosTokenIds` from the model config, or `extraEOSTokens` resolved through `convertTokenToId` (this is what catches Gemma3's `<end_of_turn>`, Phi's `<|end|>`, SmolLM's `<turn|>`, etc.).
-2. Flush a final detokenizer chunk after the loop so partial-UTF-8 bytes are not dropped at `maxTokens` mid-codepoint exits.
+2. Call the detokenizer's `finish()` after the loop. `next()` holds back text that ends in an incomplete UTF-8 sequence, and calling it again keeps holding it, so a reply cut mid-codepoint (at `maxTokens`, say) would lose its tail. `finish()` emits that text, with U+FFFD for the incomplete bytes.
 3. Call `Stream.defaultStream.synchronize()` before tearing down `perform` so in-flight async evals complete cleanly. Mirrors mlx-swift-lm's own `runSynchronousGenerationLoop`. Not `Stream()`: since mlx-swift 0.33 that creates a new stream, and waiting on it returns at once.
 
 The token callback returns `1` to continue or `0` to cancel; cancellation breaks the loop without flushing the final chunk.

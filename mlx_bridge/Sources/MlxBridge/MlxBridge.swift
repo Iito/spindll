@@ -573,9 +573,12 @@ public func mlxGenerate(
                     }
                 }
 
-                // Flush any partial-UTF-8 bytes the detokenizer was holding
-                // back (e.g. when the loop hits maxTokens mid-codepoint).
-                if !cancelled, let chunk = detokenizer.next() {
+                // Flush the text the detokenizer is still holding back. It
+                // withholds text that ends in an incomplete UTF-8 sequence
+                // (maxTokens hit mid-codepoint, say), and calling next() again
+                // would keep withholding it. finish() emits it, with U+FFFD
+                // standing in for the incomplete bytes.
+                if !cancelled, let chunk = detokenizer.finish() {
                     _ = chunk.withCString { ptr in callback(ptr, callbackCtx) }
                 }
 
@@ -855,7 +858,7 @@ public func mlxChatGenerate(
                     }
                 }
 
-                if !cancelled, let chunk = detokenizer.next() {
+                if !cancelled, let chunk = detokenizer.finish() {
                     _ = chunk.withCString { ptr in callback(ptr, callbackCtx) }
                 }
 
@@ -1113,7 +1116,7 @@ public func mlxChatGenerateVision(
                     }
                 }
 
-                if !cancelled, let chunk = detokenizer.next() {
+                if !cancelled, let chunk = detokenizer.finish() {
                     _ = chunk.withCString { ptr in callback(ptr, callbackCtx) }
                 }
 
