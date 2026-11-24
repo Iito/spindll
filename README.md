@@ -89,6 +89,7 @@ Model names follow Ollama conventions (`llama3.1:8b`, `qwen2:0.5b`) or HuggingFa
 --ctx-size <N>             Context window size [default: 2048]
 --budget <SIZE>            Memory budget (e.g. "8G", omit=live RAM, "0"=total RAM)
 --kv-cache [<SIZE>]        Enable KV cache for prompt prefixes [default: 2G when enabled]
+--kv-scheme <SCHEME>       Compress MLX models' KV cache, e.g. turbo8v3 [default: f16]
 ```
 
 ### Serve options
@@ -103,6 +104,11 @@ Model names follow Ollama conventions (`llama3.1:8b`, `qwen2:0.5b`) or HuggingFa
                            sysinfo's available_memory elsewhere). Pass "0" to use
                            total RAM (trust unified-memory paging).
 --kv-cache [<SIZE>]        Enable KV cache for prompt prefixes [default: 2G]
+--kv-scheme <SCHEME>       Compress MLX models' KV cache [default: f16]. TurboQuant:
+                           turbo8v3 (8-bit keys, 3-bit values; upstream's default
+                           pick), turbo0v4 (f16 keys, 4-bit values; safest),
+                           turbo4/turbo3/turbo2 (most compression). Also affine4/8.
+                           Saves memory but slows decoding; GGUF models unaffected.
 --batch-slots <N>          Concurrent sequence slots per model [default: 0 = disabled]
 --ram-cache [<SIZE>]       Keep recently-evicted models warm in RAM [default: 4G; no-op on macOS]
 ```
