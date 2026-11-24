@@ -139,6 +139,36 @@ public func mlxSetCacheBudgets(_ ramBytes: UInt64, _ diskBytes: UInt64) {
 }
 
 // ---------------------------------------------------------------------------
+// KV cache scheme — set once at startup via `mlx_set_kv_scheme`. nil keeps
+// the default f16 KV cache. Otherwise it names one of mlx-swift-lm's
+// compressed layouts, e.g. "turbo8v3" (TurboQuant: 8-bit keys, 3-bit values),
+// "turbo0v4" or "affine8"; GenerateParameters.kvScheme documents the set.
+// ---------------------------------------------------------------------------
+
+private var mlxKVScheme: String? = nil
+
+/// Pick the KV cache scheme for every later generation, or clear it with
+/// NULL. Returns 0 on success, or -1 with the setting unchanged when
+/// mlx-swift-lm doesn't know the name. Call before any model is loaded:
+/// each model's prompt-cache namespace includes the scheme, fixed at load.
+@_cdecl("mlx_set_kv_scheme")
+public func mlxSetKVScheme(_ scheme: UnsafePointer<CChar>?) -> Int32 {
+    guard let scheme else {
+        mlxKVScheme = nil
+        return 0
+    }
+    let name = String(cString: scheme)
+    guard resolveAffineScheme(name) != nil || resolveTurboScheme(name) != nil
+            || resolveVarianceNormalizedScheme(name) != nil else {
+        fputs("[mlx-bridge] unknown KV cache scheme \"\(name)\"\n", stderr)
+        return -1
+    }
+    mlxKVScheme = name
+    fputs("[mlx-bridge] KV cache scheme: \(name)\n", stderr)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
 // MlxDiskCache — on-disk LRU tier behind PromptCache.
 //
 // Evicted PromptCache entries are written here as safetensors (via
