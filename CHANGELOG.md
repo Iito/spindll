@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - **MLX runs on mlx-swift-lm 3.33.0 and mlx-swift 0.33** — up from an mlx-swift-lm `main` commit of 2026-08-17 on mlx-swift 0.31.6, and pinned to a release tag now instead of a commit. The three months of upstream work in between include fixes to rotating KV caches (the prompt-cache path of sliding-window models), prefill over a quantized KV cache through the fused attention kernel, and parallel weight loading. The bridge also stops building mlx-swift-lm's adapter for Apple's FoundationModels framework, which it never used and which has broken on Xcode 27 SDKs. Building with `--features mlx` now needs the macOS 26 SDK, so Xcode 26 or newer: a swift.org toolchain on an older Xcode is no longer enough, and `build.rs` says so before the Swift build starts.
+- **The MLX prompt cache reuses prefixes from 16 tokens, down from 64** — shorter matches were ignored, so short prompts re-prefilled even the chat header every prompt opens with, and a repeated short prompt was prefilled from scratch every time. On Qwen2.5-1.5B (Apple M4) first-token latency fell from 78 to 40 ms for fresh short prompts and from 74 to 23 ms for repeated ones. A long prompt that matches only its header in RAM still checks the disk tier.
 
 ### Changed
 
