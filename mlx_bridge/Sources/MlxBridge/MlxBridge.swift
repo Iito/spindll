@@ -725,6 +725,59 @@ private func deepCopyCache(_ layer: any KVCache) -> any KVCache {
     return copied
 }
 
+/// An independent copy of `cache` cut back to its first `keep` tokens, for
+/// restoring a cached prefix. Plain attention layers copy only those tokens,
+/// so reusing just the chat header of a long entry doesn't drag the rest of
+/// that entry along; with `toF16`, quantized ones come back as f16 (see the
+/// hit path for why). Other layer types (a scheme's layout, a sliding-window
+/// ring) are copied whole and rewound. Every copy is evaluated in one GPU
+/// pass. `nil` when some layer can't rewind that far, such as a ring already
+/// past its window: the caller then prefills from scratch.
+private func restorePrefix(_ cache: [any KVCache], keep: Int, toF16: Bool) -> [any KVCache]? {
+    guard keep > 0, cache.allSatisfy({ $0.offset >= keep }) else { return nil }
+    let cut = { (a: MLXArray) -> MLXArray in a[.ellipsis, ..<keep, 0...] }
+    var restored: [any KVCache] = []
+    var rewind: [any KVCache] = []
+    var pending: [MLXArray] = []
+    for layer in cache {
+        // Exact classes only: a subclass may hold arrays that aren't laid out
+        // by token, which a cut along the token axis would corrupt.
+        if let simple = layer as? KVCacheSimple, type(of: simple) == KVCacheSimple.self {
+            let copy = KVCacheSimple()
+            copy.state = simple.state.map { cut($0) * 1 }   // `* 1` detaches; offset = keep
+            restored.append(copy)
+            pending += copy.state
+        } else if let q = layer as? QuantizedKVCache, type(of: q) == QuantizedKVCache.self,
+                  let prefix = q.copy() as? QuantizedKVCache {
+            // Views of the first `keep` tokens, with groupSize, bits and mode.
+            prefix.state = q.state.map(cut)
+            prefix.offset = keep
+            let copy: any KVCache
+            if toF16 {
+                copy = prefix.toUnquantized()   // fresh arrays: dequantizes just `keep` tokens
+            } else {
+                prefix.state = prefix.state.map { $0 * 1 }
+                copy = prefix
+            }
+            restored.append(copy)
+            pending += copy.state
+        } else {
+            guard canTrimPromptCache([layer], numTokens: layer.offset - keep) else { return nil }
+            var copy = layer.copy()
+            copy.state = copy.state.map { $0 * 1 }   // copy() shares buffers; detach
+            restored.append(copy)
+            rewind.append(copy)
+            pending += copy.state
+        }
+    }
+    MLX.eval(pending)
+    for layer in rewind {
+        let n = layer.offset - keep
+        guard layer.trim(n) == n else { return nil }
+    }
+    return restored
+}
+
 /// Take an independent snapshot of a live KV cache for the prompt cache.
 ///
 /// Attention layers are quantized to `bits` (`trim()` just decrements the offset
@@ -820,48 +873,54 @@ public func mlxChatGenerate(
                 // `canTrimPromptCache` is the SWA fallback: for Gemma-style
                 // sliding-window models `RotatingKVCache.isTrimmable` flips to
                 // false once the conversation exceeds the window, in which case
-                // we silently fall back to a cold prefill. Same guard on the
-                // save path below skips snapshotting non-trimmable caches at all.
+                // we silently fall back to a cold prefill, as we do when a
+                // layer can't rewind as far as the restore needs. Same guard on
+                // the save path below skips snapshotting non-trimmable caches.
                 let liveCache: [any KVCache]
                 var iterator: TokenIterator
                 let snapshotBits: Int   // precision to re-snapshot the live cache at
-                let wasMiss: Bool
+                let storeAsIs: Bool     // live cache is already in stored form
 
+                // A hit restores the shared prefix, minus the last prompt token
+                // when the whole prompt is cached: TokenIterator needs at least
+                // one token to produce the logits it samples from.
+                //
+                // Without a KV scheme the prefix comes back as f16, so the new
+                // tokens keep full precision and the save below snapshots the
+                // state at `highBits`, as on a miss. Appending to the quantized
+                // snapshot instead leaves the whole new conversation at that
+                // width: a 4-bit entry shared only through the chat header made
+                // entire long prompts 4-bit (garbled answers) and, at 4 bits,
+                // never spilled to disk. Under a scheme the restored state
+                // keeps the scheme's layout and is stored as it is.
+                var restoredHit: (cache: [any KVCache], keep: Int, bits: Int, storeAsIs: Bool)? = nil
                 if let hit = state.promptCache.lookup(tokenIds: tokenIds),
                    canTrimPromptCache(hit.entry.kvCache) {
                     let cachedLen = hit.entry.tokenIds.count
-                    let prefixLen = hit.prefixLength      // 1 ≤ prefixLen ≤ tokenIds.count, ≤ cachedLen
-
-                    // If the cached state covers exactly the shared prefix (no
-                    // trim needed), consume it in place — the save below will
-                    // drop this entry by token prefix anyway, so we don't need
-                    // an independent copy. Otherwise we have to deep-copy, since
-                    // trimming + prefilling would mutate the surviving entry.
-                    let restored: [any KVCache]
-                    if prefixLen == cachedLen {
-                        restored = hit.entry.kvCache
-                    } else {
-                        restored = hit.entry.kvCache.map { deepCopyCache($0) }
-                        trimPromptCache(restored, numTokens: cachedLen - prefixLen)
+                    let keep = min(hit.prefixLength, tokenIds.count - 1)
+                    if mlxKVScheme == nil {
+                        if let copy = restorePrefix(hit.entry.kvCache, keep: keep, toF16: true) {
+                            restoredHit = (copy, keep, highBits, false)
+                        }
+                    } else if hit.prefixLength == cachedLen {
+                        // The entry is exactly a prefix of this prompt, so the
+                        // save below drops it: consume it in place, no copy.
+                        let n = cachedLen - keep
+                        if n == 0 || (canTrimPromptCache(hit.entry.kvCache, numTokens: n)
+                                      && trimPromptCache(hit.entry.kvCache, numTokens: n) == n) {
+                            restoredHit = (hit.entry.kvCache, keep, hit.entry.bits, true)
+                        }
+                    } else if let copy = restorePrefix(hit.entry.kvCache, keep: keep, toF16: false) {
+                        restoredHit = (copy, keep, hit.entry.bits, true)
                     }
+                }
 
-                    let seedTokens: [Int32]
-                    if prefixLen < tokenIds.count {
-                        seedTokens = Array(tokenIds[prefixLen...])
-                    } else {
-                        // Whole prompt already cached — re-process just the last
-                        // token so TokenIterator has logits to sample from.
-                        trimPromptCache(restored, numTokens: 1)
-                        seedTokens = [tokenIds[tokenIds.count - 1]]
-                    }
-
-                    liveCache = restored
-                    // Keep the precision we restored at — re-quantizing a coarse
-                    // state to a finer width recovers no information.
-                    snapshotBits = hit.entry.bits
-                    wasMiss = false
+                if let hit = restoredHit {
+                    liveCache = hit.cache
+                    snapshotBits = hit.bits
+                    storeAsIs = hit.storeAsIs
                     iterator = try TokenIterator(
-                        input: LMInput(tokens: MLXArray(seedTokens)),
+                        input: LMInput(tokens: MLXArray(Array(tokenIds[hit.keep...]))),
                         model: context.model,
                         cache: liveCache,
                         parameters: params
@@ -891,7 +950,7 @@ public func mlxChatGenerate(
                     liveCache = fresh
                     // Miss: snapshot near-losslessly.
                     snapshotBits = highBits
-                    wasMiss = true
+                    storeAsIs = false
                     iterator = try TokenIterator(
                         input: LMInput(tokens: MLXArray(seedTokens)),
                         model: context.model,
@@ -942,21 +1001,19 @@ public func mlxChatGenerate(
                 // non-trimmable caches (Mamba/SSM hybrids): they could only ever
                 // be matched whole, which is never useful for prefix reuse.
                 //
-                // On a miss the live cache is f16 KVCacheSimple — quantize as we
-                // store (a raw KVCacheSimple snapshot would share buffers with
-                // the still-mutating live cache). On a hit the cache's
-                // QuantizedKVCache layers are already independent — deep-copied
-                // for partial-prefix hits, exclusively owned for full-prefix
-                // hits (the dedup in `save` drops the original entry) — so we
-                // hand them to `save` directly. This avoids the redundant
-                // post-generation deep copy that was happening on every hit.
-                // Under a KV scheme a miss's layers are already compressed, so
-                // they're handed over the same way (`compactFinishedCache`).
+                // On a miss, and on a hit restored as f16, the live cache is f16
+                // KVCacheSimple — quantize as we store (a raw KVCacheSimple
+                // snapshot would share buffers with the still-mutating live
+                // cache). Under a KV scheme a hit's layers are already in the
+                // scheme's layout and independent — copied, or the consumed
+                // entry itself (the dedup in `save` drops the original) — so
+                // they're handed to `save` directly, and a miss's layers go
+                // through `compactFinishedCache`.
                 if canTrimPromptCache(liveCache) {
                     // A failed snapshot only loses the cache entry — the
                     // generation already streamed, so never fail it here.
                     let toStore: [any KVCache]?
-                    if !wasMiss {
+                    if storeAsIs {
                         toStore = liveCache
                     } else if mlxKVScheme != nil {
                         toStore = try? compactFinishedCache(liveCache, bits: snapshotBits)
