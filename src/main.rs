@@ -103,6 +103,11 @@ enum Commands {
         #[arg(long, conflicts_with = "kv_ram_cache")]
         no_kv_ram_cache: bool,
 
+        /// KV cache compression for MLX models, e.g. turbo8v3 (TurboQuant: 8-bit keys,
+        /// 3-bit values) or turbo0v4. GGUF models are unaffected. Default: f16
+        #[arg(long)]
+        kv_scheme: Option<String>,
+
         /// Concurrent sequence slots per model for batch scheduling (0 = disabled)
         #[arg(long, default_value = "0")]
         batch_slots: usize,
@@ -147,6 +152,10 @@ enum Commands {
         /// Enable KV cache for prompt prefixes (e.g. "2G", default 2G when enabled)
         #[arg(long)]
         kv_cache: Option<Option<String>>,
+
+        /// KV cache compression for MLX models, e.g. turbo8v3 or turbo0v4 (see `serve --help`)
+        #[arg(long)]
+        kv_scheme: Option<String>,
 
         /// Path to an image file to include with the prompt (requires vision model)
         #[cfg(feature = "vision")]
@@ -264,6 +273,27 @@ async fn connect_server(
                  start one with `spindll serve` ({e})"
             )
         })
+}
+
+/// Apply `--kv-scheme` before any model loads. Only MLX generation reads it.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+fn apply_kv_scheme(scheme: Option<&str>) -> anyhow::Result<()> {
+    let Some(scheme) = scheme else { return Ok(()) };
+    spindll::backend::mlx_swift::set_kv_scheme(Some(scheme))?;
+    println!("kv scheme (MLX models): {scheme}");
+    Ok(())
+}
+
+/// Without the MLX backend nothing would read `--kv-scheme`, so refuse it
+/// instead of silently ignoring it.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
+fn apply_kv_scheme(scheme: Option<&str>) -> anyhow::Result<()> {
+    match scheme {
+        None => Ok(()),
+        Some(s) => anyhow::bail!(
+            "--kv-scheme {s} needs the MLX backend (Apple Silicon, built with --features mlx)"
+        ),
+    }
 }
 
 /// Parse a human-readable size like "2G", "512M" into bytes. Defaults to 2GB.
@@ -545,6 +575,7 @@ async fn main() -> anyhow::Result<()> {
             no_kv_cache,
             kv_ram_cache,
             no_kv_ram_cache,
+            kv_scheme,
             batch_slots,
             ram_cache,
             http_port,
@@ -589,6 +620,7 @@ async fn main() -> anyhow::Result<()> {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
                 spindll::backend::mlx_swift::set_cache_budgets(0, 0);
             }
+            apply_kv_scheme(kv_scheme.as_deref())?;
 
             if let Some(cache_size) = ram_cache {
                 let bytes = match cache_size.as_deref() {
@@ -669,6 +701,7 @@ async fn main() -> anyhow::Result<()> {
             ctx_size,
             budget,
             kv_cache,
+            kv_scheme,
             #[cfg(feature = "vision")]
             image,
             #[cfg(feature = "vision")]
@@ -687,6 +720,7 @@ async fn main() -> anyhow::Result<()> {
                 let bytes = parse_size_bytes(cache_size.as_deref());
                 manager.enable_kv_cache(bytes);
             }
+            apply_kv_scheme(kv_scheme.as_deref())?;
 
             #[cfg(feature = "vision")]
             let has_image = image.is_some();
