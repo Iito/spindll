@@ -47,9 +47,12 @@ change ships.
   `-mmacosx-version-min=15.0` on the metal compile. Without it the metallib
   targets Metal 4.0 (the macos-26 SDK default) and macOS 15's loader rejects it
   at runtime — this shipped once, in v0.9.0.
-- **Swift toolchain**: mlx-swift-lm is pinned to a release tag (`exact:` in
-  `mlx_bridge/Package.swift`), with its default FoundationModelsIntegration
-  trait off. The test hardware runs Swift natively with no toolchain overlay.
+- **Swift toolchain and SDK**: mlx-swift-lm is pinned to a release tag
+  (`exact:` in `mlx_bridge/Package.swift`), with its default
+  FoundationModelsIntegration trait off. The bridge needs Swift 6.3+ and the
+  macOS 26 SDK: a swift.org toolchain on an older Xcode fails, and `build.rs`
+  stops early with the fix. The test hardware runs Swift natively with no
+  toolchain overlay.
 
 ## Review lanes on Apple Silicon
 

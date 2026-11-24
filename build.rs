@@ -36,6 +36,8 @@ fn build_mlx_bridge() -> Result<(), Box<dyn std::error::Error>> {
     // Fail fast on a missing Metal Toolchain BEFORE the multi-minute Swift
     // build, so the actionable hint is the first thing the build says.
     preflight_metal_toolchain(&manifest_dir)?;
+    // Likewise for an SDK too old for the MLX Swift packages.
+    preflight_macos_sdk()?;
 
     // mlx-swift 0.31.5+ declares swift-tools 6.3, so SwiftPM must be at least
     // that new to parse the dependency manifests — newer than the SwiftPM in
@@ -183,6 +185,41 @@ fn metallib_stamp_path(dest: &std::path::Path) -> std::path::PathBuf {
 fn metallib_is_current(dest: &std::path::Path, fingerprint: &str) -> bool {
     dest.exists()
         && std::fs::read_to_string(metallib_stamp_path(dest)).is_ok_and(|s| s == fingerprint)
+}
+
+/// Oldest macOS SDK the bridge's Swift dependencies compile against.
+/// mlx-swift-lm 3.33 builds in Swift 6 mode and relies on Sendable
+/// annotations the macOS 26 SDK added (CoreImage's `CIContext`, for one).
+/// It gates them on the compiler version rather than the SDK, so a swift.org
+/// 6.3 toolchain on an older Xcode's SDK fails minutes into the build, with a
+/// concurrency error deep inside upstream code.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const MIN_MACOS_SDK_FOR_BRIDGE: u32 = 26;
+
+/// Fail fast when the SDK is older than `MIN_MACOS_SDK_FOR_BRIDGE`. An SDK
+/// version that can't be read passes: the build itself will say what's wrong.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn preflight_macos_sdk() -> Result<(), Box<dyn std::error::Error>> {
+    // No `--sdk`, so this honors SDKROOT as well as DEVELOPER_DIR.
+    let Ok(out) = std::process::Command::new("xcrun").arg("--show-sdk-version").output() else {
+        return Ok(());
+    };
+    let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let major = version.split('.').next().and_then(|m| m.parse::<u32>().ok());
+    match major {
+        Some(major) if out.status.success() && major < MIN_MACOS_SDK_FOR_BRIDGE => Err(format!(
+            "mlx_bridge needs the macOS {MIN_MACOS_SDK_FOR_BRIDGE} SDK or newer, but this build \
+             would use macOS {version}. mlx-swift-lm relies on Sendable annotations that SDK \
+             added, so a newer Swift toolchain alone does not help.\n\
+             Fix one of:\n\
+             - select an Xcode 26.4+ install: sudo xcode-select -s /Applications/Xcode.app\n\
+             - point just this build at an Xcode 26+ install:\n  \
+               DEVELOPER_DIR=/Applications/Xcode-26.app/Contents/Developer cargo build ...\n  \
+               (that Xcode needs its Metal Toolchain too: xcodebuild -downloadComponent MetalToolchain)"
+        )
+        .into()),
+        _ => Ok(()),
+    }
 }
 
 /// Issue #75 friction: when `mlx.metallib` will need compiling this build,

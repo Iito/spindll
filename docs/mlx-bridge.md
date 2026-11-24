@@ -81,8 +81,14 @@ The build steps are:
    `~/Library/Developer/Toolchains` or `/Library/Developer/Toolchains`
    (selected via `TOOLCHAINS` for the SwiftPM child process only). If none
    qualifies it aborts with install hints. Xcode 26.4+ satisfies this natively;
-   Xcode ≤ 26.3 needs a [swift.org toolchain](https://www.swift.org/install/macos/)
+   Xcode 26.0–26.3 needs a [swift.org toolchain](https://www.swift.org/install/macos/)
    alongside — the metallib step below stays on the `xcode-select`'d Xcode either way.
+   The SDK must be macOS 26 or newer, whatever the toolchain: mlx-swift-lm relies on
+   Sendable annotations that SDK added, so a swift.org toolchain on Xcode 16 fails
+   deep in the build. `build.rs` checks `xcrun --show-sdk-version` first and stops
+   with the fix. To build on a Mac whose selected Xcode is older, point the build at
+   an Xcode 26 install with `DEVELOPER_DIR=/Applications/<Xcode 26>.app/Contents/Developer`;
+   that Xcode needs its own Metal Toolchain.
 2. `compile_mlx_metallib` walks `mlx_bridge/.build/checkouts/mlx-swift/Source/Cmlx/mlx-generated/metal/`, compiles every `.metal` file with `xcrun -sdk macosx metal`, and links the resulting `.air` files into `mlx.metallib` next to the spindll binary. MLX's `device.cpp` discovers the metallib via `load_colocated_library("mlx")`, so it must sit next to the binary. The binary also embeds a copy and writes it out at startup if the file next to it is missing or a different size. A built metallib is reused only while `mlx.metallib.stamp` beside it matches a fingerprint of the shader tree and the compile flags, so an mlx-swift bump recompiles it rather than shipping the old kernels.
 3. Cargo links the static archive plus `Foundation`, `Metal`, `Accelerate`, `MetalPerformanceShaders`, and adds rpaths for the Xcode Swift toolchain and `/usr/lib/swift` so `libswift_Concurrency.dylib` resolves at runtime.
 
