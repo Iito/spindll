@@ -307,20 +307,24 @@ private final class PromptCache {
     /// Total in-RAM byte budget for the cache. Configured via `mlx_set_cache_budgets`
     /// (wired to `--kv-ram-cache`); `0` disables the prompt cache entirely.
     private let maxBytes: Int64
-    /// Don't reuse a state that shares only a handful of tokens — the prefill
-    /// we would save is dwarfed by the deep-copy + trim + re-snapshot overhead.
-    /// 64 tokens covers a typical chat-template wrapping plus a short turn; below
-    /// that, restoring is a net loss vs. a cold prefill.
+    /// Shortest shared prefix worth restoring. A restore copies only the shared
+    /// tokens, in one GPU pass, while each prompt token it skips saves a whole
+    /// forward pass of prefill, so even the chat-template header every prompt
+    /// opens with (system prompt and role markers, often 20-40 tokens) pays off,
+    /// most of all on large models. Shorter shares save too little to matter.
     private let minPrefix: Int
     /// Only touch the on-disk tier for prompts at least this long — for short
     /// prompts, reading an ~tens-of-MB safetensors back costs more than just
     /// re-prefilling. The RAM tier is used regardless of length.
     private let diskMinTokens = 512
+    /// How many more prompt tokens than the RAM hit a disk entry must cover
+    /// before loading it is worth the I/O.
+    private let diskMinGain = 64
     /// Model identity (digest of config.json) — namespaces this model's entries
     /// in the shared on-disk tier.
     private let modelDigest: String
 
-    init(modelDigest: String, maxBytes: Int64? = nil, minPrefix: Int = 64) {
+    init(modelDigest: String, maxBytes: Int64? = nil, minPrefix: Int = 16) {
         self.modelDigest = modelDigest
         self.maxBytes    = maxBytes ?? mlxRamCacheBudget
         self.minPrefix   = minPrefix
@@ -329,13 +333,17 @@ private final class PromptCache {
     private var usedBytes: Int64 { entries.reduce(0) { $0 + $1.sizeBytes } }
 
     /// RAM lookup: the entry sharing the longest token prefix with `tokenIds`
-    /// (≥ `minPrefix`), promoted to the front of the LRU list.
+    /// (≥ `minPrefix`), promoted to the front of the LRU list. Among entries
+    /// that share equally far (every conversation shares the chat header), the
+    /// finer snapshot wins, then the most recent.
     private func lookupRam(_ tokenIds: [Int32]) -> PromptCacheHit? {
         var bestIdx: Int? = nil
         var bestLen = 0
         for (i, e) in entries.enumerated() {
             let l = commonPrefixLength(e.tokenIds, tokenIds)
-            if l > bestLen { bestLen = l; bestIdx = i }
+            let better = l > bestLen
+                || (l == bestLen && bestIdx.map { e.bits > entries[$0].bits } == true)
+            if better { bestLen = l; bestIdx = i }
         }
         guard let idx = bestIdx, bestLen >= minPrefix else { return nil }
         let entry = entries.remove(at: idx)
@@ -350,11 +358,16 @@ private final class PromptCache {
     /// cache.
     func lookup(tokenIds: [Int32]) -> PromptCacheHit? {
         guard !tokenIds.isEmpty else { return nil }
-        if maxBytes > 0, let hit = lookupRam(tokenIds) { return hit }
+        let ram = maxBytes > 0 ? lookupRam(tokenIds) : nil
+        // A RAM hit can cover as little as the chat header, so a long prompt
+        // still asks the disk tier, which may hold far more of it.
+        let covered = ram?.prefixLength ?? 0
         guard tokenIds.count >= diskMinTokens,
+              tokenIds.count - covered >= diskMinGain,
               let d = sharedMlxDiskCache.lookup(
-                modelDigest: modelDigest, tokenIds: tokenIds, minPrefix: minPrefix)
-        else { return nil }
+                modelDigest: modelDigest, tokenIds: tokenIds,
+                minPrefix: max(minPrefix, covered + diskMinGain))
+        else { return ram }
         let entry = PromptCacheEntry(tokenIds: d.tokenIds, kvCache: d.kvCache, bits: d.bits)
         entry.spilled = true   // it came from disk; no need to write it back
         if maxBytes > 0 {
