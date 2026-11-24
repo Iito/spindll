@@ -551,8 +551,11 @@ public func mlxGenerate(
 
     Task {
         do {
+            // No prompt cache here, so TokenIterator can convert the cache to
+            // the scheme itself.
             let params = GenerateParameters(
                 maxTokens: Int(maxTokens),
+                kvScheme: mlxKVScheme,
                 temperature: temperature,
                 topP: topP
             )
@@ -1066,8 +1069,11 @@ public func mlxChatGenerateVision(
 
     Task {
         do {
+            // No prompt cache on the vision path, so TokenIterator can convert
+            // the cache to the scheme itself.
             let params = GenerateParameters(
                 maxTokens: Int(maxTokens),
+                kvScheme: mlxKVScheme,
                 temperature: temperature,
                 topP: topP
             )
