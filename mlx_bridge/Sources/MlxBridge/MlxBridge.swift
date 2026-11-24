@@ -581,8 +581,11 @@ public func mlxGenerate(
 
                 // Wait for in-flight async evaluations to finish before the
                 // perform closure tears down — mirrors upstream's sync loop
-                // in `runSynchronousGenerationLoop` (Evaluate.swift:1134).
-                Stream().synchronize()
+                // in `runSynchronousGenerationLoop`. It has to be the default
+                // stream, which TokenIterator evaluates on: since mlx-swift
+                // 0.33, `Stream()` makes a new, empty stream, and waiting on
+                // that one returns at once.
+                Stream.defaultStream.synchronize()
             }
             box.value = generated
         } catch {
@@ -882,7 +885,7 @@ public func mlxChatGenerate(
                     }
                 }
 
-                Stream().synchronize()
+                Stream.defaultStream.synchronize()
             }
             box.value = generated
         } catch {
@@ -1114,7 +1117,7 @@ public func mlxChatGenerateVision(
                     _ = chunk.withCString { ptr in callback(ptr, callbackCtx) }
                 }
 
-                Stream().synchronize()
+                Stream.defaultStream.synchronize()
             }
             box.value = generated
         } catch {
