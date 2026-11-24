@@ -83,7 +83,7 @@ The build steps are:
    qualifies it aborts with install hints. Xcode 26.4+ satisfies this natively;
    Xcode ≤ 26.3 needs a [swift.org toolchain](https://www.swift.org/install/macos/)
    alongside — the metallib step below stays on the `xcode-select`'d Xcode either way.
-2. `compile_mlx_metallib` walks `mlx_bridge/.build/checkouts/mlx-swift/Source/Cmlx/mlx-generated/metal/`, compiles every `.metal` file with `xcrun -sdk macosx metal`, and links the resulting `.air` files into `mlx.metallib` next to the spindll binary. MLX's `device.cpp` discovers the metallib via `load_colocated_library("mlx")`, so it must sit next to the binary.
+2. `compile_mlx_metallib` walks `mlx_bridge/.build/checkouts/mlx-swift/Source/Cmlx/mlx-generated/metal/`, compiles every `.metal` file with `xcrun -sdk macosx metal`, and links the resulting `.air` files into `mlx.metallib` next to the spindll binary. MLX's `device.cpp` discovers the metallib via `load_colocated_library("mlx")`, so it must sit next to the binary. The binary also embeds a copy and writes it out at startup if the file next to it is missing or a different size. A built metallib is reused only while `mlx.metallib.stamp` beside it matches a fingerprint of the shader tree and the compile flags, so an mlx-swift bump recompiles it rather than shipping the old kernels.
 3. Cargo links the static archive plus `Foundation`, `Metal`, `Accelerate`, `MetalPerformanceShaders`, and adds rpaths for the Xcode Swift toolchain and `/usr/lib/swift` so `libswift_Concurrency.dylib` resolves at runtime.
 
 If `xcrun metal` reports "missing Metal Toolchain", the build aborts with the install hint:
@@ -92,7 +92,7 @@ If `xcrun metal` reports "missing Metal Toolchain", the build aborts with the in
 xcodebuild -downloadComponent MetalToolchain
 ```
 
-Recompilation is gated on `mlx_bridge/Sources` and `mlx_bridge/Package.swift` (`rerun-if-changed`), so editing Swift code or bumping dependencies in `Package.swift` triggers a rebuild on the next `cargo build`.
+Recompilation is gated on `mlx_bridge/Sources`, `mlx_bridge/Package.swift` and `mlx_bridge/Package.resolved` (`rerun-if-changed`), so editing Swift code or bumping dependencies, in the manifest or the lockfile alone, triggers a rebuild on the next `cargo build`.
 
 ## Updating dependencies
 

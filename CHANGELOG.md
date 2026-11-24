@@ -20,6 +20,7 @@ All notable changes to this project will be documented in this file.
 - **`spindll serve --ram-cache <model>` no longer swallows the model name** — the optional flag value consumed the positional argument, silently falling back to the default cache size and preloading nothing.
 - **`cargo build --all-targets` works without extra features** — the benchmark client at `src/bin/bench.rs` was picked up as an ordinary binary with no feature gate, so any all-targets build or `cargo clippy --all-targets` on a default-feature checkout failed on missing argument-parsing dependencies. It now declares the `cli` feature it needs and is skipped unless that feature is on.
 - **`cargo build --features cli` compiles again** — the Anthropic and Responses dialect modules were not gated behind the `http` feature they depend on.
+- **An in-place `cargo build` no longer ships stale MLX GPU kernels** — `build.rs` reused any `mlx.metallib` already in the target directory, so after an mlx-swift update the new binary embedded the old version's kernels. The metallib now carries a fingerprint of the shader sources and compile flags and is rebuilt when they change, and a change to `mlx_bridge/Package.resolved` alone also reruns the bridge build.
 
 ## [0.9.3] - 2026-08-22
 

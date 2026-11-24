@@ -28,12 +28,14 @@ fn build_mlx_bridge() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cargo:rerun-if-changed=mlx_bridge/Sources");
     println!("cargo:rerun-if-changed=mlx_bridge/Package.swift");
+    // A lockfile-only bump changes the MLX code and shaders just the same.
+    println!("cargo:rerun-if-changed=mlx_bridge/Package.resolved");
 
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")?;
 
     // Fail fast on a missing Metal Toolchain BEFORE the multi-minute Swift
     // build, so the actionable hint is the first thing the build says.
-    preflight_metal_toolchain()?;
+    preflight_metal_toolchain(&manifest_dir)?;
 
     // mlx-swift 0.31.5+ declares swift-tools 6.3, so SwiftPM must be at least
     // that new to parse the dependency manifests — newer than the SwiftPM in
@@ -121,16 +123,84 @@ fn metallib_dest_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>
     Ok(bin_dir.join("mlx.metallib"))
 }
 
+/// MLX's pre-generated shader tree, inside SwiftPM's checkout of mlx-swift.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn metal_src_dir(manifest_dir: &str) -> std::path::PathBuf {
+    std::path::Path::new(manifest_dir)
+        .join("mlx_bridge/.build/checkouts/mlx-swift/Source/Cmlx/mlx-generated/metal")
+}
+
+/// Flags for every .metal → .air compile. They are part of the metallib
+/// fingerprint, so changing them recompiles a cached metallib.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const METAL_FLAGS: &[&str] = &[
+    "-O2",
+    // Pin the Metal deployment target to the mlx_bridge platform
+    // floor (Package.swift: .macOS(.v15)). Without it the compiler
+    // defaults to the SDK's own OS — a metallib built on the
+    // macos-26 runner targets Metal language 4.0, which macOS 15's
+    // loader rejects ("language version 4.0 is not supported").
+    "-mmacosx-version-min=15.0",
+];
+
+/// Fingerprint of everything `mlx.metallib` is built from: `METAL_FLAGS` and
+/// every file in the shader tree, headers included (the compile passes the
+/// tree as `-I`), by relative path and contents. FNV-1a rather than std's
+/// hasher, whose output may change between Rust releases.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn metallib_fingerprint(metal_src: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+    let mut files = Vec::new();
+    collect_files(metal_src, &mut files)?;
+    files.sort();
+
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    // Length-prefixed, so no two different inputs feed the same byte stream.
+    let mut field = |bytes: &[u8]| {
+        for &b in (bytes.len() as u64).to_le_bytes().iter().chain(bytes) {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for flag in METAL_FLAGS {
+        field(flag.as_bytes());
+    }
+    for file in &files {
+        field(file.strip_prefix(metal_src)?.to_string_lossy().as_bytes());
+        field(&std::fs::read(file)?);
+    }
+    Ok(format!("{hash:016x}"))
+}
+
+/// Where the fingerprint of the metallib at `dest` is recorded.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn metallib_stamp_path(dest: &std::path::Path) -> std::path::PathBuf {
+    dest.with_extension("metallib.stamp")
+}
+
+/// True when the metallib at `dest` was built from inputs with `fingerprint`.
+/// A metallib from before stamps existed counts as stale, and is rebuilt once.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn metallib_is_current(dest: &std::path::Path, fingerprint: &str) -> bool {
+    dest.exists()
+        && std::fs::read_to_string(metallib_stamp_path(dest)).is_ok_and(|s| s == fingerprint)
+}
+
 /// Issue #75 friction: when `mlx.metallib` will need compiling this build,
 /// verify the Metal Toolchain exists up front instead of surfacing the error
-/// after the long Swift build. A cached metallib skips the check entirely
+/// after the long Swift build. A reusable cached metallib skips the check
 /// (matching `compile_mlx_metallib`'s skip); any other `xcrun` hiccup is left
 /// for the real compile step to report with full context.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn preflight_metal_toolchain() -> Result<(), Box<dyn std::error::Error>> {
+fn preflight_metal_toolchain(manifest_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
     use std::process::Command;
 
-    if metallib_dest_path()?.exists() {
+    // This runs before SwiftPM updates its checkouts, so right after an
+    // mlx-swift bump it can still see the old shaders and skip. The compile
+    // step then reports a missing toolchain itself, just later.
+    let dest = metallib_dest_path()?;
+    let reusable = metallib_fingerprint(&metal_src_dir(manifest_dir))
+        .is_ok_and(|fp| metallib_is_current(&dest, &fp));
+    if reusable {
         return Ok(());
     }
     let Ok(out) = Command::new("xcrun")
@@ -161,22 +231,20 @@ fn compile_mlx_metallib(manifest_dir: &str) -> Result<(), Box<dyn std::error::Er
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    let metal_src = PathBuf::from(manifest_dir)
-        .join("mlx_bridge/.build/checkouts/mlx-swift/Source/Cmlx/mlx-generated/metal");
+    let metal_src = metal_src_dir(manifest_dir);
 
     let out_dir = std::env::var("OUT_DIR")?;
     let metallib_dest = metallib_dest_path()?;
     let metallib_out = Path::new(&out_dir).join("mlx.metallib");
 
-    // Skip recompilation if the metallib is already in the binary dir.
-    // The build script re-runs whenever mlx_bridge/Sources changes (rerun-if-changed above),
-    // so the metallib will be refreshed when shaders change.
-    if metallib_dest.exists() {
-        // Ensure OUT_DIR has a copy for include_bytes!() even when the
-        // build-script hash changes across rebuilds.
-        if !metallib_out.exists() {
-            std::fs::copy(&metallib_dest, &metallib_out)?;
-        }
+    // Reuse the metallib in the binary dir only if it was built from these
+    // exact shaders and flags. An mlx-swift bump changes the kernels, and a
+    // stale metallib would be embedded into the binary as is.
+    let fingerprint = metallib_fingerprint(&metal_src)?;
+    if metallib_is_current(&metallib_dest, &fingerprint) {
+        // Refresh OUT_DIR's copy for include_bytes!(): OUT_DIR moves when the
+        // build-script hash changes, and an old one can hold a stale copy.
+        std::fs::copy(&metallib_dest, &metallib_out)?;
         return Ok(());
     }
 
@@ -195,15 +263,9 @@ fn compile_mlx_metallib(manifest_dir: &str) -> Result<(), Box<dyn std::error::Er
         let air_file = Path::new(&out_dir).join(format!("{safe_name}.air"));
 
         let out = Command::new("xcrun")
+            .args(["-sdk", "macosx", "metal"])
+            .args(METAL_FLAGS)
             .args([
-                "-sdk", "macosx", "metal",
-                "-O2",
-                // Pin the Metal deployment target to the mlx_bridge platform
-                // floor (Package.swift: .macOS(.v15)). Without it the compiler
-                // defaults to the SDK's own OS — a metallib built on the
-                // macos-26 runner targets Metal language 4.0, which macOS 15's
-                // loader rejects ("language version 4.0 is not supported").
-                "-mmacosx-version-min=15.0",
                 "-c", metal_file.to_str().unwrap(),
                 "-o", air_file.to_str().unwrap(),
                 "-I", metal_src.to_str().unwrap(),
@@ -241,7 +303,15 @@ fn compile_mlx_metallib(manifest_dir: &str) -> Result<(), Box<dyn std::error::Er
         return Err("metallib link failed".into());
     }
 
+    // Drop the old stamp first: a copy that fails halfway must not leave a
+    // stamp vouching for a half-written metallib.
+    let stamp = metallib_stamp_path(&metallib_dest);
+    match std::fs::remove_file(&stamp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
     std::fs::copy(&metallib_out, &metallib_dest)?;
+    std::fs::write(&stamp, &fingerprint)?;
     println!("cargo:warning=compiled mlx.metallib → {}", metallib_dest.display());
 
     Ok(())
@@ -354,14 +424,21 @@ fn select_swift_toolchain() -> Result<Option<String>, Box<dyn std::error::Error>
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn collect_metal_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
     let mut files = Vec::new();
+    collect_files(dir, &mut files)?;
+    files.retain(|path| path.extension().and_then(|e| e.to_str()) == Some("metal"));
+    Ok(files)
+}
+
+/// Append every file under `dir`, recursively, to `files`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn collect_files(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
+        let path = entry?.path();
         if path.is_dir() {
-            files.extend(collect_metal_files(&path)?);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("metal") {
+            collect_files(&path, files)?;
+        } else {
             files.push(path);
         }
     }
-    Ok(files)
+    Ok(())
 }
