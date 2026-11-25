@@ -48,12 +48,29 @@ private final class Box<T>: @unchecked Sendable {
 
 private let kvGroupSize = 64
 
-/// Prompt tokens per prefill step. mlx-swift-lm defaults to 512 and clears
+/// Most prompt tokens per prefill step. mlx-swift-lm defaults to 512 and clears
 /// MLX's buffer cache after every step; Python mlx-lm's server takes 2048 at a
 /// time. Bigger steps spread each pass over the weights, and each cache clear,
 /// across more tokens, for a higher activation peak while a long prompt fills.
 /// A model with a sliding window still caps the step at its window.
-private let prefillStepSize = 2048
+private let prefillStepCeiling = 2048
+
+/// `params` with the prefill step for handing `count` tokens to a TokenIterator.
+///
+/// mlx-swift-lm's generic prefill passes a prompt that fits in one step to the
+/// iterator's first forward whole, and that forward projects every position
+/// onto the vocabulary to sample from the last one: on Llama 3.2 1B, ~2k tokens
+/// make about 1 TFLOP of work and 0.5 GB of logits thrown away. A longer prompt
+/// is chunked, leaving only its last token for that forward. So a prompt past
+/// the default step gets a step just under its length (at most the ceiling):
+/// chunked, with one token left over, as in mlx-lm. A shorter prompt keeps the
+/// single forward, cheaper there than another pass over the weights.
+private func withPrefillStep(_ params: GenerateParameters, count: Int) -> GenerateParameters {
+    var p = params
+    p.prefill.stepSize = count > PrefillParameters.defaultStepSize
+        ? min(prefillStepCeiling, count - 1) : nil
+    return p
+}
 
 private let fullBits = 16    // `bits` of an entry kept as computed, in f16
 private let highBits = 8     // width a KV scheme's leftover f16 layers are stored at
@@ -556,13 +573,12 @@ public func mlxGenerate(
         do {
             // No prompt cache here, so TokenIterator can convert the cache to
             // the scheme itself.
-            var params = GenerateParameters(
+            let params = GenerateParameters(
                 maxTokens: Int(maxTokens),
                 kvScheme: mlxKVScheme,
                 temperature: temperature,
                 topP: topP
             )
-            params.prefill.stepSize = prefillStepSize
 
             // Tokenise the already chat-template-formatted prompt directly.
             // Using UserInput(prompt:) + container.prepare() would re-apply the
@@ -576,7 +592,7 @@ public func mlxGenerate(
                 var iterator = try TokenIterator(
                     input: lmInput,
                     model: context.model,
-                    parameters: params
+                    parameters: withPrefillStep(params, count: tokenIds.count)
                 )
                 var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
 
@@ -807,12 +823,11 @@ public func mlxChatGenerate(
 
     Task {
         do {
-            var params = GenerateParameters(
+            let params = GenerateParameters(
                 maxTokens: Int(maxTokens),
                 temperature: temperature,
                 topP: topP
             )
-            params.prefill.stepSize = prefillStepSize
 
             var generated: Int32 = 0
             try await state.container.perform(nonSendable: messages) { context, msgs in
@@ -878,7 +893,7 @@ public func mlxChatGenerate(
                         input: LMInput(tokens: MLXArray(Array(tokenIds[hit.keep...]))),
                         model: context.model,
                         cache: liveCache,
-                        parameters: params
+                        parameters: withPrefillStep(params, count: tokenIds.count - hit.keep)
                     )
                 } else {
                     var fresh = try makePromptCache(model: context.model, parameters: params)
@@ -896,7 +911,7 @@ public func mlxChatGenerate(
                             input: LMInput(tokens: MLXArray(Array(tokenIds.dropLast()))),
                             model: context.model,
                             cache: fresh,
-                            parameters: params
+                            parameters: withPrefillStep(params, count: tokenIds.count - 1)
                         )
                         seedState = warm.state
                         maybeQuantizeKVCache(cache: &fresh, kvBits: nil, kvScheme: scheme)
@@ -910,7 +925,7 @@ public func mlxChatGenerate(
                         model: context.model,
                         cache: liveCache,
                         state: seedState,
-                        parameters: params
+                        parameters: withPrefillStep(params, count: seedTokens.count)
                     )
                 }
 
@@ -1124,14 +1139,14 @@ public func mlxChatGenerateVision(
     Task {
         do {
             // No prompt cache on the vision path, so TokenIterator can convert
-            // the cache to the scheme itself.
-            var params = GenerateParameters(
+            // the cache to the scheme itself. Vision models prefill through
+            // their own paths, so they keep the library's prefill step.
+            let params = GenerateParameters(
                 maxTokens: Int(maxTokens),
                 kvScheme: mlxKVScheme,
                 temperature: temperature,
                 topP: topP
             )
-            params.prefill.stepSize = prefillStepSize
 
             // Build UserInput from chat messages + optional image.
             // Find the index of the last user message so we can attach the image to it.
