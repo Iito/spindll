@@ -393,7 +393,7 @@ impl MlxSwiftEngine {
 
         // Chunks only drive `on_token`; usage takes the bridge's sampled count.
         for token in &rx {
-            // The Swift bridge emits an empty string as the EOS indicator.
+            // A token can decode to no new text; such chunks carry nothing.
             if token.is_empty() {
                 continue;
             }

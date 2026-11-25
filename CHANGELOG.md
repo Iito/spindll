@@ -8,6 +8,10 @@ All notable changes to this project will be documented in this file.
 
 - **`spindll serve <model>`, `spindll load`, `spindll unload`** — `serve` takes an optional model and preloads it before the ports open, so the server only accepts traffic once the model is ready and a failed load exits non-zero instead of leaving a warm-looking server with nothing in it. `load` / `unload` drive a running server over gRPC (`--port`, else the server's lockfile), which works on `--features cli` builds and servers started with `--http-port 0`.
 
+### Changed
+
+- **MLX runs on mlx-swift-lm 3.33.0 and mlx-swift 0.33** — up from an mlx-swift-lm `main` commit of 2026-08-17 on mlx-swift 0.31.6, and pinned to a release tag now instead of a commit. The three months of upstream work in between include fixes to rotating KV caches (the prompt-cache path of sliding-window models), prefill over a quantized KV cache through the fused attention kernel, and parallel weight loading. The bridge also stops building mlx-swift-lm's adapter for Apple's FoundationModels framework, which it never used and which has broken on Xcode 27 SDKs. Building with `--features mlx` now needs the macOS 26 SDK, so Xcode 26 or newer: a swift.org toolchain on an older Xcode is no longer enough, and `build.rs` says so before the Swift build starts.
+
 ### Fixed
 
 - **`spindll rm` no longer strips vision from a model you kept** — a vision repo ships one projector file shared by every quant variant it holds, and removing any single variant deleted it. The variants you kept stayed listed and loadable but silently lost image support, with nothing left on disk to recover from. The projector now survives for as long as any remaining model in its directory can use it — including the variants that record no path of their own and find it by scanning, which is how every model pulled as plain GGUF reaches it.
@@ -20,6 +24,8 @@ All notable changes to this project will be documented in this file.
 - **`spindll serve --ram-cache <model>` no longer swallows the model name** — the optional flag value consumed the positional argument, silently falling back to the default cache size and preloading nothing.
 - **`cargo build --all-targets` works without extra features** — the benchmark client at `src/bin/bench.rs` was picked up as an ordinary binary with no feature gate, so any all-targets build or `cargo clippy --all-targets` on a default-feature checkout failed on missing argument-parsing dependencies. It now declares the `cli` feature it needs and is skipped unless that feature is on.
 - **`cargo build --features cli` compiles again** — the Anthropic and Responses dialect modules were not gated behind the `http` feature they depend on.
+- **An in-place `cargo build` no longer ships stale MLX GPU kernels** — `build.rs` reused any `mlx.metallib` already in the target directory, so after an mlx-swift update the new binary embedded the old version's kernels. The metallib now carries a fingerprint of the shader sources and compile flags and is rebuilt when they change, and a change to `mlx_bridge/Package.resolved` alone also reruns the bridge build.
+- **MLX replies cut off mid-character keep their last text** — when generation stopped partway through a character spread over several tokens (an emoji or a CJK character cut by `max_tokens`), the end-of-reply flush called the detokenizer's `next()` again, which kept withholding the pending text, so the reply lost it. It's now emitted, with U+FFFD in place of the incomplete bytes.
 
 ## [0.9.3] - 2026-08-22
 
