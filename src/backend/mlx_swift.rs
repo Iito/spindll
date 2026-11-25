@@ -87,6 +87,10 @@ unsafe extern "C" {
     fn mlx_free_floats(data: *mut f32);
 
     fn mlx_set_cache_budgets(ram_bytes: u64, disk_bytes: u64);
+
+    // 0 on success, -1 (setting unchanged) for a name mlx-swift-lm doesn't
+    // know. NULL clears the scheme.
+    fn mlx_set_kv_scheme(scheme: *const c_char) -> i32;
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +106,29 @@ pub fn set_cache_budgets(ram_bytes: u64, disk_bytes: u64) {
     // side. We expect this to be called once at startup, before any concurrent
     // model loads or chat requests, so no synchronisation is needed.
     unsafe { mlx_set_cache_budgets(ram_bytes, disk_bytes) }
+}
+
+/// Choose the KV cache compression scheme MLX generation uses, e.g.
+/// `"turbo8v3"` (TurboQuant: 8-bit keys, 3-bit values), or `None` for the
+/// default f16 cache. The bridge checks the name against mlx-swift-lm's own
+/// list, so whatever the pinned version supports is accepted. Call once at
+/// startup, before any MLX model is loaded: each model's prompt-cache
+/// namespace is fixed at load time.
+pub fn set_kv_scheme(scheme: Option<&str>) -> anyhow::Result<()> {
+    let Some(scheme) = scheme else {
+        // Safety: NULL is the documented "clear" value.
+        unsafe { mlx_set_kv_scheme(std::ptr::null()) };
+        return Ok(());
+    };
+    let c = CString::new(scheme)
+        .map_err(|_| anyhow::anyhow!("KV cache scheme contains a NUL byte"))?;
+    // Safety: `c` outlives the call, and the bridge copies the string.
+    match unsafe { mlx_set_kv_scheme(c.as_ptr()) } {
+        0 => Ok(()),
+        _ => anyhow::bail!(
+            "unknown KV cache scheme {scheme:?} (try turbo8v3, turbo0v4, turbo4 or affine8)"
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -708,5 +735,25 @@ impl BackendModel for MlxSwiftEngine {
 impl Drop for MlxSwiftEngine {
     fn drop(&mut self) {
         unsafe { mlx_model_free(self.handle) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // One test owns the process-wide scheme, so parallel tests never race on
+    // it; it clears the setting on the way out.
+    #[test]
+    fn kv_scheme_takes_upstream_names_and_rejects_the_rest() {
+        for name in ["turbo8v3", "turbo0v4", "turbo4", "affine8"] {
+            assert!(set_kv_scheme(Some(name)).is_ok(), "{name} should be accepted");
+        }
+
+        let err = set_kv_scheme(Some("turbo9v9")).unwrap_err().to_string();
+        assert!(err.contains("turbo9v9"), "error should name the scheme: {err}");
+        assert!(set_kv_scheme(Some("turbo\08v3")).is_err(), "interior NUL must be refused");
+
+        assert!(set_kv_scheme(None).is_ok());
     }
 }

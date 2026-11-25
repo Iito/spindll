@@ -7,6 +7,11 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - **`spindll serve <model>`, `spindll load`, `spindll unload`** — `serve` takes an optional model and preloads it before the ports open, so the server only accepts traffic once the model is ready and a failed load exits non-zero instead of leaving a warm-looking server with nothing in it. `load` / `unload` drive a running server over gRPC (`--port`, else the server's lockfile), which works on `--features cli` builds and servers started with `--http-port 0`.
+- **`--kv-scheme` compresses the KV cache of MLX models** — `serve` and `run` take one of mlx-swift-lm's KV cache schemes, such as `turbo8v3` (TurboQuant: 8-bit keys, 3-bit values) or `affine8`. The KV cache is the memory that grows with every token of context; under `turbo8v3` a cached conversation takes about 30% less than the prompt cache's default 8-bit entries, and less than half of f16. It costs decode speed: with a 1.5B model on a base M4 at 16k tokens of context, the TurboQuant schemes decoded at roughly 35–45% of the f16 rate and `affine8` at about 90%. A single long prompt still peaks at f16 size, since the cache is compressed once prefill is done. The scheme works with the MLX prompt cache: reused prefixes stay in its compressed form in RAM and on disk, and on-disk entries are kept per scheme, so switching schemes starts a fresh disk cache rather than restoring state in the wrong layout. Unknown names fail at startup with a hint. GGUF models are unaffected, and builds without the MLX backend reject the flag.
+
+### Changed
+
+- **MLX runs on mlx-swift-lm 3.33.0 and mlx-swift 0.33** — up from an mlx-swift-lm `main` commit of 2026-08-17 on mlx-swift 0.31.6, and pinned to a release tag now instead of a commit. The three months of upstream work in between include fixes to rotating KV caches (the prompt-cache path of sliding-window models), prefill over a quantized KV cache through the fused attention kernel, and parallel weight loading. The bridge also stops building mlx-swift-lm's adapter for Apple's FoundationModels framework, which it never used and which has broken on Xcode 27 SDKs. Building with `--features mlx` now needs the macOS 26 SDK, so Xcode 26 or newer: a swift.org toolchain on an older Xcode is no longer enough, and `build.rs` says so before the Swift build starts.
 
 ### Changed
 

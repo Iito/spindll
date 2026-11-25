@@ -92,7 +92,10 @@ private struct PromptCacheHit {
 /// on entries that are no longer the most-recently-used, to shrink the in-memory
 /// footprint. Mamba/SSM layers (already independent deep copies) are left as-is.
 private func demote(_ entry: PromptCacheEntry) {
-    guard entry.bits != lowBits else { return }
+    // Under a KV scheme the layers already hold the scheme's compressed form,
+    // plus the 8-bit boundary layers it protects on purpose. Re-quantizing
+    // those to lowBits would undo that protection.
+    guard mlxKVScheme == nil, entry.bits != lowBits else { return }
     do {
         // The map builds a full replacement array before assignment, so a
         // throw leaves the entry untouched at its current width.
@@ -136,6 +139,36 @@ public func mlxSetCacheBudgets(_ ramBytes: UInt64, _ diskBytes: UInt64) {
     mlxRamCacheBudget  = clamp(ramBytes)
     mlxDiskCacheBudget = clamp(diskBytes)
     fputs("[mlx-bridge] prompt cache: ram=\(ramBytes >> 20) MB disk=\(diskBytes >> 20) MB\n", stderr)
+}
+
+// ---------------------------------------------------------------------------
+// KV cache scheme — set once at startup via `mlx_set_kv_scheme`. nil keeps
+// the default f16 KV cache. Otherwise it names one of mlx-swift-lm's
+// compressed layouts, e.g. "turbo8v3" (TurboQuant: 8-bit keys, 3-bit values),
+// "turbo0v4" or "affine8"; GenerateParameters.kvScheme documents the set.
+// ---------------------------------------------------------------------------
+
+private var mlxKVScheme: String? = nil
+
+/// Pick the KV cache scheme for every later generation, or clear it with
+/// NULL. Returns 0 on success, or -1 with the setting unchanged when
+/// mlx-swift-lm doesn't know the name. Call before any model is loaded:
+/// each model's prompt-cache namespace includes the scheme, fixed at load.
+@_cdecl("mlx_set_kv_scheme")
+public func mlxSetKVScheme(_ scheme: UnsafePointer<CChar>?) -> Int32 {
+    guard let scheme else {
+        mlxKVScheme = nil
+        return 0
+    }
+    let name = String(cString: scheme)
+    guard resolveAffineScheme(name) != nil || resolveTurboScheme(name) != nil
+            || resolveVarianceNormalizedScheme(name) != nil else {
+        fputs("[mlx-bridge] unknown KV cache scheme \"\(name)\"\n", stderr)
+        return -1
+    }
+    mlxKVScheme = name
+    fputs("[mlx-bridge] KV cache scheme: \(name)\n", stderr)
+    return 0
 }
 
 // ---------------------------------------------------------------------------
@@ -438,6 +471,10 @@ public func mlxModelLoad(_ path: UnsafePointer<CChar>?) -> UnsafeMutableRawPoint
     } else {
         modelDigest = sha256Hex(Data(modelPath.utf8))
     }
+    // Cached KV state is in the layout of the scheme that wrote it, so the
+    // namespace carries the scheme too: a restart under another scheme must
+    // not pick up on-disk entries in a layout it doesn't use.
+    let cacheNamespace = mlxKVScheme.map { "\(modelDigest)-\($0)" } ?? modelDigest
 
     Task {
         // Try VLM first — covers vision-language models (Qwen2.5-VL, Gemma3, etc.)
@@ -449,7 +486,7 @@ public func mlxModelLoad(_ path: UnsafePointer<CChar>?) -> UnsafeMutableRawPoint
             )
             let hasTemplate = await probeChatTemplate(container)
             if !hasTemplate { warnMissingChatTemplate(modelPath: modelPath, isVLM: true) }
-            box.value = ModelState(container, modelDigest: modelDigest, isVLM: true,
+            box.value = ModelState(container, modelDigest: cacheNamespace, isVLM: true,
                                    hasChatTemplate: hasTemplate)
         } catch {
             // Fall back to LLM for text-only architectures.
@@ -460,7 +497,7 @@ public func mlxModelLoad(_ path: UnsafePointer<CChar>?) -> UnsafeMutableRawPoint
                 )
                 let hasTemplate = await probeChatTemplate(container)
                 if !hasTemplate { warnMissingChatTemplate(modelPath: modelPath, isVLM: false) }
-                box.value = ModelState(container, modelDigest: modelDigest, isVLM: false,
+                box.value = ModelState(container, modelDigest: cacheNamespace, isVLM: false,
                                        hasChatTemplate: hasTemplate)
             } catch {
                 // box.value stays nil; Rust side receives NULL
@@ -521,8 +558,11 @@ public func mlxGenerate(
 
     Task {
         do {
+            // No prompt cache here, so TokenIterator can convert the cache to
+            // the scheme itself.
             let params = GenerateParameters(
                 maxTokens: Int(maxTokens),
+                kvScheme: mlxKVScheme,
                 temperature: temperature,
                 topP: topP
             )
@@ -705,6 +745,19 @@ private func snapshotCache(_ cache: [any KVCache], bits: Int) throws -> [any KVC
     }
 }
 
+/// Scheme-mode counterpart of `snapshotCache`, for a live cache whose
+/// generation has finished. Layers already compressed (the scheme's own, or
+/// the 8-bit boundary layers it protects) are kept as they are: nothing
+/// mutates them any more, so they need no copy. Only f16 layers the scheme
+/// left alone (a head size it can't group, a one-token prompt) are quantized
+/// to `bits`, as `snapshotCache` would.
+private func compactFinishedCache(_ cache: [any KVCache], bits: Int) throws -> [any KVCache] {
+    try cache.map { layer in
+        guard let simple = layer as? KVCacheSimple else { return layer }
+        return try simple.toQuantized(groupSize: kvGroupSize, bits: bits)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // mlx_chat_generate
 // ---------------------------------------------------------------------------
@@ -814,14 +867,36 @@ public func mlxChatGenerate(
                         parameters: params
                     )
                 } else {
-                    liveCache = try makePromptCache(model: context.model, parameters: params)
-                    // Miss: the live cache is f16 — snapshot it near-losslessly.
+                    var fresh = try makePromptCache(model: context.model, parameters: params)
+                    var seedTokens = tokenIds
+                    var seedState: LMOutput.State? = nil
+                    if let scheme = mlxKVScheme, tokenIds.count > 1 {
+                        // Compress once the prompt is in, as upstream does, but
+                        // on our own array. Handed the scheme, TokenIterator
+                        // would swap in new layer objects that `liveCache`
+                        // never sees, and the save below would store the stale
+                        // f16 layers. So prefill all but the last prompt token
+                        // here, convert, and let the iterator take the last one.
+                        // `params` carries no scheme, so it never converts again.
+                        let warm = try TokenIterator(
+                            input: LMInput(tokens: MLXArray(Array(tokenIds.dropLast()))),
+                            model: context.model,
+                            cache: fresh,
+                            parameters: params
+                        )
+                        seedState = warm.state
+                        maybeQuantizeKVCache(cache: &fresh, kvBits: nil, kvScheme: scheme)
+                        seedTokens = [tokenIds[tokenIds.count - 1]]
+                    }
+                    liveCache = fresh
+                    // Miss: snapshot near-losslessly.
                     snapshotBits = highBits
                     wasMiss = true
                     iterator = try TokenIterator(
-                        input: LMInput(tokens: MLXArray(tokenIds)),
+                        input: LMInput(tokens: MLXArray(seedTokens)),
                         model: context.model,
                         cache: liveCache,
+                        state: seedState,
                         parameters: params
                     )
                 }
@@ -875,11 +950,19 @@ public func mlxChatGenerate(
                 // hits (the dedup in `save` drops the original entry) — so we
                 // hand them to `save` directly. This avoids the redundant
                 // post-generation deep copy that was happening on every hit.
+                // Under a KV scheme a miss's layers are already compressed, so
+                // they're handed over the same way (`compactFinishedCache`).
                 if canTrimPromptCache(liveCache) {
                     // A failed snapshot only loses the cache entry — the
                     // generation already streamed, so never fail it here.
-                    let toStore = wasMiss ? (try? snapshotCache(liveCache, bits: snapshotBits))
-                                          : liveCache
+                    let toStore: [any KVCache]?
+                    if !wasMiss {
+                        toStore = liveCache
+                    } else if mlxKVScheme != nil {
+                        toStore = try? compactFinishedCache(liveCache, bits: snapshotBits)
+                    } else {
+                        toStore = try? snapshotCache(liveCache, bits: snapshotBits)
+                    }
                     if let toStore {
                         state.promptCache.save(
                             tokenIds: tokenIds + generatedTokenIds,
@@ -1036,8 +1119,11 @@ public func mlxChatGenerateVision(
 
     Task {
         do {
+            // No prompt cache on the vision path, so TokenIterator can convert
+            // the cache to the scheme itself.
             let params = GenerateParameters(
                 maxTokens: Int(maxTokens),
+                kvScheme: mlxKVScheme,
                 temperature: temperature,
                 topP: topP
             )
