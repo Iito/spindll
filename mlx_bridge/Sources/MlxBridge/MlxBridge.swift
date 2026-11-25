@@ -47,6 +47,14 @@ private final class Box<T>: @unchecked Sendable {
 // ---------------------------------------------------------------------------
 
 private let kvGroupSize = 64
+
+/// Prompt tokens per prefill step. mlx-swift-lm defaults to 512 and clears
+/// MLX's buffer cache after every step; Python mlx-lm's server takes 2048 at a
+/// time. Bigger steps spread each pass over the weights, and each cache clear,
+/// across more tokens, for a higher activation peak while a long prompt fills.
+/// A model with a sliding window still caps the step at its window.
+private let prefillStepSize = 2048
+
 private let fullBits = 16    // `bits` of an entry kept as computed, in f16
 private let highBits = 8     // width a KV scheme's leftover f16 layers are stored at
 
@@ -548,12 +556,13 @@ public func mlxGenerate(
         do {
             // No prompt cache here, so TokenIterator can convert the cache to
             // the scheme itself.
-            let params = GenerateParameters(
+            var params = GenerateParameters(
                 maxTokens: Int(maxTokens),
                 kvScheme: mlxKVScheme,
                 temperature: temperature,
                 topP: topP
             )
+            params.prefill.stepSize = prefillStepSize
 
             // Tokenise the already chat-template-formatted prompt directly.
             // Using UserInput(prompt:) + container.prepare() would re-apply the
@@ -798,11 +807,12 @@ public func mlxChatGenerate(
 
     Task {
         do {
-            let params = GenerateParameters(
+            var params = GenerateParameters(
                 maxTokens: Int(maxTokens),
                 temperature: temperature,
                 topP: topP
             )
+            params.prefill.stepSize = prefillStepSize
 
             var generated: Int32 = 0
             try await state.container.perform(nonSendable: messages) { context, msgs in
@@ -1115,12 +1125,13 @@ public func mlxChatGenerateVision(
         do {
             // No prompt cache on the vision path, so TokenIterator can convert
             // the cache to the scheme itself.
-            let params = GenerateParameters(
+            var params = GenerateParameters(
                 maxTokens: Int(maxTokens),
                 kvScheme: mlxKVScheme,
                 temperature: temperature,
                 topP: topP
             )
+            params.prefill.stepSize = prefillStepSize
 
             // Build UserInput from chat messages + optional image.
             // Find the index of the last user message so we can attach the image to it.
