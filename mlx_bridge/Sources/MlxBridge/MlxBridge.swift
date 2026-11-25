@@ -573,16 +573,22 @@ public func mlxGenerate(
                     }
                 }
 
-                // Flush any partial-UTF-8 bytes the detokenizer was holding
-                // back (e.g. when the loop hits maxTokens mid-codepoint).
-                if !cancelled, let chunk = detokenizer.next() {
+                // Flush the text the detokenizer is still holding back. It
+                // withholds text that ends in an incomplete UTF-8 sequence
+                // (maxTokens hit mid-codepoint, say), and calling next() again
+                // would keep withholding it. finish() emits it, with U+FFFD
+                // standing in for the incomplete bytes.
+                if !cancelled, let chunk = detokenizer.finish() {
                     _ = chunk.withCString { ptr in callback(ptr, callbackCtx) }
                 }
 
                 // Wait for in-flight async evaluations to finish before the
                 // perform closure tears down — mirrors upstream's sync loop
-                // in `runSynchronousGenerationLoop` (Evaluate.swift:1134).
-                Stream().synchronize()
+                // in `runSynchronousGenerationLoop`. It has to be the default
+                // stream, which TokenIterator evaluates on: since mlx-swift
+                // 0.33, `Stream()` makes a new, empty stream, and waiting on
+                // that one returns at once.
+                Stream.defaultStream.synchronize()
             }
             box.value = generated
         } catch {
@@ -852,7 +858,7 @@ public func mlxChatGenerate(
                     }
                 }
 
-                if !cancelled, let chunk = detokenizer.next() {
+                if !cancelled, let chunk = detokenizer.finish() {
                     _ = chunk.withCString { ptr in callback(ptr, callbackCtx) }
                 }
 
@@ -882,7 +888,7 @@ public func mlxChatGenerate(
                     }
                 }
 
-                Stream().synchronize()
+                Stream.defaultStream.synchronize()
             }
             box.value = generated
         } catch {
@@ -1110,11 +1116,11 @@ public func mlxChatGenerateVision(
                     }
                 }
 
-                if !cancelled, let chunk = detokenizer.next() {
+                if !cancelled, let chunk = detokenizer.finish() {
                     _ = chunk.withCString { ptr in callback(ptr, callbackCtx) }
                 }
 
-                Stream().synchronize()
+                Stream.defaultStream.synchronize()
             }
             box.value = generated
         } catch {
