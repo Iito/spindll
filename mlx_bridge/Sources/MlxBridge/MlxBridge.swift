@@ -480,6 +480,15 @@ private final class ModelState: @unchecked Sendable {
     }
 }
 
+/// Prompt tokens as TokenIterator input. A model loaded as a VLM gets them as
+/// [1, L], the shape its own processors build: Qwen3-VL's single-step prefill
+/// reads `dim(1)` of the ids, so a flat array fails there. The generic LLM
+/// prefill takes the flat [L] array.
+private func promptTokenArray(_ tokens: [Int32], vlm: Bool) -> MLXArray {
+    let array = MLXArray(tokens)
+    return vlm ? array.expandedDimensions(axis: 0) : array
+}
+
 /// True when the tokenizer renders its own chat template. Any render failure
 /// counts as "no template" — generation would take the ChatML fallback either
 /// way.
@@ -633,7 +642,8 @@ public func mlxGenerate(
             var generated: Int32 = 0
             try await state.container.perform(nonSendable: promptStr) { context, prompt in
                 let tokenIds = context.tokenizer.encode(text: prompt, addSpecialTokens: false)
-                let lmInput = LMInput(tokens: MLXArray(tokenIds.map { Int32($0) }))
+                let lmInput = LMInput(
+                    tokens: promptTokenArray(tokenIds.map { Int32($0) }, vlm: state.isVLM))
                 var iterator = try TokenIterator(
                     input: lmInput,
                     model: context.model,
@@ -944,7 +954,8 @@ public func mlxChatGenerate(
                     storedBits = hit.bits
                     compactOnSave = false
                     iterator = try TokenIterator(
-                        input: LMInput(tokens: MLXArray(Array(tokenIds[hit.keep...]))),
+                        input: LMInput(tokens: promptTokenArray(Array(tokenIds[hit.keep...]),
+                                                                vlm: state.isVLM)),
                         model: context.model,
                         cache: liveCache,
                         state: hit.modelState,
@@ -963,7 +974,8 @@ public func mlxChatGenerate(
                         // here, convert, and let the iterator take the last one.
                         // `params` carries no scheme, so it never converts again.
                         let warm = try TokenIterator(
-                            input: LMInput(tokens: MLXArray(Array(tokenIds.dropLast()))),
+                            input: LMInput(tokens: promptTokenArray(Array(tokenIds.dropLast()),
+                                                                    vlm: state.isVLM)),
                             model: context.model,
                             cache: fresh,
                             parameters: withPrefillStep(params, count: tokenIds.count - 1)
@@ -976,7 +988,7 @@ public func mlxChatGenerate(
                     storedBits = mlxKVScheme == nil ? fullBits : highBits
                     compactOnSave = mlxKVScheme != nil
                     iterator = try TokenIterator(
-                        input: LMInput(tokens: MLXArray(seedTokens)),
+                        input: LMInput(tokens: promptTokenArray(seedTokens, vlm: state.isVLM)),
                         model: context.model,
                         cache: liveCache,
                         state: seedState,
