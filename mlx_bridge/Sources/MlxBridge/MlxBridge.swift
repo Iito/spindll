@@ -113,14 +113,40 @@ private struct PromptCacheHit {
     let prefixLength: Int
 }
 
-/// Total bytes occupied by the live state arrays of every layer in `kvCache`.
-/// `MLXArray.nbytes` reports the size of the (possibly-sliced) view.
+/// Bytes `kvCache` keeps in memory. A layer's `state` is a view of the tokens
+/// it holds, while its buffers grow in steps (256 tokens for KVCacheSimple), so
+/// each layer counts the buffers it holds (`innerState`), or the view for a
+/// type that reports none.
 private func sizeOf(_ kvCache: [any KVCache]) -> Int64 {
     var total: Int64 = 0
     for layer in kvCache {
-        for array in layer.state { total += Int64(array.nbytes) }
+        let used = layer.state.reduce(Int64(0)) { $0 + Int64($1.nbytes) }
+        let held = ((layer as? BaseKVCache)?.innerState() ?? [])
+            .reduce(Int64(0)) { $0 + Int64($1.nbytes) }
+        total += max(used, held)
     }
     return total
+}
+
+/// `cache` with each plain attention layer whose buffer is more than a quarter
+/// empty copied down to the tokens it holds. A short conversation otherwise
+/// keeps most of a 256-token growth step per layer, which the byte budget now
+/// counts. Other layer types are kept as they are.
+private func trimmedToFit(_ cache: [any KVCache]) -> [any KVCache] {
+    var pending: [MLXArray] = []
+    let fitted: [any KVCache] = cache.map { layer in
+        guard let simple = layer as? KVCacheSimple, type(of: simple) == KVCacheSimple.self
+        else { return layer }
+        let used = simple.state.reduce(0) { $0 + $1.nbytes }
+        let held = simple.innerState().reduce(0) { $0 + $1.nbytes }
+        guard (held - used) * 4 > held else { return layer }
+        let copy = KVCacheSimple()
+        copy.state = simple.state.map { $0 * 1 }   // `* 1` detaches; offset unchanged
+        pending += copy.state
+        return copy
+    }
+    if !pending.isEmpty { MLX.eval(pending) }
+    return fitted
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +425,14 @@ private final class PromptCache {
         for e in entries { spillToDisk(e) }
         entries.insert(PromptCacheEntry(tokenIds: tokenIds, kvCache: kvCache, bits: bits), at: 0)
         evictExcess()
+    }
+
+    /// Take `entry` out of the RAM tier because its state is becoming a live
+    /// cache: generation extends it, so its token list and size would no longer
+    /// describe it. The save after generation stores the extended state, and a
+    /// turn that never gets there leaves no stale entry behind.
+    func take(_ entry: PromptCacheEntry) {
+        entries.removeAll { $0 === entry }
     }
 
     private func evictExcess() {
@@ -862,11 +896,12 @@ public func mlxChatGenerate(
                 // Without a KV scheme entries are exact f16, so the restored
                 // prefix computes what a cold prefill would and the output
                 // matches. An entry that is exactly a prefix of this prompt is
-                // consumed in place (the save below drops it anyway). A
-                // quantized entry, such as an 8-bit one read back from disk, is
-                // dequantized into a copy instead of extended: appending to it
-                // would leave the whole new conversation at its width. Under a
-                // scheme the restored state keeps the scheme's layout.
+                // consumed in place: it leaves the cache, and the save below
+                // stores it extended. A quantized entry, such as an 8-bit one
+                // read back from disk, is dequantized into a copy instead of
+                // extended: appending to it would leave the whole new
+                // conversation at its width. Under a scheme the restored state
+                // keeps the scheme's layout.
                 var restoredHit: (cache: [any KVCache], keep: Int, bits: Int)? = nil
                 if let hit = state.promptCache.lookup(tokenIds: tokenIds),
                    canTrimPromptCache(hit.entry.kvCache) {
@@ -875,9 +910,13 @@ public func mlxChatGenerate(
                     let extendable = mlxKVScheme != nil || hit.entry.bits == fullBits
                     if extendable && hit.prefixLength == cachedLen {
                         let n = cachedLen - keep
-                        if n == 0 || (canTrimPromptCache(hit.entry.kvCache, numTokens: n)
-                                      && trimPromptCache(hit.entry.kvCache, numTokens: n) == n) {
-                            restoredHit = (hit.entry.kvCache, keep, hit.entry.bits)
+                        if n == 0 || canTrimPromptCache(hit.entry.kvCache, numTokens: n) {
+                            // Its layers become the live cache, so the entry
+                            // leaves the RAM tier before anything changes them.
+                            state.promptCache.take(hit.entry)
+                            if n == 0 || trimPromptCache(hit.entry.kvCache, numTokens: n) == n {
+                                restoredHit = (hit.entry.kvCache, keep, hit.entry.bits)
+                            }
                         }
                     } else if let copy = restorePrefix(hit.entry.kvCache, keep: keep,
                                                        toF16: mlxKVScheme == nil) {
@@ -971,17 +1010,20 @@ public func mlxChatGenerate(
                 // be matched whole, which is never useful for prefix reuse.
                 //
                 // Generation is over and nothing mutates the live cache any more,
-                // so it is stored as it is, without a copy: exact f16 by default,
-                // the scheme's layout under a KV scheme. It shares no buffers
-                // with any other entry: a hit restores into a copy, and an entry
-                // consumed in place is dropped by the dedup in `save`. Only a
-                // scheme miss can still hold f16 layers the scheme left alone,
-                // which `compactFinishedCache` quantizes.
+                // so it is stored as it is: exact f16 by default, the scheme's
+                // layout under a KV scheme. It shares no buffers with any other
+                // entry: a hit restores into a copy, and an entry consumed in
+                // place has already left the cache. Only a layer whose buffer is
+                // mostly unused is copied down to size (`trimmedToFit`), since
+                // the byte budget counts whole buffers. A scheme miss can still
+                // hold f16 layers the scheme left alone, which
+                // `compactFinishedCache` quantizes.
                 if canTrimPromptCache(liveCache) {
                     // A failed compaction only loses the cache entry — the
                     // generation already streamed, so never fail it here.
                     let toStore = compactOnSave
-                        ? (try? compactFinishedCache(liveCache, bits: storedBits)) : liveCache
+                        ? (try? compactFinishedCache(liveCache, bits: storedBits))
+                        : trimmedToFit(liveCache)
                     if let toStore {
                         state.promptCache.save(
                             tokenIds: tokenIds + generatedTokenIds,
