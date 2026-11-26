@@ -206,6 +206,19 @@ public func mlxSetKVScheme(_ scheme: UnsafePointer<CChar>?) -> Int32 {
     return 0
 }
 
+/// Model types whose attention writes its KV cache with `cache.update(keys:values:)`
+/// directly, without going through `attentionWithCacheUpdate` or checking for a
+/// quantized cache. Every scheme quantizes some layers into `QuantizedKVCache`
+/// (all of them under affine*, the 8-bit boundary layers under the smaller turbo
+/// schemes), and `QuantizedKVCache.update` is a fatalError, so these models
+/// would kill the process on their first prompt. They keep the f16 cache.
+/// From mlx-swift-lm 3.33.0's model sources; re-check on a bump with
+/// `grep -rn 'cache.update(keys' Libraries/MLXLLM/Models Libraries/MLXVLM/Models`,
+/// leaving out the models that handle `QuantizedKVCache` before that call.
+private let directCacheWriterModelTypes: Set<String> = [
+    "apertus", "baichuan_m1", "bitnet", "gemma2", "gpt_oss",
+]
+
 // ---------------------------------------------------------------------------
 // MlxDiskCache — on-disk LRU tier behind PromptCache.
 //
@@ -471,12 +484,16 @@ private final class ModelState: @unchecked Sendable {
     /// False when the tokenizer cannot render its own chat template — text
     /// requests then fall back to ChatML and vision requests are rejected.
     let hasChatTemplate: Bool
+    /// The KV scheme this model generates with: `--kv-scheme`, or nil (f16)
+    /// for a model that can't take one (`directCacheWriterModelTypes`).
+    let kvScheme: String?
     init(_ container: ModelContainer, modelDigest: String, isVLM: Bool = false,
-         hasChatTemplate: Bool = true) {
+         hasChatTemplate: Bool = true, kvScheme: String?) {
         self.container = container
         self.promptCache = PromptCache(modelDigest: modelDigest)
         self.isVLM = isVLM
         self.hasChatTemplate = hasChatTemplate
+        self.kvScheme = kvScheme
     }
 }
 
@@ -532,16 +549,27 @@ public func mlxModelLoad(_ path: UnsafePointer<CChar>?) -> UnsafeMutableRawPoint
     // Model identity for the on-disk prompt cache: digest of config.json (the
     // same artefact the Rust side uses as the MLX model version), falling back
     // to the path if it can't be read.
-    let modelDigest: String
-    if let cfg = try? Data(contentsOf: url.appendingPathComponent("config.json")) {
-        modelDigest = sha256Hex(cfg)
+    let config = try? Data(contentsOf: url.appendingPathComponent("config.json"))
+    let modelDigest = sha256Hex(config ?? Data(modelPath.utf8))
+
+    // `--kv-scheme` applies only to models that can take a compressed cache.
+    let modelType = config
+        .flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }?["model_type"]
+        as? String
+    let kvScheme: String?
+    if let scheme = mlxKVScheme, let modelType, directCacheWriterModelTypes.contains(modelType) {
+        fputs("[mlx-bridge] WARNING: --kv-scheme \(scheme) does not apply to \(modelType) " +
+              "models, whose attention can't use a compressed KV cache. " +
+              "This model keeps the f16 cache.\n", stderr)
+        kvScheme = nil
     } else {
-        modelDigest = sha256Hex(Data(modelPath.utf8))
+        kvScheme = mlxKVScheme
     }
+
     // Cached KV state is in the layout of the scheme that wrote it, so the
     // namespace carries the scheme too: a restart under another scheme must
     // not pick up on-disk entries in a layout it doesn't use.
-    let cacheNamespace = mlxKVScheme.map { "\(modelDigest)-\($0)" } ?? modelDigest
+    let cacheNamespace = kvScheme.map { "\(modelDigest)-\($0)" } ?? modelDigest
 
     Task {
         // Try VLM first — covers vision-language models (Qwen2.5-VL, Gemma3, etc.)
@@ -554,7 +582,7 @@ public func mlxModelLoad(_ path: UnsafePointer<CChar>?) -> UnsafeMutableRawPoint
             let hasTemplate = await probeChatTemplate(container)
             if !hasTemplate { warnMissingChatTemplate(modelPath: modelPath, isVLM: true) }
             box.value = ModelState(container, modelDigest: cacheNamespace, isVLM: true,
-                                   hasChatTemplate: hasTemplate)
+                                   hasChatTemplate: hasTemplate, kvScheme: kvScheme)
         } catch {
             // Fall back to LLM for text-only architectures.
             do {
@@ -565,7 +593,7 @@ public func mlxModelLoad(_ path: UnsafePointer<CChar>?) -> UnsafeMutableRawPoint
                 let hasTemplate = await probeChatTemplate(container)
                 if !hasTemplate { warnMissingChatTemplate(modelPath: modelPath, isVLM: false) }
                 box.value = ModelState(container, modelDigest: cacheNamespace, isVLM: false,
-                                       hasChatTemplate: hasTemplate)
+                                       hasChatTemplate: hasTemplate, kvScheme: kvScheme)
             } catch {
                 // box.value stays nil; Rust side receives NULL
             }
@@ -629,7 +657,7 @@ public func mlxGenerate(
             // the scheme itself.
             let params = GenerateParameters(
                 maxTokens: Int(maxTokens),
-                kvScheme: mlxKVScheme,
+                kvScheme: state.kvScheme,
                 temperature: temperature,
                 topP: topP
             )
@@ -924,13 +952,14 @@ public func mlxChatGenerate(
                 // conversation at its width. Under a scheme the restored state
                 // keeps the scheme's layout. Either way the entry's model state
                 // comes along, which Qwen-VL-family models need on a warm cache.
+                let kvScheme = state.kvScheme
                 var restoredHit: (cache: [any KVCache], keep: Int, bits: Int,
                                   modelState: LMOutput.State?)? = nil
                 if let hit = state.promptCache.lookup(tokenIds: tokenIds),
                    canTrimPromptCache(hit.entry.kvCache) {
                     let cachedLen = hit.entry.tokenIds.count
                     let keep = min(hit.prefixLength, tokenIds.count - 1)
-                    let extendable = mlxKVScheme != nil || hit.entry.bits == fullBits
+                    let extendable = kvScheme != nil || hit.entry.bits == fullBits
                     if extendable && hit.prefixLength == cachedLen {
                         let n = cachedLen - keep
                         if n == 0 || canTrimPromptCache(hit.entry.kvCache, numTokens: n) {
@@ -943,8 +972,8 @@ public func mlxChatGenerate(
                             }
                         }
                     } else if let copy = restorePrefix(hit.entry.kvCache, keep: keep,
-                                                       toF16: mlxKVScheme == nil) {
-                        restoredHit = (copy, keep, mlxKVScheme == nil ? fullBits : hit.entry.bits,
+                                                       toF16: kvScheme == nil) {
+                        restoredHit = (copy, keep, kvScheme == nil ? fullBits : hit.entry.bits,
                                        hit.entry.state)
                     }
                 }
@@ -965,7 +994,7 @@ public func mlxChatGenerate(
                     var fresh = try makePromptCache(model: context.model, parameters: params)
                     var seedTokens = tokenIds
                     var seedState: LMOutput.State? = nil
-                    if let scheme = mlxKVScheme, tokenIds.count > 1 {
+                    if let scheme = kvScheme, tokenIds.count > 1 {
                         // Compress once the prompt is in, as upstream does, but
                         // on our own array. Handed the scheme, TokenIterator
                         // would swap in new layer objects that `liveCache`
@@ -985,8 +1014,8 @@ public func mlxChatGenerate(
                         seedTokens = [tokenIds[tokenIds.count - 1]]
                     }
                     liveCache = fresh
-                    storedBits = mlxKVScheme == nil ? fullBits : highBits
-                    compactOnSave = mlxKVScheme != nil
+                    storedBits = kvScheme == nil ? fullBits : highBits
+                    compactOnSave = kvScheme != nil
                     iterator = try TokenIterator(
                         input: LMInput(tokens: promptTokenArray(seedTokens, vlm: state.isVLM)),
                         model: context.model,
@@ -1215,7 +1244,7 @@ public func mlxChatGenerateVision(
             // their own paths, so they keep the library's prefill step.
             let params = GenerateParameters(
                 maxTokens: Int(maxTokens),
-                kvScheme: mlxKVScheme,
+                kvScheme: state.kvScheme,
                 temperature: temperature,
                 topP: topP
             )
