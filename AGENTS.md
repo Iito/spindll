@@ -42,8 +42,8 @@ Add `#[cfg(test)]` blocks alongside any module you change.
 These are enforced by `.claude/hooks/guard-git.py`, not by your memory. The hook
 denies the call and tells you why; `scripts/hook-tests.sh` proves it still works.
 
-- **Never push, open a PR, or cut a release without the user's approval, each
-  time.** Approval is a lockfile the user touches by hand
+- **Never push, open or merge a PR, or cut a release without the user's
+  approval, each time.** Approval is a lockfile the user touches by hand
   (`~/.local/state/spindll-harness/push.allowed`); one touch authorises one
   publish and the hook consumes it.
 - **Never `--no-verify`.** The pre-commit hook enforces this repo's commit
