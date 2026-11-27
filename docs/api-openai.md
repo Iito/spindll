@@ -23,14 +23,68 @@ curl http://localhost:8080/v1/models
 {
   "object": "list",
   "data": [
-    {"id": "ollama/llama3.1/8b.gguf", "object": "model", "owned_by": "spindll"}
+    {
+      "id": "ollama/llama3.1/8b.gguf",
+      "object": "model",
+      "owned_by": "spindll",
+      "created": 1767225600,
+      "architecture": "llama",
+      "context_length": 131072,
+      "format": "gguf",
+      "size_bytes": 4920000000,
+      "capabilities": {"chat": true, "completions": true, "embeddings": true}
+    }
   ]
 }
 ```
 
+Each item has the standard `id`, `object`, `created` (when the model was downloaded or imported, in Unix seconds) and `owned_by`, plus:
+
+| Field | Notes |
+|-------|-------|
+| `architecture` | Omitted when unknown |
+| `context_length` | Trained context size from the registry, not the loaded size. Omitted when 0, which is always the case for MLX |
+| `format` | `"gguf"` or `"mlx"` |
+| `size_bytes` | Size on disk |
+| `capabilities` | `chat`, `completions` and `embeddings` are `true` for every model; nothing checks what the model supports |
+
+## GET /v1/models/{id}
+
+One model, in the same shape as a `/v1/models` item. `{id}` must be the exact registry key from `/v1/models`, URL-encoded. Aliases such as `llama3.1:8b` are not resolved here.
+
+```bash
+curl http://localhost:8080/v1/models/ollama%2Fllama3.1%2F8b.gguf
+```
+
+An unknown id returns 404:
+
+```json
+{"error": {"message": "model not found", "type": "invalid_request_error"}}
+```
+
+## GET /v1/status
+
+```bash
+curl http://localhost:8080/v1/status
+```
+
+```json
+{
+  "status": "ok",
+  "version": "0.10.0",
+  "models": {
+    "total": 2,
+    "loaded": 1,
+    "loaded_models": ["ollama/llama3.1/8b.gguf"]
+  }
+}
+```
+
+`version` is the server's version. `total` counts the models in the store, and `loaded_models` lists the keys of the models in memory.
+
 ## POST /v1/chat/completions
 
-### Streaming (default)
+### Streaming
 
 ```bash
 curl -N -X POST http://localhost:8080/v1/chat/completions \
@@ -248,7 +302,7 @@ data: {"object":"text_completion","model":"llama3.1:8b","choices":[{"index":0,"t
 data: [DONE]
 ```
 
-### Non-streaming
+### Non-streaming (default)
 
 ```bash
 curl -X POST http://localhost:8080/v1/completions \
@@ -291,6 +345,48 @@ curl -X POST http://localhost:8080/v1/completions \
 | `top_p` | float | no | 0.95 |
 | `seed` | integer | no | 42 |
 
+Other fields are ignored, including `stop` and `stream_options`: there are no stop sequences, and a stream carries no `usage`. `finish_reason` is always `"stop"` here, even when `max_tokens` was reached.
+
+## POST /v1/embeddings
+
+```bash
+curl -X POST http://localhost:8080/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama3.1:8b",
+    "input": ["first text", "second text"]
+  }'
+```
+
+```json
+{
+  "object": "list",
+  "data": [
+    {"object": "embedding", "index": 0, "embedding": [0.0123, -0.0456, 0.0789]},
+    {"object": "embedding", "index": 1, "embedding": [0.0234, -0.0567, 0.0891]}
+  ],
+  "model": "llama3.1:8b",
+  "usage": {"prompt_tokens": 6, "total_tokens": 6}
+}
+```
+
+(Vectors shortened.)
+
+**Request body:**
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `model` | string | yes | |
+| `input` | string or array of strings | yes | |
+| `encoding_format` | string | no | `"float"` |
+
+- `input` is a string or an array of up to 2048 strings. Each one must be non-empty and at most 32,768 bytes. Token-id arrays are rejected.
+- `encoding_format` is `"float"` or `"base64"` (the little-endian float32 bytes, base64-encoded). Any other value is rejected.
+- `dimensions` is not supported: a request that sets it is rejected.
+- Each rejection above is a 400. Most failures after that return 500, an unknown model name included.
+- Each input is embedded on its own, and `usage.prompt_tokens` sums their token counts.
+- Vectors are L2-normalized. GGUF models run a forward pass and use the model's pooling, or the last token's embedding when it has none; input past the context size is cut off. MLX models return the mean of the input token embeddings with no forward pass, so their vectors are only a rough approximation.
+
 ## POST /v1/responses
 
 The [OpenAI Responses API](https://platform.openai.com/docs/api-reference/responses) — the stateless subset agent clients use with `store: false`. Codex CLI works with its default `wire_api = "responses"`; no provider override needed:
@@ -305,7 +401,7 @@ name = "spindll"
 base_url = "http://localhost:8080/v1"
 ```
 
-### Non-streaming (default)
+### Non-streaming
 
 ```bash
 curl -X POST http://localhost:8080/v1/responses   -H "Content-Type: application/json"   -d '{
