@@ -43,6 +43,8 @@ curl -N -X POST http://localhost:8080/v1/chat/completions \
 ```
 
 ```
+data: {"object":"chat.completion.chunk","model":"llama3.1:8b","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
 data: {"object":"chat.completion.chunk","model":"llama3.1:8b","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}
 
 data: {"object":"chat.completion.chunk","model":"llama3.1:8b","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
@@ -50,7 +52,9 @@ data: {"object":"chat.completion.chunk","model":"llama3.1:8b","choices":[{"index
 data: [DONE]
 ```
 
-### Non-streaming
+The first chunk carries only `delta.role`. A streamed response has no `usage` unless the request sets `"stream_options": {"include_usage": true}`. Then one more chunk, with `"choices": []` and the `usage` object, arrives just before `[DONE]`.
+
+### Non-streaming (default)
 
 ```bash
 curl -X POST http://localhost:8080/v1/chat/completions \
@@ -87,7 +91,8 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 |-------|------|----------|---------|
 | `model` | string | yes | |
 | `messages` | array of `{role, content}` | yes | |
-| `stream` | boolean | no | true |
+| `stream` | boolean | no | false |
+| `stream_options.include_usage` | boolean | no | false |
 | `max_tokens` | integer | no | 512 |
 | `temperature` | float | no | 0.8 |
 | `top_p` | float | no | 0.95 |
@@ -217,13 +222,13 @@ Thinking models (Qwen3 / Qwen3.5, DeepSeek-R1, …) emit a reasoning pass delimi
 
 Both delimiter conventions are handled: models that emit `<think>` themselves, and chat templates that force the block open (the generation prompt ends with `<think>`, so the stream starts mid-reasoning — detected once per model at load). A single leading think block is recognized; delimiters appearing after visible content stream through as ordinary text.
 
-**Truncation is detectable.** `finish_reason` is `"length"` when generation exhausted `max_tokens` (previously always `"stop"`). If the reasoning consumed the whole budget, `content` is empty (or absent from deltas), the partial reasoning is still returned in `reasoning_content`, and `usage.completion_tokens_details.reasoning_tokens` shows where the budget went. `reasoning_tokens` is a stream-piece approximation of the token count.
+**Truncation is detectable.** `finish_reason` is `"length"` when generation exhausted `max_tokens` (previously always `"stop"`). If the reasoning consumed the whole budget, `content` is empty (or absent from deltas), the partial reasoning is still returned in `reasoning_content`, and `usage.completion_tokens_details.reasoning_tokens` shows where the budget went (in a stream, only when `stream_options.include_usage` is set). `reasoning_tokens` is a stream-piece approximation of the token count.
 
 ## POST /v1/completions
 
 Raw text completion (no chat template applied). Use this for code completion, text continuation, and other non-chat tasks.
 
-### Streaming (default)
+### Streaming
 
 ```bash
 curl -N -X POST http://localhost:8080/v1/completions \
@@ -280,7 +285,7 @@ curl -X POST http://localhost:8080/v1/completions \
 |-------|------|----------|---------|
 | `model` | string | yes | |
 | `prompt` | string | yes | |
-| `stream` | boolean | no | true |
+| `stream` | boolean | no | false |
 | `max_tokens` | integer | no | 512 |
 | `temperature` | float | no | 0.8 |
 | `top_p` | float | no | 0.95 |
@@ -300,7 +305,7 @@ name = "spindll"
 base_url = "http://localhost:8080/v1"
 ```
 
-### Non-streaming
+### Non-streaming (default)
 
 ```bash
 curl -X POST http://localhost:8080/v1/responses   -H "Content-Type: application/json"   -d '{
