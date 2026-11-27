@@ -12,6 +12,8 @@ scripts/build-ios-xcframework.sh          # keyboard build: no Metal, no weight 
 scripts/build-ios-xcframework.sh --metal  # containing-app build, with the GPU
 ```
 
+Both builds target iOS 17, the package's minimum. A `--metal` build still runs on the CPU until `Scorer.Config.gpuLayers` is set, since it defaults to 0. Leave it at 0 on the Simulator, whose Metal returns garbage for llama.cpp's kernels.
+
 Then add `ios/SpindllKit` to the app as a local package.
 
 ## Use
