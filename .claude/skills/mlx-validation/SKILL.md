@@ -19,8 +19,11 @@ Tag the worklog entry `mlx-validate-required` when the change touches any of:
 - `src/backend/mlx*.rs`
 - any path gated on `feature = "mlx"`
 
-`scripts/mlx-validate.sh` picks the tag up and appends `mlx-validated` when it
-passes.
+Then run `scripts/mlx-validate.sh <branch>` on Apple Silicon. It doesn't read
+the tag: it switches the checkout it runs in to that branch, builds and tests it
+with `--features cli,http,mlx,vision`, and appends an entry tagged
+`mlx-validated` to that host's worklog when it passes. Run it in a spare
+worktree, never in the user's checkout.
 
 ## What CI already covers, and what it does not
 
