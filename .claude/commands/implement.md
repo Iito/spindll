@@ -24,9 +24,9 @@ You are running the **`/implement`** loop on spindll. The operating manual is
    without a >7-day age check.
 
 5. **Ratchet, expecting green.** `bash scripts/ratchet.sh`. Block until green.
-   Clippy is strict (`-D warnings`) and the hook tests run here too. If the
-   ratchet exceeds 60s on Apple Silicon or 90s on the Linux host, trim the
-   `--lib` filter — never raise the cap.
+   Clippy is strict (`--all-targets --locked -- -D warnings`), and the hook
+   tests and the harness lint run here too. If the ratchet exceeds 60s on Apple
+   Silicon or 90s on the Linux host, trim the test filter — never raise the cap.
 
 6. **MLX flag.** If you touched `mlx_bridge/`, `src/backend/mlx*.rs`, or any
    `feature = "mlx"` path, the worklog entry gets `tag: mlx-validate-required`.
