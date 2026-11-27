@@ -275,6 +275,12 @@ async fn connect_server(
         })
 }
 
+/// The KV scheme `--kv-scheme` asks for. `f16`, the documented default, is
+/// the uncompressed cache, so it means no scheme rather than an unknown name.
+fn requested_kv_scheme(arg: Option<&str>) -> Option<&str> {
+    arg.filter(|s| !s.eq_ignore_ascii_case("f16"))
+}
+
 /// Apply `--kv-scheme` before any model loads. Only MLX generation reads it.
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 fn apply_kv_scheme(scheme: Option<&str>) -> anyhow::Result<()> {
@@ -620,7 +626,7 @@ async fn main() -> anyhow::Result<()> {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
                 spindll::backend::mlx_swift::set_cache_budgets(0, 0);
             }
-            apply_kv_scheme(kv_scheme.as_deref())?;
+            apply_kv_scheme(requested_kv_scheme(kv_scheme.as_deref()))?;
 
             if let Some(cache_size) = ram_cache {
                 let bytes = match cache_size.as_deref() {
@@ -720,7 +726,7 @@ async fn main() -> anyhow::Result<()> {
                 let bytes = parse_size_bytes(cache_size.as_deref());
                 manager.enable_kv_cache(bytes);
             }
-            apply_kv_scheme(kv_scheme.as_deref())?;
+            apply_kv_scheme(requested_kv_scheme(kv_scheme.as_deref()))?;
 
             #[cfg(feature = "vision")]
             let has_image = image.is_some();
@@ -1126,6 +1132,17 @@ mod tests {
         // Reading the lockfile unlinks stale entries, so a command told which
         // port to use must not consult it at all.
         assert_eq!(server_grpc_port(Some(9999)).unwrap(), 9999);
+    }
+
+    /// `--kv-scheme f16` is the documented default, so it must start the
+    /// server with no scheme instead of failing as an unknown name.
+    #[test]
+    fn kv_scheme_f16_means_the_default_cache() {
+        assert_eq!(requested_kv_scheme(Some("f16")), None);
+        assert_eq!(requested_kv_scheme(Some("F16")), None);
+        assert_eq!(requested_kv_scheme(None), None);
+        assert_eq!(requested_kv_scheme(Some("turbo8v3")), Some("turbo8v3"));
+        assert!(apply_kv_scheme(requested_kv_scheme(Some("f16"))).is_ok());
     }
 
     /// `serve --ram-cache <model>` must not bind the model name to the flag.
