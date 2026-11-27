@@ -34,8 +34,9 @@ bench/run.sh \
 
 ### Compare with mlx-engine (lm-studio)
 
-Runs two phases with automatic lifecycle management — starts lm-studio,
-benchmarks it, stops it, cools down, starts spindll, benchmarks it, stops it:
+Runs three phases with automatic lifecycle management: lm-studio, spindll over
+HTTP, then spindll over gRPC. Each phase starts its engine, benchmarks it and
+stops it, with a cooldown between phases:
 
 ```bash
 bench/run.sh \
@@ -43,7 +44,9 @@ bench/run.sh \
     --mode compare
 ```
 
-Requires the `lms` CLI (installed with LM Studio).
+This is the default mode when `--mode` is omitted. It requires an Apple Silicon
+Mac and the `lms` CLI (installed with LM Studio); on other platforms, use
+`--mode spindll` or `--mode before-after`.
 
 ### Before / after (merge gate)
 
@@ -110,9 +113,11 @@ cargo build --release --features cli,bench
 | `--prompts P,P,...` | built-in pool | Comma-separated prompts to cycle across runs |
 | `--cooldown N` | 5 | Seconds between phases (thermal/memory settle) |
 
-When neither `--prompts` is given, the bench binary cycles through four
-built-in prompts. With 10 runs, the first 3 are cold cache misses and runs
-4-10 are warm cache hits — which is why mean and median diverge in TTFT results.
+When `--prompts` is not given, the bench binary cycles through four built-in
+prompts. The cycle starts with the warmup runs, so with the default 3 warmups
+only the first of the 10 measured runs (the fourth prompt) is a cold cache
+miss, and runs 2-10 are warm cache hits. That one cold run is why mean and
+median diverge in TTFT results.
 
 `top_p` is applied across the HTTP and gRPC benchmark paths. `top_k` is fixed
 at `40`, because the OpenAI-compatible HTTP endpoints used by the benchmark do
@@ -124,9 +129,21 @@ not expose a `top_k` override.
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--url-mlx` | `http://localhost:1234` | mlx-engine (lm-studio) HTTP base URL |
 | `--url-spin` | `http://localhost:8080` | spindll HTTP base URL |
 | `--grpc-host` | `localhost` | spindll gRPC host |
 | `--grpc-port` | `50051` | spindll gRPC port |
+| `--http-port` | `8080` | HTTP port the script starts spindll on; `--url-spin` follows it unless set |
+| `--spin-port` | `50051` | gRPC port the script starts spindll on; `--grpc-port` follows it unless set |
+| `--spindll-bin` | `target/release/spindll` | spindll binary the script starts; the default one is built if missing |
+
+---
+
+## Output
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--output PATH` | `bench/results/<date>_<model>.md` | Markdown report path (`before-after` adds `before-after_` to the default name). Each run's prompt and generated text go to a `.txt` file of the same name |
 
 ---
 
