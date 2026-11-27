@@ -70,6 +70,6 @@ The `guard-git.py` hook enforces the publish, `--no-verify`, amend, force-push
 and local-file rules — it will deny the call and tell you why. Beyond those:
 
 - One punchlist item per run. Do not chain.
-- Stay on a feature branch. If you are on `main` or `next`, branch first. Base a
-  quickfix on `main` and feature work on `next`; if the right base is ambiguous,
-  ask "main or next?" before branching.
+- Stay on a feature branch. If you are on `main` or `next`, branch first, off
+  `next`: every change goes through a PR into `next`, fixes included, and
+  nothing is pushed to `main`.
