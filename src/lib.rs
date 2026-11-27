@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Iito <https://github.com/Iito> and sarmientoF <https://github.com/sarmientoF>
 
-//! Spindll — a Rust-native GGUF inference engine with model management.
+//! Spindll — a Rust-native inference engine for GGUF and MLX models, with model
+//! management.
 //!
 //! Pull models from Ollama or HuggingFace, load them with GPU acceleration,
 //! and serve streaming inference over gRPC, HTTP/SSE, or an OpenAI-compatible API.
 //! Supports multi-model concurrency with LRU eviction, continuous batching,
 //! encrypted KV caching, and configurable memory budgets.
 //!
-//! The default library includes the gRPC server so embedders >
+//! The default library includes the gRPC server so embedders
 //! can start it in-process. The `cli` feature adds the standalone binary extras
 //! (argument parsing, pretty logging). The `http` feature adds an HTTP/SSE server
 //! with an OpenAI-compatible `/v1` API for use with AnythingLLM, Open WebUI, etc.
@@ -20,13 +21,12 @@
 //! use spindll::model_store::ModelStore;
 //!
 //! let store = ModelStore::new(None);
-//! let path = store.resolve_model_path("llama3.1:8b").unwrap();
-//! let digest = store.resolve_model_digest("llama3.1:8b").unwrap_or_default();
+//! let m = store.resolve("llama3.1:8b").unwrap(); // canonical key, path and digest
 //!
 //! let manager = ModelManager::new(2048, None, 0).unwrap();
-//! manager.load_model_with_digest("llama3.1:8b", &path, None, digest).unwrap();
+//! manager.load_model_with_digest(&m.key, &m.path, None, m.digest.clone()).unwrap();
 //!
-//! manager.generate("llama3.1:8b", "Hello!", &GenerateParams::default(), None, |token| {
+//! manager.generate(&m.key, "Hello!", &GenerateParams::default(), None, |token| {
 //!     print!("{token}");
 //!     true
 //! }).unwrap();
