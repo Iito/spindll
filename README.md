@@ -165,13 +165,12 @@ use spindll::engine::{ModelManager, GenerateParams};
 use spindll::model_store::ModelStore;
 
 let store = ModelStore::new(None);
-let path = store.resolve_model_path("llama3.1:8b")?;
-let digest = store.resolve_model_digest("llama3.1:8b").unwrap_or_default();
+let m = store.resolve("llama3.1:8b")?; // canonical key, path and digest
 
 let manager = ModelManager::new(2048, None, 0)?;
-manager.load_model_with_digest("llama3.1:8b", &path, None, digest)?;
+manager.load_model_with_digest(&m.key, &m.path, None, m.digest.clone())?;
 
-manager.generate("llama3.1:8b", "Hello!", &GenerateParams::default(), None, |token| {
+manager.generate(&m.key, "Hello!", &GenerateParams::default(), None, |token| {
     print!("{token}");
     true
 })?;
