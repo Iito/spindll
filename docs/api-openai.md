@@ -95,9 +95,32 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 | `tools` | array of tool objects | no | |
 | `tool_choice` | string or object | no | `"auto"` when tools present |
 
+Other fields are ignored. That includes `stop`: stop sequences are not supported on this endpoint.
+
+### Images (`vision` feature)
+
+A message's `content` can also be an array of `text` and `image_url` parts. Image parts need the `vision` build feature:
+
+```json
+{
+  "role": "user",
+  "content": [
+    {"type": "text", "text": "What is in this picture?"},
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}}
+  ]
+}
+```
+
+- `url` must be a base64 `data:` URI. spindll never fetches `http(s)` URLs.
+- Allowed media types: `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/bmp`.
+- Each image can be up to 32 MiB once decoded.
+- The model must be a vision model: a GGUF loaded with its multimodal projector (mmproj), or an MLX VLM.
+- A bad image (not a base64 `data:` URI, too large, or another media type) fails the request with a 500, or with an error event when streaming.
+- Without the `vision` feature, any `image_url` part gets a 400.
+
 ### Tool / function calling
 
-Pass `tools` to enable function calling. Tool definitions are injected into the system prompt (Spindll uses prompt injection, not a model-native grammar — see the note below) and the model's output is parsed back into tool calls, recognizing the common wrapper formats (Hermes `<tool_call>`, Llama-3.1 `<|python_tag|>`, Mistral `[TOOL_CALLS]`) as well as bare JSON.
+Pass `tools` to enable function calling. The model's chat template renders the tools when it supports them; injecting them into the system prompt is the fallback (see the notes below). The model's output is parsed back into tool calls, recognizing the common wrapper formats (Hermes `<tool_call>`, Llama-3.1 `<|python_tag|>`, Mistral `[TOOL_CALLS]`) as well as bare JSON.
 
 ```bash
 curl -X POST http://localhost:8080/v1/chat/completions \
@@ -152,15 +175,16 @@ Send tool results back as a `tool` role message:
   "messages": [
     {"role": "user", "content": "What is the weather in Tokyo?"},
     {"role": "assistant", "content": null, "tool_calls": [{"id": "call_abc123", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Tokyo\"}"}}]},
-    {"role": "tool", "tool_call_id": "call_abc123", "content": "{\"temp\": 22, \"condition\": \"sunny\"}"},
+    {"role": "tool", "tool_call_id": "call_abc123", "content": "{\"temp\": 22, \"condition\": \"sunny\"}"}
   ]
 }
 ```
 
 **Notes:**
 - Tool calling works best with models fine-tuned for it (Llama 3.1+, Qwen 2.5+, Mistral v0.3+).
-- `tool_choice` is honored: `"none"` disables tools entirely (no injection, no parsing); `"auto"` (the default when `tools` is present) lets the model decide; `"required"` and `{"type": "function", "function": {"name": …}}` instruct the model to call a tool. Without a grammar these are prompt-level guidance, not a hard constraint.
-- Emission is **prompt-injection only** — llama.cpp's OpenAI-compatible chat-template + GBNF-grammar helper was removed in llama-cpp-2 0.1.150, so there is no model-native grammar constraint today.
+- Tool rendering: on GGUF models, a chat template that references `tools` renders them in the model's trained format; otherwise the tool list is injected into the system prompt. MLX models always pass the tools to their template, with no injection fallback. Requests with images always use injection.
+- `tool_choice` is honored: `"none"` disables tools entirely (the model never sees them, and nothing is parsed); `"auto"` (the default when `tools` is present) lets the model decide; `"required"` and `{"type": "function", "function": {"name": …}}` ask for a call. That instruction is part of the injected preamble only; a template that renders the tools itself receives the tool list without it. Neither path forces a call.
+- With the `grammar` build feature, GGUF models also get a lazy GBNF grammar when `tool_choice` is `"required"` or names a function. It starts once the model opens a tool call (`<tool_call>`, `[TOOL_CALLS]` or `<|python_tag|>`) and then holds the output to a valid call: a listed tool name and an `arguments` object (matched against the tool's schema when one function is named). Text before the opener is not constrained. MLX models, requests with images, and servers running with `--batch-slots` get no grammar.
 - Streaming with tools: output is buffered to parse the calls, then emitted as OpenAI-style **incremental** `tool_calls` deltas (per-call `index`, then `id`/`name`, then `arguments`).
 
 ### Reasoning models (`reasoning_content`)
