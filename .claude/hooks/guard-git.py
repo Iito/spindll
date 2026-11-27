@@ -13,8 +13,8 @@ the body as its script), one command per line, wrappers like `env` and
 `timeout` looked through, and nested `sh -c` / `eval` strings read in turn.
 Rules only fire on segments that actually invoke git or gh.
 
-Deliberately NOT enforced here: which branch you commit on. Both quickfix->main
-and feature->next are real flows in this repo, so that stays a judgment call.
+Deliberately NOT enforced here: which branch you commit on or open a PR into.
+AGENTS.md's branch flow covers that (everything goes through next).
 Nor can it see commands assembled at runtime, inside scripts, behind aliases or
 in raw `gh api` calls: it stops accidents, it is not a sandbox.
 """
