@@ -74,6 +74,10 @@ trial per line), keeps winners, logs every trial to
 Metrics: `prompt_eval_tps`, `decode_tps`, `peak_rss_mb`, `p50_ms`, `p95_ms`.
 Keep-threshold defaults to +2% over the baseline median of 3 runs.
 
+**Neither script records a metric today (#124).** `spindll bench --json` emits
+`ttft_ms`, `tok_per_sec`, `total_ms` and `mem_peak_mb`, none of the names above,
+and `autoloop.sh` builds without the `bench` feature the subcommand needs.
+
 `bands.yaml` defines the control bands for the same metrics and
 `scripts/bands-check.py` evaluates a metrics log against them. Tiers:
 
