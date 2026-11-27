@@ -10,7 +10,8 @@ service Spindll {
   // Streaming chat inference from a message history.
   rpc Chat (ChatRequest) returns (stream ChatResponse);
 
-  // Download a model from HuggingFace. Streams progress updates.
+  // Download a model from Ollama or HuggingFace. Streams one message when the
+  // pull starts and one with done = true when it ends, with no byte progress.
   rpc Pull (PullRequest) returns (stream PullProgress);
 
   // List locally available models.
@@ -165,7 +166,7 @@ message ModelInfo {
 
 message LoadRequest {
   string model = 1;
-  int32 gpu_layers = 2;  // -1 = auto
+  int32 gpu_layers = 2;  // GGUF only. Unset or 0 = CPU only; negative = server default
   EvictionPriority priority = 3;
   uint32 idle_reload_secs = 4;  // 0 = disabled
 }
