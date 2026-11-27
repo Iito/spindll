@@ -1,16 +1,19 @@
 ---
 name: release-flow
-description: How to cut a spindll release — version bump and changelog commits on main via a detached worktree, lightweight tag, the release.yml gates, hand-curated notes, and the main/next fast-forward lockstep. Use when tagging a version, preparing release commits, writing release notes, or syncing main and next after a release.
+description: How to cut a spindll release. Version bump and changelog commits through a PR into next and then the next→main PR, a lightweight tag on main, the release.yml gates, hand-curated notes, and resetting next to main after the merge. Use when tagging a version, preparing release commits, writing release notes, or syncing main and next after a release.
 ---
 
 # Cutting a spindll release
 
-Verified against v0.9.0 (2026-08-21) and every v0.9.x since.
+Verified against v0.9.0 (2026-08-21) and every v0.9.x since. The PR path in §1
+and §6 replaced direct pushes to `main` on 2026-11-27, and no release has gone
+through it yet.
 
-## 1. Two commits on `main`, in a detached sibling worktree
+## 1. Two commits on a branch off `next`, in a sibling worktree
 
 ```bash
-git worktree add --detach ../spindll-release origin/main
+git fetch origin
+git worktree add -b release/X.Y.Z ../spindll-release origin/next
 ```
 
 Never do release work in the shared `main` checkout. The user works there and
@@ -24,7 +27,9 @@ Two commits, in this order:
 2. `docs(changelog): set X.Y.Z release date` — `## [Unreleased]` becomes
    `## [X.Y.Z] - <date>`.
 
-Validate with `cargo check --features cli,http` before either lands.
+Validate with `cargo check --features cli,http`, then open a PR into `next`.
+Never push these commits to `main`: they reach it like any other change, through
+`next`'s PR, its CI and its merge, then the next→main PR (§6).
 
 **Worktree gotcha.** Cargo walks parent directories for `.cargo/config.toml`, so
 a worktree nested under the main checkout inherits its config — including
@@ -36,8 +41,9 @@ half-configured CMake dir: `rm -rf target/debug/build/llama-cpp-sys-2-*`.
 
 ## 2. Tag
 
-Lightweight `vX.Y.Z` on the **changelog-date commit**. Pushing it triggers
-`.github/workflows/release.yml`.
+Lightweight `vX.Y.Z` on **`main`'s changelog-date commit**, once the next→main
+PR has merged. The merge rewrites commits, so tag the copy on `main`, never the
+one `next` had. Pushing the tag triggers `.github/workflows/release.yml`.
 
 Never tag before the bump lands: `check-version` hard-fails unless
 `Cargo.toml`'s version equals the tag. A post-publish artifact defect gets a
@@ -71,15 +77,30 @@ shipped.
 
 ## 6. Branch sync
 
-`main` and `next` advance in lockstep with identical SHAs. Releases land on main
-by **fast-forward** — the GitHub merge buttons don't fit (merge commits are
-disabled, rebase refuses branches containing merges). Push
-`origin/next:refs/heads/main` directly; admin bypasses the review rule and the
-open next→main PR auto-flips to MERGED. After cutting, fast-forward `next` to
-`main` and push so both tips match.
+`next` reaches `main` only through the next→main PR, merged once its CI passes.
+**Never push to `main`**, not even a fast-forward.
+
+The repo allows only squash and rebase merges, and both rewrite commits. So the
+merge leaves `main` with copies of `next`'s commits: the same tree, different
+SHAs. Until `next` is reset to `main`, any later next→main PR lists those commits
+again and its rebase conflicts on `CHANGELOG.md`. Reset `next` right after the
+merge, before anything else lands on it:
+
+```bash
+git fetch origin
+git diff --quiet origin/main origin/next && echo "same tree"
+git push --force-with-lease=refs/heads/next:$(git rev-parse origin/next) \
+  origin origin/main:refs/heads/next
+```
+
+If the trees differ, something landed on `next` after the merge, and the reset
+would drop it: stop and ask the user. `--force-with-lease` refuses if `next`
+moved after the fetch. Agents never force-push `next` (an AGENTS.md hard rule),
+so the user runs this one.
 
 ## Approval
 
-Every push and every `gh pr create` in this flow needs the user's explicit
-approval, each time. The `guard-git.py` hook enforces it via a lockfile the user
-touches by hand; it is consumed by one publish.
+Every push (the tag's included), every `gh pr create` and every `gh pr merge` in
+this flow needs the user's explicit approval, each time. The `guard-git.py` hook
+enforces it via a lockfile the user touches by hand; it is consumed by one
+publish.
