@@ -42,12 +42,12 @@ Models are loaded automatically on first request, or explicitly via the `Load` R
 ## CLI
 
 ```
-spindll search <query> [--limit N]     # search HuggingFace + Ollama, ranked by hardware
+spindll search <query> [flags]        # search HuggingFace + Ollama, ranked by hardware
 spindll pull <model> [flags]          # pull from Ollama registry or HuggingFace
 spindll list                          # show local models with metadata (alias: ls)
 spindll rm <model> [flags]            # delete a local model, alias: remove (prompts for external sources)
 spindll run <model> "prompt" [flags]   # one-shot inference (no server)
-spindll bench <model> [other]         # benchmark one or two models (debug builds only)
+spindll bench <model> [other]         # benchmark one or two models (needs --features bench)
 spindll serve [model] [options]       # start gRPC + HTTP server, optionally preloading a model
 spindll load <model> [--port N]       # load a model into a running server
 spindll unload <model> [--port N]     # drop a model from memory (stays on disk)
@@ -55,13 +55,24 @@ spindll import [OPTIONS]              # import models (from Ollama, HuggingFace 
 spindll status                        # query a running server
 ```
 
-Model names follow Ollama conventions (`llama3.1:8b`, `qwen2:0.5b`) or HuggingFace repos (`TheBloke/Llama-3-8B-GGUF`, `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit`).
+Model names follow Ollama conventions (`llama3.1:8b`, `qwen2:0.5b`) or HuggingFace repos (`Qwen/Qwen2.5-3B-Instruct-GGUF`, `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit`).
+
+### Search options
+
+```
+--limit <N>                Maximum results to show [default: 20]
+--format <FMT>             Show only gguf or mlx models
+--sort <ORDER>             downloads, size or name [default: hardware-aware ranking]
+```
 
 ### Pull options
 
 ```
---quant <STR>              Pick a specific quant (e.g. q4_k_m, q5_k_m, fp16). Without
-                           this flag, the picker prefers q4_k_m by default.
+--quant <STR>              Pick a specific quant: a HuggingFace GGUF quant (e.g. q4_k_m,
+                           q5_k_m, fp16; without this flag the picker prefers q4_k_m)
+                           or an MLX quant (e.g. 4bit, the default). Ollama registry
+                           pulls ignore it, so put the quant in the tag instead
+                           (e.g. llama3.1:8b-instruct-q5_K_M).
 --gguf                     Force GGUF, skip MLX resolution on Apple Silicon
 --mlx                      Force MLX, error if no MLX equivalent is found
 ```
@@ -86,10 +97,17 @@ Model names follow Ollama conventions (`llama3.1:8b`, `qwen2:0.5b`) or HuggingFa
 ### Run options
 
 ```
+--system <STR>             System prompt, not sent with --image
+                           [default: "You are a helpful assistant."]
+--max-tokens <N>           Max tokens to generate [default: 512]
 --ctx-size <N>             Context window size [default: 2048]
 --budget <SIZE>            Memory budget (e.g. "8G", omit=live RAM, "0"=total RAM)
 --kv-cache [<SIZE>]        Enable KV cache for prompt prefixes [default: 2G when enabled]
 --kv-scheme <SCHEME>       Compress MLX models' KV cache, e.g. turbo8v3 [default: f16]
+--image <PATH>             Image to send with the prompt, for vision models
+                           (--features vision)
+--mmproj <PATH>            Multimodal projector GGUF, auto-detected if omitted
+                           (--features vision)
 ```
 
 ### Serve options
