@@ -243,19 +243,27 @@ sudo apt install -y \
   clang libclang-dev
 ```
 
-GitHub Actions runners come with these pre-installed, so CI succeeds without explicit setup. Bare Ubuntu requires the full list.
+For `--features vulkan`, also install:
+
+```bash
+sudo apt install -y \
+  ninja-build libvulkan-dev \
+  glslc glslang-tools spirv-tools spirv-headers
+```
+
+CI installs cmake and protobuf-compiler itself, plus extra packages for its vision and Vulkan jobs; the GitHub Actions runner images ship the rest. Bare Ubuntu requires the full list.
 
 ### End-user runtime
 
-The release binary links dynamically against system libraries. On Linux (glibc), users need:
+The release binary links dynamically against system libraries. The Linux release is a Vulkan build, so on Linux (glibc) users need the Vulkan loader too:
 
 ```bash
-sudo apt install -y libssl3 libgomp1
+sudo apt install -y libssl3 libgomp1 libvulkan1
 ```
 
 (These are pre-installed on Ubuntu/Debian/Fedora desktop; minimal server images require the install.)
 
-macOS release binaries are self-contained; no runtime dependencies.
+The macOS release binary is for Apple Silicon on macOS 15 or later and needs no extra packages. On first start it writes `mlx.metallib` (MLX's GPU kernels) next to itself. If it can't, for example because that directory isn't writable, the MLX backend is disabled and only GGUF models run.
 
 ## License
 
