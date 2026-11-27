@@ -19,7 +19,9 @@ reach.
    disk.
 
 2. **Read the verdict.** `status: baselining` or `no-samples` means there is no
-   baseline yet. Say so and stop — do not invent one.
+   baseline yet. Say so and stop — do not invent one. Until #124 is fixed,
+   `bench` records nothing, since `spindll bench --json` emits other metric
+   names: after a `bench`, `no-samples` means that bug, so say that instead.
 
 3. **Act at the tier, and only at the tier.**
 
