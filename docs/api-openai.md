@@ -302,9 +302,17 @@ curl -X POST http://localhost:8080/v1/responses   -H "Content-Type: application/
       "content": [{"type": "output_text", "text": "Hi! How can I help?", "annotations": []}]
     }
   ],
-  "usage": {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20}
+  "usage": {
+    "input_tokens": 12,
+    "input_tokens_details": {"cached_tokens": 0},
+    "output_tokens": 8,
+    "output_tokens_details": {"reasoning_tokens": 0},
+    "total_tokens": 20
+  }
 }
 ```
+
+`cached_tokens` and `reasoning_tokens` are always 0. This endpoint does not split out think blocks: a `<think>` block the model writes stays in the output text.
 
 ### Streaming
 
@@ -324,6 +332,8 @@ event: response.completed
 
 The terminal event is `response.completed`, or `response.incomplete` when `max_output_tokens` was hit, or `response.failed` (with `response.error.code` / `message`) on error.
 
+With tools in the request, the output is buffered and replayed through the same events once generation ends, so the text arrives as a single delta.
+
 ### Scope
 
 | Accepted | Notes |
@@ -337,9 +347,11 @@ The terminal event is `response.completed`, or `response.incomplete` when `max_o
 
 Function calls come back as `function_call` output items (arguments as one fragment via `response.function_call_arguments.delta`); send results back as `function_call_output` items keyed by `call_id`.
 
-**Rejected with a 400:** `previous_response_id` (spindll is stateless — Codex's `store: false` path never sends it) and `input_image` parts (not mapped yet).
+**Rejected with a 400:** `previous_response_id` (spindll is stateless; Codex's `store: false` path never sends it), `input_image` parts (not mapped yet), and a request with neither `input` nor `instructions`.
 
 **Error format:**
+
+`/v1/models`, `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings` return errors in this shape. `type` is `"server_error"` whether the status is 400 or 500:
 
 ```json
 {
@@ -349,3 +361,9 @@ Function calls come back as `function_call` output items (arguments as one fragm
   }
 }
 ```
+
+The 404 from `GET /v1/models/{id}` uses `"invalid_request_error"`. `/v1/responses` uses the same shape with `"invalid_request_error"` for a 400 and `"api_error"` for a 500.
+
+When a chat or text completion stream fails, including a model that fails to load, the server sends one `data: {"error": {...}}` event in this shape and closes the stream without `[DONE]`. The HTTP status is still 200. A failing `/v1/responses` stream ends with `response.failed` instead.
+
+A request body that doesn't parse (for example, one without `model`) is rejected before these handlers run, with a plain-text 400, 415 or 422.
