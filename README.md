@@ -20,11 +20,11 @@ spindll import --from-ollama
 spindll serve
 ```
 
-Models are loaded automatically on first request, or explicitly via the `Load` RPC / `POST /load` endpoint.
+Models are loaded automatically on first request, or explicitly via the `Load` RPC / `POST /load` endpoint. The exception is the gRPC `Generate` RPC, which needs the model loaded first.
 
 ## Features
 
-- **Pull from Ollama or HuggingFace** -- auto-detects source from model name format; on Apple Silicon, resolves to MLX-format models when available, falls back to GGUF
+- **Pull from Ollama or HuggingFace** -- auto-detects source from model name format; on Apple Silicon builds with the `mlx` feature, resolves to MLX-format models when available, falls back to GGUF
 - **Pluggable backends** -- `InferenceBackend` trait dispatches to `llama.cpp` for GGUF and `mlx-swift-lm` for MLX, with an extension point for new engines
 - **Smart quant default** -- `pull` without `--quant` picks q4_k_m by priority list (q4_k_m > q5_k_m > q4_0 > … > fp16) instead of grabbing the first GGUF in the repo
 - **Streaming inference** -- token-by-token output over gRPC, HTTP/SSE, or OpenAI-compatible API
@@ -33,10 +33,10 @@ Models are loaded automatically on first request, or explicitly via the `Load` R
 - **Multi-model** -- multiple models loaded concurrently, LRU eviction when budget exceeded
 - **Continuous batching** -- concurrent requests to the same model share a single context via sequence IDs
 - **KV cache** -- disk-backed prefix caching with optional ChaCha20-Poly1305 encryption at rest
-- **Chat templates** -- reads the template from GGUF metadata, falls back to ChatML, and honors a `<model>.jinja` sidecar override (raw Jinja or a built-in name like `gemma`) for models shipping a broken or missing template
+- **Chat templates** -- reads the template from GGUF metadata, falls back to ChatML, and honors a sidecar override named after the model file plus `.jinja` (e.g. `model.gguf.jinja`; raw Jinja or a built-in name like `gemma`) for models shipping a broken or missing template
 - **GGUF metadata** -- extracts model name, description, and architecture from file headers
 - **Memory-aware** -- configurable budget; budget-aware n_ctx auto-resolution at load time prevents silent OOMs
-- **GPU acceleration** -- Metal (macOS) auto-detected, CUDA / Vulkan (Linux) supported
+- **GPU acceleration** -- Metal (macOS) auto-detected, CUDA / Vulkan (Linux, Windows) supported; the Linux and Windows release binaries are Vulkan builds, and CUDA needs a source build
 - **Embeddable** -- use as a Rust crate in your own project, no subprocess needed
 
 ## CLI
@@ -219,6 +219,9 @@ Models are stored in `~/.spindll/models/<repo>/<file>`. A JSON registry at `~/.s
 | `cuda` | CUDA GPU support in llama.cpp |
 | `metal` | Metal GPU support in llama.cpp |
 | `vulkan` | Vulkan GPU support in llama.cpp |
+| `bench` | `spindll bench` subcommand for in-process benchmarks (implies `cli`) |
+| `vision` | Image input for vision models: GGUF through llama.cpp's mtmd, and MLX VLMs |
+| `grammar` | GBNF grammar that forces a valid tool call on GGUF models when `tool_choice` requires one |
 
 The gRPC server and core engine are always compiled -- no feature flag needed for library consumers or for embedding spindll in another binary.
 
