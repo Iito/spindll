@@ -568,8 +568,10 @@ public func mlxModelLoad(_ path: UnsafePointer<CChar>?) -> UnsafeMutableRawPoint
 
     // Cached KV state is in the layout of the scheme that wrote it, so the
     // namespace carries the scheme too: a restart under another scheme must
-    // not pick up on-disk entries in a layout it doesn't use.
-    let cacheNamespace = kvScheme.map { "\(modelDigest)-\($0)" } ?? modelDigest
+    // not pick up on-disk entries in a layout it doesn't use. Exact f16 entries
+    // have a name of their own, so 8-bit entries an older spindll wrote under
+    // the bare digest are never restored as exact.
+    let cacheNamespace = "\(modelDigest)-\(kvScheme ?? "f16")"
 
     Task {
         // Try VLM first — covers vision-language models (Qwen2.5-VL, Gemma3, etc.)
