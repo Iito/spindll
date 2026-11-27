@@ -4,9 +4,11 @@ allowed-tools: Bash, Read, Write
 argument-hint: <metric> <grid.jsonl>
 ---
 
-Karpathy autoresearch loop. Source: `AGENTS.md` "Karpathy autoloop", PDF slide 18.
+Karpathy autoresearch loop. Background: `.claude/skills/harness-ops/SKILL.md`.
 
 Metric (arg 1): one of `prompt_eval_tps`, `decode_tps`, `peak_rss_mb`, `p50_ms`, `p95_ms`.
+
+**Broken today (#124):** `spindll bench --json` emits none of these names, and the script builds without the `bench` feature, so every trial records no metric. Say so instead of reporting a sweep.
 Grid (arg 2): JSONL at `.refs/autoloop/grids/<name>.jsonl`. Each line: `{"label": "...", "patch_cmd": "...", "env": {"K":"V"}}`.
 
 Run: `bash scripts/autoloop.sh "$1" "$2"`.
