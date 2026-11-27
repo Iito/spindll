@@ -83,7 +83,7 @@ curl -X POST http://localhost:8080/v1/messages \
   }'
 ```
 
-A tool call answers with `stop_reason: "tool_use"` and a `{"type": "tool_use", "id", "name", "input"}` block. Streaming tool calls arrive as a `tool_use` `content_block_start` followed by one `input_json_delta` (arguments are parsed from the completed output, not token-by-token).
+A tool call answers with `stop_reason: "tool_use"` and a `{"type": "tool_use", "id", "name", "input"}` block. Streaming tool calls arrive as a `tool_use` `content_block_start` followed by one `input_json_delta` (arguments are parsed from the completed output, not token-by-token). With tools in the request the whole reply is buffered, so any text also arrives as one `text_delta` after generation ends.
 
 ## Supported request fields
 
@@ -92,7 +92,7 @@ A tool call answers with `stop_reason: "tool_use"` and a `{"type": "tool_use", "
 | `model`, `max_tokens`, `messages` | Required (`max_tokens` missing → Anthropic-shaped 400) |
 | `system` | String or text-block array |
 | `messages[].content` | String or block array: `text`, `image`, `tool_use`, `tool_result` |
-| `tools`, `tool_choice` | `{type: auto \| any \| tool \| none}`; rendered through the model's native tool template |
+| `tools`, `tool_choice` | `{type: auto \| any \| tool \| none}`. The model's chat template renders the tools when it supports them; injecting them into the system prompt is the fallback (details in [api-openai.md](api-openai.md#tool--function-calling)) |
 | `stop_sequences` | Honored in both modes; streamed output holds back a partial match so a stop string split across tokens never leaks |
 | `temperature`, `top_p`, `top_k` | Passed through |
 | `stream` | Messages SSE grammar |
@@ -109,4 +109,5 @@ Unknown content block types (`thinking`, `redacted_thinking`, `document`, …) a
 - `/v1/messages/count_tokens`, batches, files
 - prompt caching fields (accepted, ignored; `usage` never reports cache reads)
 - extended thinking (no `thinking` config; thinking blocks in history are dropped)
+- splitting out reasoning: a `<think>` block the model writes stays in the `text` content
 - server-side tools (web search etc.) — only client-executed function tools
