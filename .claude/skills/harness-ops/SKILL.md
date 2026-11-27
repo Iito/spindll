@@ -67,8 +67,9 @@ script, so every `ratchet=green` before that date meant "clippy unknown".
 
 ## Autoloop and control bands
 
-`scripts/autoloop.sh <metric> <param-grid.json>` sweeps a parameter grid,
-keeps winners, logs every trial to `.refs/autoloop/log-<date>.jsonl`.
+`scripts/autoloop.sh <metric> <grid.jsonl>` sweeps a parameter grid (JSONL, one
+trial per line), keeps winners, logs every trial to
+`.refs/autoloop/log-<date>.jsonl`.
 
 Metrics: `prompt_eval_tps`, `decode_tps`, `peak_rss_mb`, `p50_ms`, `p95_ms`.
 Keep-threshold defaults to +2% over the baseline median of 3 runs.
