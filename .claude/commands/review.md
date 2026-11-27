@@ -16,7 +16,8 @@ Lanes:
 - **R2** — `codex exec --model gpt-5.4-xhigh`
 - **R3** — `codex exec --model gpt-5.3-codex`, only when `RELEASE=1`
 
-Each lane writes `.refs/review/r<n>-<sha>.md`; the script collates into
+Each lane writes `.refs/review/r<n>-<model>-<sha>.md` (R1's is
+`r1-claude-opus-4-6-<sha>.md`); the script collates into
 `.refs/review/COLLATED-<sha>.md`.
 
 On Apple Silicon the R2 lane has no OpenAI credentials by design. Report
