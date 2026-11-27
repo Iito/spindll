@@ -55,10 +55,11 @@ plus `COLLATED-<sha>.md`. A finding is dropped only with a one-line
 
 ## Ratchet
 
-`scripts/ratchet.sh` is the fast green gate: `cargo check`, `cargo clippy -D
-warnings`, `cargo test --lib`, and the hook tests. Target ≤60s on Apple
-Silicon, ≤90s on the Linux host. **If it grows, trim the test filter — never
-raise the cap.** A slow gate is a gate people skip.
+`scripts/ratchet.sh` is the fast green gate: `cargo check`, `cargo clippy
+--all-targets --locked -- -D warnings`, `cargo test --lib --bins`, the hook
+tests and `scripts/harness-lint.py`. Target ≤60s on Apple Silicon, ≤90s on the
+Linux host; it warns past `RATCHET_CAP`, 90s by default. **If it grows, trim the
+test filter — never raise the cap.** A slow gate is a gate people skip.
 
 Clippy went strict on 2026-08-29. It had been warn-only against a
 "13 pre-existing lints" baseline that was cleaned up without anyone updating the
