@@ -103,14 +103,21 @@ Model names follow Ollama conventions (`llama3.1:8b`, `qwen2:0.5b`) or HuggingFa
                            (free + inactive + purgeable + speculative on macOS;
                            sysinfo's available_memory elsewhere). Pass "0" to use
                            total RAM (trust unified-memory paging).
---kv-cache [<SIZE>]        Enable KV cache for prompt prefixes [default: 2G]
+--kv-cache <SIZE>          Disk KV cache size for prompt prefixes, on by default [default: 2G]
+--no-kv-cache              Turn off the KV cache (disk and in-memory tiers)
+--kv-ram-cache <SIZE>      In-memory KV cache [default: 512M]
+--no-kv-ram-cache          Turn off the in-memory KV cache
 --kv-scheme <SCHEME>       Compress MLX models' KV cache [default: f16]. TurboQuant:
                            turbo8v3 (8-bit keys, 3-bit values; upstream's default
                            pick), turbo0v4 (f16 keys, 4-bit values; safest),
                            turbo4/turbo3/turbo2 (most compression). Also affine4/8.
                            Saves memory but slows decoding; GGUF models unaffected.
+                           Gemma 2, GPT-OSS, Bitnet, Apertus and Baichuan-M1 keep
+                           the f16 cache. Builds without the MLX backend reject any
+                           scheme but f16.
 --batch-slots <N>          Concurrent sequence slots per model [default: 0 = disabled]
---ram-cache [<SIZE>]       Keep recently-evicted models warm in RAM [default: 4G; no-op on macOS]
+--ram-cache[=<SIZE>]       Keep recently-evicted models warm in RAM [default: 4G; no-op on
+                           macOS]. Pass a size with =, e.g. --ram-cache=8G
 ```
 
 While `serve` is running it writes a JSON lockfile (`pid`, `grpc_port`, `http_port`) to the system temp dir. `spindll status` reads this file to auto-detect the port, so `--port` is optional when a local server is running. Stale lockfiles are cleaned automatically when the referenced PID is no longer alive.
