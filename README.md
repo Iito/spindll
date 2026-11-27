@@ -203,7 +203,8 @@ The gRPC server and core engine are always compiled -- no feature flag needed fo
 
 - [Rust toolchain](https://rustup.rs/) (stable, edition 2024)
 - CMake (for llama.cpp compilation)
-- Swift toolchain ≥ 5.9 and Xcode command-line tools (only when building with `--features mlx` on Apple Silicon)
+- protoc, the Protocol Buffers compiler (for the gRPC code; `brew install protobuf` on macOS)
+- Only for `--features mlx` on Apple Silicon: Xcode 26.4+ (Swift 6.3, macOS 26 SDK), or Xcode 26 plus a swift.org Swift 6.3+ toolchain (found automatically, or set `TOOLCHAINS`), and the Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`)
 
 ### Linux build (bare Ubuntu 24.04 or equivalent)
 
