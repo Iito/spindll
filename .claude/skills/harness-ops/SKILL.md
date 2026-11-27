@@ -42,12 +42,13 @@ entry.
 
 ## Review fanout
 
-`scripts/review-fanout.sh <base>` runs the lanes defined in `REVIEW.md`, which
-is also the prompt — there is no second copy in the script. Reviewers get the
-diff plus the punchlist item the change claims to implement.
+`scripts/review-fanout.sh <base>` runs the review lanes, which the script itself
+sets: R1 Claude Opus and R2 Codex, plus R3 Codex with `RELEASE=1`. `REVIEW.md`
+is the prompt, and there is no second copy of it in the script. Reviewers get
+the diff plus the punchlist item the change claims to implement.
 
-Output lands in `.refs/review/`: one file per lane, plus
-`COLLATED-<sha>.md`. A finding is dropped only with a one-line
+Output lands in `.refs/review/`: one file per lane (`r<n>-<model>-<sha>.md`),
+plus `COLLATED-<sha>.md`. A finding is dropped only with a one-line
 `# silenced: <why>` beside it in the collated file.
 
 `.refs/` is a local sink and is gitignored. Never commit logs.
