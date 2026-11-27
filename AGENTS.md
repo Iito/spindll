@@ -27,10 +27,11 @@ Messages (`/v1/messages`), and a stateless subset of OpenAI Responses
 cargo build --features cli,http                      # dev
 cargo build --release --features cli,http,mlx        # Apple Silicon
 cargo build --release --features cli,http,cuda       # Linux + CUDA
-bash scripts/ratchet.sh                              # the green gate, <60s
+bash scripts/ratchet.sh                              # the green gate, warns past 90s
 ```
 
-Feature flags: `cli`, `http`, `cuda`, `metal`, `vulkan`, `mlx`, `vision`, `rpc`.
+Feature flags: `cli`, `http`, `cuda`, `metal`, `vulkan`, `mlx`, `bench`, `vision`,
+`grammar`.
 MLX is Apple-Silicon only — gate it
 `#[cfg(all(target_arch = "aarch64", target_os = "macos", feature = "mlx"))]`.
 

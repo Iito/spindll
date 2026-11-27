@@ -13,7 +13,7 @@ Messages dialect (`/v1/messages`), and a stateless subset of the OpenAI
 Responses API (`/v1/responses`).
 
 Edition 2024. Feature flags: `cli`, `http`, `cuda`, `metal`, `vulkan`, `mlx`,
-`vision`, `rpc`. Anything MLX is Apple-Silicon only and must be gated
+`bench`, `vision`, `grammar`. Anything MLX is Apple-Silicon only and must be gated
 `#[cfg(all(target_arch = "aarch64", target_os = "macos", feature = "mlx"))]`.
 
 ## Severity ladder
