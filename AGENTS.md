@@ -55,13 +55,15 @@ denies the call and tells you why; `scripts/hook-tests.sh` proves it still works
 
 ## Branch flow
 
-- **Quickfix or hotfix → branch off `main`, PR to `main`.** It reaches `next`
-  later via the user's main→next carry merge. Do not open a second PR for it.
-- **Feature work → branch off `next`, PR to `next`.** `next` merges to `main`
-  for releases.
-- **Release docs follow the release**: changelog and version commits for a tag
-  cut from `main` are main-line work, done in a detached sibling worktree.
-- **If the right base is ambiguous, ask "main or next?"** before branching.
+- **Never push to `main`.** It moves only when the next→main PR merges.
+- **All work, fixes included → branch off `next`, PR to `next`.** Wait for CI,
+  then merge. A fix merged into `main` alone would split the two branches.
+- **`next` reaches `main` only through its PR**, after its CI. Release commits
+  take the same path (`.claude/skills/release-flow/SKILL.md`).
+- **That merge leaves `main` with copies of `next`'s commits**: the repo allows
+  only squash and rebase merges. The user resets `next` to `main` afterwards.
+  Before opening a next→main PR, check
+  `git rev-list --left-right --count origin/main...origin/next`.
 
 ## The loop (`/implement`)
 
