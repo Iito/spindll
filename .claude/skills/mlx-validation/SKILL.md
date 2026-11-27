@@ -29,8 +29,8 @@ worktree, never in the user's checkout.
 
 | | Runs on | Covers |
 |---|---|---|
-| `.github/workflows/ci.yml` | Linux + Windows matrix | Build/test, clippy, vision. Path-scoped to `src/**`, `proto/**`, `Cargo.*`, `build.rs`. **Does not list `mlx_bridge/**`.** |
-| `.github/workflows/ci-macos.yml` | `macos-26`, Xcode 26.6 | **Debug** build + lib tests, `--features cli,http,mlx,vision`. Scoped to MLX-relevant paths *including* `mlx_bridge/**`. |
+| `.github/workflows/ci.yml` | Linux + Windows matrix | Build/test, clippy (plus the `ffi` crate's clippy and tests), vision and vulkan feature checks. Path-scoped to `src/**`, `tests/**`, `proto/**`, `ffi/**`, `.cargo/**`, `Cargo.*`, `build.rs`. **Does not list `mlx_bridge/**`.** |
+| `.github/workflows/ci-macos.yml` | `macos-26`, Xcode 26.6 | **Debug** build + lib tests, `--features cli,http,mlx,vision`, and an `ios-check` job that lints the library for iPhone and the Simulator. Scoped to MLX-relevant paths *including* `mlx_bridge/**`. |
 | `scripts/mlx-validate.sh` | Local Apple Silicon | **Release** build + full lib tests. The heavy validator. |
 
 Net effect: a Swift-bridge-only change runs **only** the macOS job. Shared-code
