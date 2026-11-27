@@ -12,6 +12,13 @@ cargo build --lib --release --target aarch64-apple-ios       # iPhone
 cargo build --lib --release --target aarch64-apple-ios-sim   # Simulator
 ```
 
+Apps that link spindll as a static library use its C API instead: the
+`spindll-ffi` crate in `ffi/`, which wraps the `Scorer` (header:
+`ffi/include/spindll.h`). `scripts/build-ios-xcframework.sh` builds it for both
+targets into `SpindllFFI.xcframework`, for iOS 17, with Metal and weight
+repacking off as below (`--metal` turns Metal on).
+[SpindllKit](../ios/SpindllKit/README.md) is the Swift package over it.
+
 The MLX bridge is macOS-only for now: with `--features mlx`, a build for any
 other target skips it with a warning.
 
@@ -26,10 +33,12 @@ soon as the backend starts, even when every layer runs on the CPU:
 | Metal compiled out | 2 MB | 32 MB |
 
 A keyboard extension gets about 76 MB on an iPhone 15, so build it without
-Metal. `llama-cpp-sys-2` passes any `GGML_*` environment variable to CMake:
+Metal, and without weight repacking, which copies mmap'd weights (Q4_0, for
+one) into memory iOS counts. `llama-cpp-sys-2` passes any `GGML_*` environment
+variable to CMake:
 
 ```sh
-GGML_METAL=OFF cargo build --lib --release --target aarch64-apple-ios
+GGML_METAL=OFF GGML_CPU_REPACK=OFF cargo build --lib --release --target aarch64-apple-ios
 ```
 
 The model file itself barely counts: weights are memory-mapped, and clean
@@ -45,3 +54,6 @@ model costs about 12 MB.
 - **The memory budget comes from `os_proc_available_memory()`.** iOS
   terminates a process at its jetsam limit, far below physical RAM, so the
   budget is the headroom under that limit, not total RAM.
+- **The `Scorer` behind the C API takes its layers from its config.**
+  `gpu_layers` defaults to 0, so it runs on the CPU in every build until that
+  is set. Leave it at 0 on the Simulator.
