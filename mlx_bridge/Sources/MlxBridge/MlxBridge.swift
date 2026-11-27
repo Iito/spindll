@@ -94,14 +94,20 @@ private final class PromptCacheEntry {
     var bits: Int
     /// In-RAM footprint of `kvCache`.
     var sizeBytes: Int64
+    /// Model state that belongs with `kvCache`, as TokenIterator left it.
+    /// Qwen-VL-family models need it to continue from a warm cache: their
+    /// M-RoPE rope delta, stored relative to the cache offset, so it stays valid
+    /// when the restored prefix is cut back. nil for most models.
+    var state: LMOutput.State?
     /// A copy of this state has already been written to the on-disk tier — so
     /// it isn't re-written when the entry is later evicted.
     var spilled = false
 
-    init(tokenIds: [Int32], kvCache: [any KVCache], bits: Int) {
+    init(tokenIds: [Int32], kvCache: [any KVCache], bits: Int, state: LMOutput.State?) {
         self.tokenIds  = tokenIds
         self.kvCache   = kvCache
         self.bits      = bits
+        self.state     = state
         self.sizeBytes = sizeOf(kvCache)
     }
 }
@@ -113,14 +119,40 @@ private struct PromptCacheHit {
     let prefixLength: Int
 }
 
-/// Total bytes occupied by the live state arrays of every layer in `kvCache`.
-/// `MLXArray.nbytes` reports the size of the (possibly-sliced) view.
+/// Bytes `kvCache` keeps in memory. A layer's `state` is a view of the tokens
+/// it holds, while its buffers grow in steps (256 tokens for KVCacheSimple), so
+/// each layer counts the buffers it holds (`innerState`), or the view for a
+/// type that reports none.
 private func sizeOf(_ kvCache: [any KVCache]) -> Int64 {
     var total: Int64 = 0
     for layer in kvCache {
-        for array in layer.state { total += Int64(array.nbytes) }
+        let used = layer.state.reduce(Int64(0)) { $0 + Int64($1.nbytes) }
+        let held = ((layer as? BaseKVCache)?.innerState() ?? [])
+            .reduce(Int64(0)) { $0 + Int64($1.nbytes) }
+        total += max(used, held)
     }
     return total
+}
+
+/// `cache` with each plain attention layer whose buffer is more than a quarter
+/// empty copied down to the tokens it holds. A short conversation otherwise
+/// keeps most of a 256-token growth step per layer, which the byte budget now
+/// counts. Other layer types are kept as they are.
+private func trimmedToFit(_ cache: [any KVCache]) -> [any KVCache] {
+    var pending: [MLXArray] = []
+    let fitted: [any KVCache] = cache.map { layer in
+        guard let simple = layer as? KVCacheSimple, type(of: simple) == KVCacheSimple.self
+        else { return layer }
+        let used = simple.state.reduce(0) { $0 + $1.nbytes }
+        let held = simple.innerState().reduce(0) { $0 + $1.nbytes }
+        guard (held - used) * 4 > held else { return layer }
+        let copy = KVCacheSimple()
+        copy.state = simple.state.map { $0 * 1 }   // `* 1` detaches; offset unchanged
+        pending += copy.state
+        return copy
+    }
+    if !pending.isEmpty { MLX.eval(pending) }
+    return fitted
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +205,19 @@ public func mlxSetKVScheme(_ scheme: UnsafePointer<CChar>?) -> Int32 {
     fputs("[mlx-bridge] KV cache scheme: \(name)\n", stderr)
     return 0
 }
+
+/// Model types whose attention writes its KV cache with `cache.update(keys:values:)`
+/// directly, without going through `attentionWithCacheUpdate` or checking for a
+/// quantized cache. Every scheme quantizes some layers into `QuantizedKVCache`
+/// (all of them under affine*, the 8-bit boundary layers under the smaller turbo
+/// schemes), and `QuantizedKVCache.update` is a fatalError, so these models
+/// would kill the process on their first prompt. They keep the f16 cache.
+/// From mlx-swift-lm 3.33.0's model sources; re-check on a bump with
+/// `grep -rn 'cache.update(keys' Libraries/MLXLLM/Models Libraries/MLXVLM/Models`,
+/// leaving out the models that handle `QuantizedKVCache` before that call.
+private let directCacheWriterModelTypes: Set<String> = [
+    "apertus", "baichuan_m1", "bitnet", "gemma2", "gpt_oss",
+]
 
 // ---------------------------------------------------------------------------
 // MlxDiskCache — on-disk LRU tier behind PromptCache.
@@ -240,7 +285,7 @@ private final class MlxDiskCache {
     /// `tokenIds` (≥ `minPrefix`), load it, refresh its LRU stamp, and return
     /// its reconstructed KV state. `nil` on no match or a load failure.
     func lookup(modelDigest: String, tokenIds: [Int32], minPrefix: Int)
-        -> (tokenIds: [Int32], kvCache: [any KVCache], bits: Int)? {
+        -> (tokenIds: [Int32], kvCache: [any KVCache], bits: Int, state: LMOutput.State?)? {
         guard enabled else { return nil }
         lock.lock()
         var best: DiskCacheEntry? = nil
@@ -253,8 +298,8 @@ private final class MlxDiskCache {
         let url = dir.appendingPathComponent(entry.file)
         lock.unlock()
 
-        let loaded: [KVCache]
-        do { loaded = try loadPromptCache(url: url).0 }
+        let snapshot: PromptCacheSnapshot
+        do { snapshot = try loadPromptCacheSnapshot(url: url) }
         catch {
             fputs("[mlx-bridge] disk cache: load failed (\(entry.file)): \(error)\n", stderr)
             lock.lock(); index[entry.file] = nil; saveIndexLocked(); lock.unlock()
@@ -264,6 +309,7 @@ private final class MlxDiskCache {
         // loadPromptCache rebuilds QuantizedKVCache layers at the default 8-bit
         // width — mlx-swift-lm doesn't restore bits/groupSize from metaState — so
         // re-bind the loaded arrays into caches with the width we recorded.
+        let loaded = snapshot.cache
         let kvCache: [any KVCache] = entry.bits == 8 ? loaded : loaded.map { layer in
             guard let q = layer as? QuantizedKVCache, q.bits != entry.bits else { return layer }
             let nq = QuantizedKVCache(groupSize: q.groupSize, bits: entry.bits)
@@ -276,17 +322,19 @@ private final class MlxDiskCache {
         index[entry.file] = entry
         saveIndexLocked()
         lock.unlock()
-        return (entry.tokenIds, kvCache, entry.bits)
+        return (entry.tokenIds, kvCache, entry.bits, snapshot.state)
     }
 
-    /// Write an evicted RAM entry to disk, dropping LRU disk entries if over budget.
-    func put(modelDigest: String, tokenIds: [Int32], kvCache: [any KVCache], bits: Int) {
+    /// Write an evicted RAM entry to disk, with the model state that belongs
+    /// with it, dropping LRU disk entries if over budget.
+    func put(modelDigest: String, tokenIds: [Int32], kvCache: [any KVCache], bits: Int,
+             state: LMOutput.State?) {
         guard enabled, !tokenIds.isEmpty else { return }
         var tokenData = Data(capacity: tokenIds.count * 4)
         for t in tokenIds { withUnsafeBytes(of: t.littleEndian) { tokenData.append(contentsOf: $0) } }
         let file = "\(modelDigest)_\(sha256Hex(tokenData)).safetensors"
         let url = dir.appendingPathComponent(file)
-        do { try savePromptCache(url: url, cache: kvCache, metadata: [:]) }
+        do { try savePromptCache(url: url, cache: kvCache, metadata: [:], state: state) }
         catch {
             fputs("[mlx-bridge] disk cache: save failed (\(file)): \(error)\n", stderr)
             try? FileManager.default.removeItem(at: url)
@@ -371,7 +419,8 @@ private final class PromptCache {
                 modelDigest: modelDigest, tokenIds: tokenIds,
                 minPrefix: max(minPrefix, covered + diskMinGain))
         else { return ram }
-        let entry = PromptCacheEntry(tokenIds: d.tokenIds, kvCache: d.kvCache, bits: d.bits)
+        let entry = PromptCacheEntry(tokenIds: d.tokenIds, kvCache: d.kvCache, bits: d.bits,
+                                     state: d.state)
         entry.spilled = true   // it came from disk; no need to write it back
         if maxBytes > 0 {
             entries.removeAll { commonPrefixLength($0.tokenIds, entry.tokenIds) == $0.tokenIds.count }
@@ -386,19 +435,27 @@ private final class PromptCache {
     /// supersedes it). Surviving older entries spill a copy to the on-disk tier,
     /// once. While the cache is over its byte budget, the LRU entry is dropped
     /// from RAM (already on disk).
-    func save(tokenIds: [Int32], kvCache: [any KVCache], bits: Int) {
+    func save(tokenIds: [Int32], kvCache: [any KVCache], bits: Int, state: LMOutput.State?) {
         guard !tokenIds.isEmpty else { return }
+        let entry = PromptCacheEntry(tokenIds: tokenIds, kvCache: kvCache, bits: bits, state: state)
         // RAM tier disabled: skip RAM bookkeeping but still spill to disk so
         // `--no-kv-ram-cache` users keep their on-disk cache.
         if maxBytes == 0 {
-            let entry = PromptCacheEntry(tokenIds: tokenIds, kvCache: kvCache, bits: bits)
             spillToDisk(entry)
             return
         }
         entries.removeAll { commonPrefixLength($0.tokenIds, tokenIds) == $0.tokenIds.count }
         for e in entries { spillToDisk(e) }
-        entries.insert(PromptCacheEntry(tokenIds: tokenIds, kvCache: kvCache, bits: bits), at: 0)
+        entries.insert(entry, at: 0)
         evictExcess()
+    }
+
+    /// Take `entry` out of the RAM tier because its state is becoming a live
+    /// cache: generation extends it, so its token list and size would no longer
+    /// describe it. The save after generation stores the extended state, and a
+    /// turn that never gets there leaves no stale entry behind.
+    func take(_ entry: PromptCacheEntry) {
+        entries.removeAll { $0 === entry }
     }
 
     private func evictExcess() {
@@ -412,7 +469,8 @@ private final class PromptCache {
     private func spillToDisk(_ entry: PromptCacheEntry) {
         guard !entry.spilled, entry.tokenIds.count >= diskMinTokens else { return }
         sharedMlxDiskCache.put(modelDigest: modelDigest,
-                               tokenIds: entry.tokenIds, kvCache: entry.kvCache, bits: entry.bits)
+                               tokenIds: entry.tokenIds, kvCache: entry.kvCache, bits: entry.bits,
+                               state: entry.state)
         entry.spilled = true
     }
 }
@@ -426,13 +484,26 @@ private final class ModelState: @unchecked Sendable {
     /// False when the tokenizer cannot render its own chat template — text
     /// requests then fall back to ChatML and vision requests are rejected.
     let hasChatTemplate: Bool
+    /// The KV scheme this model generates with: `--kv-scheme`, or nil (f16)
+    /// for a model that can't take one (`directCacheWriterModelTypes`).
+    let kvScheme: String?
     init(_ container: ModelContainer, modelDigest: String, isVLM: Bool = false,
-         hasChatTemplate: Bool = true) {
+         hasChatTemplate: Bool = true, kvScheme: String?) {
         self.container = container
         self.promptCache = PromptCache(modelDigest: modelDigest)
         self.isVLM = isVLM
         self.hasChatTemplate = hasChatTemplate
+        self.kvScheme = kvScheme
     }
+}
+
+/// Prompt tokens as TokenIterator input. A model loaded as a VLM gets them as
+/// [1, L], the shape its own processors build: Qwen3-VL's single-step prefill
+/// reads `dim(1)` of the ids, so a flat array fails there. The generic LLM
+/// prefill takes the flat [L] array.
+private func promptTokenArray(_ tokens: [Int32], vlm: Bool) -> MLXArray {
+    let array = MLXArray(tokens)
+    return vlm ? array.expandedDimensions(axis: 0) : array
 }
 
 /// True when the tokenizer renders its own chat template. Any render failure
@@ -478,16 +549,29 @@ public func mlxModelLoad(_ path: UnsafePointer<CChar>?) -> UnsafeMutableRawPoint
     // Model identity for the on-disk prompt cache: digest of config.json (the
     // same artefact the Rust side uses as the MLX model version), falling back
     // to the path if it can't be read.
-    let modelDigest: String
-    if let cfg = try? Data(contentsOf: url.appendingPathComponent("config.json")) {
-        modelDigest = sha256Hex(cfg)
+    let config = try? Data(contentsOf: url.appendingPathComponent("config.json"))
+    let modelDigest = sha256Hex(config ?? Data(modelPath.utf8))
+
+    // `--kv-scheme` applies only to models that can take a compressed cache.
+    let modelType = config
+        .flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }?["model_type"]
+        as? String
+    let kvScheme: String?
+    if let scheme = mlxKVScheme, let modelType, directCacheWriterModelTypes.contains(modelType) {
+        fputs("[mlx-bridge] WARNING: --kv-scheme \(scheme) does not apply to \(modelType) " +
+              "models, whose attention can't use a compressed KV cache. " +
+              "This model keeps the f16 cache.\n", stderr)
+        kvScheme = nil
     } else {
-        modelDigest = sha256Hex(Data(modelPath.utf8))
+        kvScheme = mlxKVScheme
     }
+
     // Cached KV state is in the layout of the scheme that wrote it, so the
     // namespace carries the scheme too: a restart under another scheme must
-    // not pick up on-disk entries in a layout it doesn't use.
-    let cacheNamespace = mlxKVScheme.map { "\(modelDigest)-\($0)" } ?? modelDigest
+    // not pick up on-disk entries in a layout it doesn't use. Exact f16 entries
+    // have a name of their own, so 8-bit entries an older spindll wrote under
+    // the bare digest are never restored as exact.
+    let cacheNamespace = "\(modelDigest)-\(kvScheme ?? "f16")"
 
     Task {
         // Try VLM first — covers vision-language models (Qwen2.5-VL, Gemma3, etc.)
@@ -500,7 +584,7 @@ public func mlxModelLoad(_ path: UnsafePointer<CChar>?) -> UnsafeMutableRawPoint
             let hasTemplate = await probeChatTemplate(container)
             if !hasTemplate { warnMissingChatTemplate(modelPath: modelPath, isVLM: true) }
             box.value = ModelState(container, modelDigest: cacheNamespace, isVLM: true,
-                                   hasChatTemplate: hasTemplate)
+                                   hasChatTemplate: hasTemplate, kvScheme: kvScheme)
         } catch {
             // Fall back to LLM for text-only architectures.
             do {
@@ -511,7 +595,7 @@ public func mlxModelLoad(_ path: UnsafePointer<CChar>?) -> UnsafeMutableRawPoint
                 let hasTemplate = await probeChatTemplate(container)
                 if !hasTemplate { warnMissingChatTemplate(modelPath: modelPath, isVLM: false) }
                 box.value = ModelState(container, modelDigest: cacheNamespace, isVLM: false,
-                                       hasChatTemplate: hasTemplate)
+                                       hasChatTemplate: hasTemplate, kvScheme: kvScheme)
             } catch {
                 // box.value stays nil; Rust side receives NULL
             }
@@ -575,7 +659,7 @@ public func mlxGenerate(
             // the scheme itself.
             let params = GenerateParameters(
                 maxTokens: Int(maxTokens),
-                kvScheme: mlxKVScheme,
+                kvScheme: state.kvScheme,
                 temperature: temperature,
                 topP: topP
             )
@@ -588,7 +672,8 @@ public func mlxGenerate(
             var generated: Int32 = 0
             try await state.container.perform(nonSendable: promptStr) { context, prompt in
                 let tokenIds = context.tokenizer.encode(text: prompt, addSpecialTokens: false)
-                let lmInput = LMInput(tokens: MLXArray(tokenIds.map { Int32($0) }))
+                let lmInput = LMInput(
+                    tokens: promptTokenArray(tokenIds.map { Int32($0) }, vlm: state.isVLM))
                 var iterator = try TokenIterator(
                     input: lmInput,
                     model: context.model,
@@ -862,26 +947,36 @@ public func mlxChatGenerate(
                 // Without a KV scheme entries are exact f16, so the restored
                 // prefix computes what a cold prefill would and the output
                 // matches. An entry that is exactly a prefix of this prompt is
-                // consumed in place (the save below drops it anyway). A
-                // quantized entry, such as an 8-bit one read back from disk, is
-                // dequantized into a copy instead of extended: appending to it
-                // would leave the whole new conversation at its width. Under a
-                // scheme the restored state keeps the scheme's layout.
-                var restoredHit: (cache: [any KVCache], keep: Int, bits: Int)? = nil
+                // consumed in place: it leaves the cache, and the save below
+                // stores it extended. A quantized entry, such as an 8-bit one
+                // read back from disk, is dequantized into a copy instead of
+                // extended: appending to it would leave the whole new
+                // conversation at its width. Under a scheme the restored state
+                // keeps the scheme's layout. Either way the entry's model state
+                // comes along, which Qwen-VL-family models need on a warm cache.
+                let kvScheme = state.kvScheme
+                var restoredHit: (cache: [any KVCache], keep: Int, bits: Int,
+                                  modelState: LMOutput.State?)? = nil
                 if let hit = state.promptCache.lookup(tokenIds: tokenIds),
                    canTrimPromptCache(hit.entry.kvCache) {
                     let cachedLen = hit.entry.tokenIds.count
                     let keep = min(hit.prefixLength, tokenIds.count - 1)
-                    let extendable = mlxKVScheme != nil || hit.entry.bits == fullBits
+                    let extendable = kvScheme != nil || hit.entry.bits == fullBits
                     if extendable && hit.prefixLength == cachedLen {
                         let n = cachedLen - keep
-                        if n == 0 || (canTrimPromptCache(hit.entry.kvCache, numTokens: n)
-                                      && trimPromptCache(hit.entry.kvCache, numTokens: n) == n) {
-                            restoredHit = (hit.entry.kvCache, keep, hit.entry.bits)
+                        if n == 0 || canTrimPromptCache(hit.entry.kvCache, numTokens: n) {
+                            // Its layers become the live cache, so the entry
+                            // leaves the RAM tier before anything changes them.
+                            state.promptCache.take(hit.entry)
+                            if n == 0 || trimPromptCache(hit.entry.kvCache, numTokens: n) == n {
+                                restoredHit = (hit.entry.kvCache, keep, hit.entry.bits,
+                                               hit.entry.state)
+                            }
                         }
                     } else if let copy = restorePrefix(hit.entry.kvCache, keep: keep,
-                                                       toF16: mlxKVScheme == nil) {
-                        restoredHit = (copy, keep, mlxKVScheme == nil ? fullBits : hit.entry.bits)
+                                                       toF16: kvScheme == nil) {
+                        restoredHit = (copy, keep, kvScheme == nil ? fullBits : hit.entry.bits,
+                                       hit.entry.state)
                     }
                 }
 
@@ -890,16 +985,18 @@ public func mlxChatGenerate(
                     storedBits = hit.bits
                     compactOnSave = false
                     iterator = try TokenIterator(
-                        input: LMInput(tokens: MLXArray(Array(tokenIds[hit.keep...]))),
+                        input: LMInput(tokens: promptTokenArray(Array(tokenIds[hit.keep...]),
+                                                                vlm: state.isVLM)),
                         model: context.model,
                         cache: liveCache,
+                        state: hit.modelState,
                         parameters: withPrefillStep(params, count: tokenIds.count - hit.keep)
                     )
                 } else {
                     var fresh = try makePromptCache(model: context.model, parameters: params)
                     var seedTokens = tokenIds
                     var seedState: LMOutput.State? = nil
-                    if let scheme = mlxKVScheme, tokenIds.count > 1 {
+                    if let scheme = kvScheme, tokenIds.count > 1 {
                         // Compress once the prompt is in, as upstream does, but
                         // on our own array. Handed the scheme, TokenIterator
                         // would swap in new layer objects that `liveCache`
@@ -908,7 +1005,8 @@ public func mlxChatGenerate(
                         // here, convert, and let the iterator take the last one.
                         // `params` carries no scheme, so it never converts again.
                         let warm = try TokenIterator(
-                            input: LMInput(tokens: MLXArray(Array(tokenIds.dropLast()))),
+                            input: LMInput(tokens: promptTokenArray(Array(tokenIds.dropLast()),
+                                                                    vlm: state.isVLM)),
                             model: context.model,
                             cache: fresh,
                             parameters: withPrefillStep(params, count: tokenIds.count - 1)
@@ -918,10 +1016,10 @@ public func mlxChatGenerate(
                         seedTokens = [tokenIds[tokenIds.count - 1]]
                     }
                     liveCache = fresh
-                    storedBits = mlxKVScheme == nil ? fullBits : highBits
-                    compactOnSave = mlxKVScheme != nil
+                    storedBits = kvScheme == nil ? fullBits : highBits
+                    compactOnSave = kvScheme != nil
                     iterator = try TokenIterator(
-                        input: LMInput(tokens: MLXArray(seedTokens)),
+                        input: LMInput(tokens: promptTokenArray(seedTokens, vlm: state.isVLM)),
                         model: context.model,
                         cache: liveCache,
                         state: seedState,
@@ -971,22 +1069,27 @@ public func mlxChatGenerate(
                 // be matched whole, which is never useful for prefix reuse.
                 //
                 // Generation is over and nothing mutates the live cache any more,
-                // so it is stored as it is, without a copy: exact f16 by default,
-                // the scheme's layout under a KV scheme. It shares no buffers
-                // with any other entry: a hit restores into a copy, and an entry
-                // consumed in place is dropped by the dedup in `save`. Only a
-                // scheme miss can still hold f16 layers the scheme left alone,
-                // which `compactFinishedCache` quantizes.
+                // so it is stored as it is: exact f16 by default, the scheme's
+                // layout under a KV scheme. It shares no buffers with any other
+                // entry: a hit restores into a copy, and an entry consumed in
+                // place has already left the cache. Only a layer whose buffer is
+                // mostly unused is copied down to size (`trimmedToFit`), since
+                // the byte budget counts whole buffers. A scheme miss can still
+                // hold f16 layers the scheme left alone, which
+                // `compactFinishedCache` quantizes. The iterator's model state
+                // is stored with the cache, for the next turn to continue from.
                 if canTrimPromptCache(liveCache) {
                     // A failed compaction only loses the cache entry — the
                     // generation already streamed, so never fail it here.
                     let toStore = compactOnSave
-                        ? (try? compactFinishedCache(liveCache, bits: storedBits)) : liveCache
+                        ? (try? compactFinishedCache(liveCache, bits: storedBits))
+                        : trimmedToFit(liveCache)
                     if let toStore {
                         state.promptCache.save(
                             tokenIds: tokenIds + generatedTokenIds,
                             kvCache: toStore,
-                            bits: storedBits)
+                            bits: storedBits,
+                            state: iterator.state)
                     }
                 }
 
@@ -1143,7 +1246,7 @@ public func mlxChatGenerateVision(
             // their own paths, so they keep the library's prefill step.
             let params = GenerateParameters(
                 maxTokens: Int(maxTokens),
-                kvScheme: mlxKVScheme,
+                kvScheme: state.kvScheme,
                 temperature: temperature,
                 topP: topP
             )
