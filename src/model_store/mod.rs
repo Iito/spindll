@@ -1171,10 +1171,15 @@ fn link_or_copy_path(src: &std::path::Path, dest: &std::path::Path) -> anyhow::R
     }
     #[cfg(windows)]
     {
+        // When Windows allows symlinks, hf-hub caches each file as a symlink
+        // with a relative target (`..\..\blobs\<sha>`). A hard link to it is
+        // the symlink itself, which dangles from `dest`'s folder, so link the
+        // file it points to.
+        let src = std::fs::canonicalize(src)?;
         if src.is_dir() {
-            copy_dir_all(src, dest)?;
-        } else if std::fs::hard_link(src, dest).is_err() {
-            std::fs::copy(src, dest)?;
+            copy_dir_all(&src, dest)?;
+        } else if std::fs::hard_link(&src, dest).is_err() {
+            std::fs::copy(&src, dest)?;
         }
     }
     Ok(())
@@ -1299,6 +1304,76 @@ mod tests {
             std::fs::read(dest.join("model.safetensors")).unwrap(),
             b"fake"
         );
+    }
+
+    /// Creates a file symlink. Returns false on Windows when this process
+    /// isn't allowed to (no Developer Mode and not elevated).
+    fn try_symlink_file(target: &std::path::Path, link: &std::path::Path) -> bool {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_file(target, link).is_err() {
+            return false;
+        }
+        true
+    }
+
+    /// The target hf-hub gives a snapshot entry, relative to `snapshots/<rev>/`.
+    fn hf_blob_target() -> std::path::PathBuf {
+        ["..", "..", "blobs", "blob1"].iter().collect()
+    }
+
+    /// Caches one file the way hf-hub does: the bytes go in `blobs/`, and
+    /// `snapshots/<rev>/<name>` is a relative symlink to them. Returns the
+    /// snapshot entry, or None where symlinks aren't allowed (hf-hub moves the
+    /// file into the snapshot then, which links fine).
+    fn hf_cached_file(
+        repo_dir: &std::path::Path,
+        name: &str,
+        bytes: &[u8],
+    ) -> Option<std::path::PathBuf> {
+        let snapshot = repo_dir.join("snapshots/rev1");
+        std::fs::create_dir_all(repo_dir.join("blobs")).unwrap();
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(repo_dir.join("blobs/blob1"), bytes).unwrap();
+        let entry = snapshot.join(name);
+        try_symlink_file(&hf_blob_target(), &entry).then_some(entry)
+    }
+
+    #[test]
+    fn link_or_copy_if_missing_links_the_file_behind_an_hf_snapshot_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("hub/models--org--repo");
+        let Some(entry) = hf_cached_file(&repo, "model.gguf", b"weights") else {
+            eprintln!("skipped: this process can't create symlinks");
+            return;
+        };
+        // From models/<owner>/<repo>/, hf-hub's relative target points nowhere.
+        let dest = dir.path().join("models/org/repo/model.gguf");
+
+        link_or_copy_if_missing(&entry, &dest).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"weights");
+    }
+
+    #[test]
+    fn link_or_copy_if_missing_repairs_what_an_older_windows_pull_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("hub/models--org--repo");
+        let Some(entry) = hf_cached_file(&repo, "model.gguf", b"weights") else {
+            eprintln!("skipped: this process can't create symlinks");
+            return;
+        };
+        // An older Windows pull hard-linked the snapshot symlink itself, which
+        // left the store a symlink with hf-hub's relative target.
+        let dest = dir.path().join("models/org/repo/model.gguf");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        assert!(try_symlink_file(&hf_blob_target(), &dest));
+        assert!(!dest.exists(), "the old entry should dangle");
+
+        link_or_copy_if_missing(&entry, &dest).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"weights");
     }
 
     #[cfg(windows)]

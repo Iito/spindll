@@ -177,9 +177,7 @@ pub fn download_hf_auto(
             tracing::info!(file = %filename, "downloading GGUF");
             let cached = repo.get(filename)?;
             let dest = dest_dir.join(filename);
-            if !dest.exists() {
-                link_or_copy(&cached, &dest)?;
-            }
+            super::link_or_copy_if_missing(&cached, &dest)?;
             total_size += std::fs::metadata(&cached)?.len();
             if first_dest.is_none() {
                 first_dest = Some(dest);
@@ -202,9 +200,7 @@ pub fn download_hf_auto(
                 tracing::info!(file = %mmproj.rfilename, "downloading mmproj");
                 let cached = repo.get(&mmproj.rfilename)?;
                 let dest = dest_dir.join(&mmproj.rfilename);
-                if !dest.exists() {
-                    link_or_copy(&cached, &dest)?;
-                }
+                super::link_or_copy_if_missing(&cached, &dest)?;
                 Some(dest)
             } else {
                 None
@@ -248,9 +244,7 @@ pub fn download_hf_auto(
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if !dest.exists() {
-            link_or_copy(&cached, &dest)?;
-        }
+        super::link_or_copy_if_missing(&cached, &dest)?;
 
         total_size += std::fs::metadata(&cached).map(|m| m.len()).unwrap_or(0);
     }
@@ -315,17 +309,6 @@ pub fn read_mlx_metadata(dir: &Path) -> (String, String) {
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
-
-/// Symlink on Unix; hard-link (with copy fallback) on Windows.
-fn link_or_copy(src: &Path, dest: &Path) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(src, dest)?;
-    #[cfg(windows)]
-    if std::fs::hard_link(src, dest).is_err() {
-        std::fs::copy(src, dest)?;
-    }
-    Ok(())
-}
 
 /// Compute SHA-256 digest of a file, returned as `"sha256:<hex>"`.
 pub fn sha256_file(path: &Path) -> anyhow::Result<String> {
