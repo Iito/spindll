@@ -55,15 +55,20 @@ denies the call and tells you why; `scripts/hook-tests.sh` proves it still works
 
 ## Branch flow
 
-- **Never push to `main`.** It moves only when the next→main PR merges.
-- **All work, fixes included → branch off `next`, PR to `next`.** Wait for CI,
-  then merge. A fix merged into `main` alone would split the two branches.
-- **`next` reaches `main` only through its PR**, after its CI. Release commits
-  take the same path (`.claude/skills/release-flow/SKILL.md`).
-- **That merge leaves `main` with copies of `next`'s commits**: the repo allows
-  only squash and rebase merges. The user resets `next` to `main` afterwards.
-  Before opening a next→main PR, check
-  `git rev-list --left-right --count origin/main...origin/next`.
+- **Features and everyday fixes → branch off `next`, PR to `next`.** Wait for
+  CI, then merge. They reach `main` through the next→main PR.
+- **Release work → branch off `main`, PR to `main`.** That's the version bump,
+  the changelog, and fixes a tag needs: an RC whose build broke, the bug a
+  patch release ships for. The tag goes on `main` once it merges
+  (`.claude/skills/release-flow/SKILL.md`).
+- **Never push to `main`.** It moves only when one of those PRs merges.
+- **Carry every release PR into `next`.** The repo allows only squash and
+  rebase merges, so `main` keeps commits `next` doesn't have. The user resets
+  `next` to `main` if nothing else is on `next`; otherwise open a carry PR into
+  `next` with the same commits cherry-picked. Before opening a next→main PR,
+  check that every release PR has been carried (release-flow §6).
+- **After a next→main merge the user resets `next` to `main`**, since that
+  merge leaves `main` with copies of `next`'s commits.
 
 ## The loop (`/implement`)
 
