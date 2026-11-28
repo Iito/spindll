@@ -71,5 +71,6 @@ and local-file rules — it will deny the call and tell you why. Beyond those:
 
 - One punchlist item per run. Do not chain.
 - Stay on a feature branch. If you are on `main` or `next`, branch first, off
-  `next`: every change goes through a PR into `next`, fixes included, and
-  nothing is pushed to `main`.
+  `next`: punchlist work goes through a PR into `next`, fixes included, and
+  nothing is pushed to `main`. Only release work branches off `main`
+  (`.claude/skills/release-flow/SKILL.md`).
