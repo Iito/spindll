@@ -14,7 +14,7 @@ the body as its script), one command per line, wrappers like `env` and
 Rules only fire on segments that actually invoke git or gh.
 
 Deliberately NOT enforced here: which branch you commit on or open a PR into.
-AGENTS.md's branch flow covers that (everything goes through next).
+AGENTS.md's branch flow covers that (release work into main, the rest into next).
 Nor can it see commands assembled at runtime, inside scripts, behind aliases or
 in raw `gh api` calls: it stops accidents, it is not a sandbox.
 """
